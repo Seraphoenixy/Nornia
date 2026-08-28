@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <resheader name="resmimetype"><value>text/microsoft-resx</value></resheader>
+  <resheader name="version"><value>2.0</value></resheader>
+  <resheader name="reader"><value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader>
+  <resheader name="writer"><value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader>
+  <data name="Help_Title" xml:space="preserve"><value>Nornia - Windows developer environment manager</value></data>
+  <data name="Help_Commands" xml:space="preserve"><value>Commands:</value></data>
+  <data name="Runtime_None" xml:space="preserve"><value>No supported runtimes detected.</value></data>
+  <data name="Runtime_Refreshed" xml:space="preserve"><value>Refreshed {0} runtimes.</value></data>
+  <data name="Tool_None" xml:space="preserve"><value>No supported development tools detected.</value></data>
+  <data name="Tool_Refreshed" xml:space="preserve"><value>Refreshed {0} development tools.</value></data>
+  <data name="Runtime_Removed" xml:space="preserve"><value>Removed {0} {1}.</value></data>
+  <data name="Tool_Removed" xml:space="preserve"><value>Removed {0} {1}.</value></data>
+  <data name="Package_Installed" xml:space="preserve"><value>Installed {0}{1}.</value></data>
+  <data name="Package_Uninstalled" xml:space="preserve"><value>Uninstalled {0}.</value></data>
+  <data name="Package_Upgraded" xml:space="preserve"><value>Upgraded {0}.</value></data>
+  <data name="Cache_Clean_RequiresId" xml:space="preserve"><value>At least one --id &lt;id&gt; is required.</value></data>
+  <data name="Cache_PreviewOnly" xml:space="preserve"><value>Preview only. Add --apply to clear the selected cache contents.</value></data>
+  <data name="Env_NoRequirements" xml:space="preserve"><value>PASS: No runtime or tool requirements are declared.</value></data>
+  <data name="Env_PlanPreviewOnly" xml:space="preserve"><value>Preview only. Add --apply to execute supported repair actions.</value></data>
+  <data name="Plan_NoRequirements" xml:space="preserve"><value>No environment requirements are declared.</value></data>
+  <data name="Project_Created" xml:space="preserve"><value>Created {0}</value></data>
+  <data name="Project_Opened" xml:space="preserve"><value>Opened {0}</value></data>
+  <data name="Project_Exported" xml:space="preserve"><value>Exported project environment declaration to {0}.</value></data>
+  <data name="Project_Imported" xml:space="preserve"><value>Imported project environment declaration into {0}.</value></data>
+  <data name="Error_OperationCancelled" xml:space="preserve"><value>Operation cancelled.</value></data>
+  <data name="Error_Prefix" xml:space="preserve"><value>ERROR: {0}</value></data>
+  <data name="Error_UnknownCommand" xml:space="preserve"><value>Unknown command: {0}</value></data>
+  <data name="Warning_LegacyTool" xml:space="preserve"><value>'{0}' is a development tool. Use 'Nornia tool {1} {0} {2}' instead.</value></data>
+  <data name="Error_NotSupportedCategory" xml:space="preserve"><value>'{0}' is not a supported {1}.</value></data>
+  <data name="Error_UnknownLanguage" xml:space="preserve"><value>Unknown language '{0}'.</value></data>
+  <data name="Summary_RuntimeList" xml:space="preserve"><value>List detected runtimes.</value></data>
+  <data name="Summary_RuntimeRefresh" xml:space="preserve"><value>Re-scan and persist detected runtimes.</value></data>
+  <data name="Summary_RuntimeInstall" xml:space="preserve"><value>Install a runtime via Winget.</value></data>
+  <data name="Summary_RuntimeRemove" xml:space="preserve"><value>Remove an installed runtime.</value></data>
+  <data name="Summary_ToolList" xml:space="preserve"><value>List detected development tools.</value></data>
+  <data name="Summary_ToolRefresh" xml:space="preserve"><value>Re-scan and persist detected development tools.</value></data>
+  <data name="Summary_ToolInstall" xml:space="preserve"><value>Install a development tool via Winget.</value></data>
+  <data name="Summary_ToolRemove" xml:space="preserve"><value>Remove an installed development tool.</value></data>
+  <data name="Summary_PackageSearch" xml:space="preserve"><value>Search Winget for packages.</value></data>
+  <data name="Summary_PackageList" xml:space="preserve"><value>List installed packages.</value></data>
+  <data name="Summary_PackageInstall" xml:space="preserve"><value>Install a package by id.</value></data>
+  <data name="Summary_PackageUninstall" xml:space="preserve"><value>Uninstall a package by id.</value></data>
+  <data name="Summary_PackageUpgrade" xml:space="preserve"><value>Upgrade a package by id.</value></data>
+  <data name="Summary_PackageCacheScan" xml:space="preserve"><value>Scan user application caches.</value></data>
+  <data name="Summary_PackageCacheClean" xml:space="preserve"><value>Preview or clear selected cache candidates.</value></data>
+  <data name="Summary_EnvCheck" xml:space="preserve"><value>Check a project's declared environment.</value></data>
+  <data name="Summary_EnvPlan" xml:space="preserve"><value>Preview the repair plan for a project.</value></data>
+  <data name="Summary_EnvFix" xml:space="preserve"><value>Preview or apply the repair plan for a project.</value></data>
+  <data name="Summary_ProjectInit" xml:space="preserve"><value>Create a Nornia.yaml environment declaration.</value></data>
+  <data name="Summary_ProjectExport" xml:space="preserve"><value>Export a project's environment declaration.</value></data>
+  <data name="Summary_ProjectImport" xml:space="preserve"><value>Import an environment declaration into a project.</value></data>
+  <data name="Summary_ProjectOpen" xml:space="preserve"><value>Open a project in its editor.</value></data>
+  <data name="Summary_Help" xml:space="preserve"><value>Show this help.</value></data>
+</root>

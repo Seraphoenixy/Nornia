@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <resheader name="resmimetype"><value>text/microsoft-resx</value></resheader>
+  <resheader name="version"><value>2.0</value></resheader>
+  <resheader name="reader"><value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader>
+  <resheader name="writer"><value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader>
+  <data name="Help_Title" xml:space="preserve"><value>Nornia - Windows 开发者环境管理器</value></data>
+  <data name="Help_Commands" xml:space="preserve"><value>命令：</value></data>
+  <data name="Runtime_None" xml:space="preserve"><value>未检测到受支持的运行时。</value></data>
+  <data name="Runtime_Refreshed" xml:space="preserve"><value>已刷新 {0} 个运行时。</value></data>
+  <data name="Tool_None" xml:space="preserve"><value>未检测到受支持的开发工具。</value></data>
+  <data name="Tool_Refreshed" xml:space="preserve"><value>已刷新 {0} 个开发工具。</value></data>
+  <data name="Runtime_Removed" xml:space="preserve"><value>已移除 {0} {1}。</value></data>
+  <data name="Tool_Removed" xml:space="preserve"><value>已移除 {0} {1}。</value></data>
+  <data name="Package_Installed" xml:space="preserve"><value>已安装 {0}{1}。</value></data>
+  <data name="Package_Uninstalled" xml:space="preserve"><value>已卸载 {0}。</value></data>
+  <data name="Package_Upgraded" xml:space="preserve"><value>已升级 {0}。</value></data>
+  <data name="Cache_Clean_RequiresId" xml:space="preserve"><value>至少需要一个 --id &lt;id&gt;。</value></data>
+  <data name="Cache_PreviewOnly" xml:space="preserve"><value>预览模式。添加 --apply 以清理所选缓存内容。</value></data>
+  <data name="Env_NoRequirements" xml:space="preserve"><value>通过：未声明任何运行时或工具要求。</value></data>
+  <data name="Env_PlanPreviewOnly" xml:space="preserve"><value>预览模式。添加 --apply 以执行支持的修复操作。</value></data>
+  <data name="Plan_NoRequirements" xml:space="preserve"><value>未声明环境要求。</value></data>
+  <data name="Project_Created" xml:space="preserve"><value>已创建 {0}</value></data>
+  <data name="Project_Opened" xml:space="preserve"><value>已打开 {0}</value></data>
+  <data name="Project_Exported" xml:space="preserve"><value>已将项目环境声明导出到 {0}。</value></data>
+  <data name="Project_Imported" xml:space="preserve"><value>已将项目环境声明导入到 {0}。</value></data>
+  <data name="Error_OperationCancelled" xml:space="preserve"><value>操作已取消。</value></data>
+  <data name="Error_Prefix" xml:space="preserve"><value>错误：{0}</value></data>
+  <data name="Error_UnknownCommand" xml:space="preserve"><value>未知命令：{0}</value></data>
+  <data name="Warning_LegacyTool" xml:space="preserve"><value>“{0}”是开发工具。请改用“Nornia tool {1} {0} {2}”。</value></data>
+  <data name="Error_NotSupportedCategory" xml:space="preserve"><value>“{0}”不是受支持的{1}。</value></data>
+  <data name="Error_UnknownLanguage" xml:space="preserve"><value>未知语言“{0}”。</value></data>
+  <data name="Summary_RuntimeList" xml:space="preserve"><value>列出检测到的运行时。</value></data>
+  <data name="Summary_RuntimeRefresh" xml:space="preserve"><value>重新扫描并持久化检测到的运行时。</value></data>
+  <data name="Summary_RuntimeInstall" xml:space="preserve"><value>通过 Winget 安装运行时。</value></data>
+  <data name="Summary_RuntimeRemove" xml:space="preserve"><value>移除已安装的运行时。</value></data>
+  <data name="Summary_ToolList" xml:space="preserve"><value>列出检测到的开发工具。</value></data>
+  <data name="Summary_ToolRefresh" xml:space="preserve"><value>重新扫描并持久化检测到的开发工具。</value></data>
+  <data name="Summary_ToolInstall" xml:space="preserve"><value>通过 Winget 安装开发工具。</value></data>
+  <data name="Summary_ToolRemove" xml:space="preserve"><value>移除已安装的开发工具。</value></data>
+  <data name="Summary_PackageSearch" xml:space="preserve"><value>在 Winget 中搜索软件包。</value></data>
+  <data name="Summary_PackageList" xml:space="preserve"><value>列出已安装的软件包。</value></data>
+  <data name="Summary_PackageInstall" xml:space="preserve"><value>按 id 安装软件包。</value></data>
+  <data name="Summary_PackageUninstall" xml:space="preserve"><value>按 id 卸载软件包。</value></data>
+  <data name="Summary_PackageUpgrade" xml:space="preserve"><value>按 id 升级软件包。</value></data>
+  <data name="Summary_PackageCacheScan" xml:space="preserve"><value>扫描用户应用程序缓存。</value></data>
+  <data name="Summary_PackageCacheClean" xml:space="preserve"><value>预览或清理所选缓存候选。</value></data>
+  <data name="Summary_EnvCheck" xml:space="preserve"><value>检查项目声明的环境。</value></data>
+  <data name="Summary_EnvPlan" xml:space="preserve"><value>预览项目修复计划。</value></data>
+  <data name="Summary_EnvFix" xml:space="preserve"><value>预览或应用项目修复计划。</value></data>
+  <data name="Summary_ProjectInit" xml:space="preserve"><value>创建 Nornia.yaml 环境声明。</value></data>
+  <data name="Summary_ProjectExport" xml:space="preserve"><value>导出项目的环境声明。</value></data>
+  <data name="Summary_ProjectImport" xml:space="preserve"><value>将环境声明导入到项目。</value></data>
+  <data name="Summary_ProjectOpen" xml:space="preserve"><value>在编辑器中打开项目。</value></data>
+  <data name="Summary_Help" xml:space="preserve"><value>显示帮助。</value></data>
+</root>

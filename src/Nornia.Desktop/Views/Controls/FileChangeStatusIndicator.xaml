@@ -1,0 +1,44 @@
+<UserControl x:Class="Nornia.Desktop.Views.Controls.FileChangeStatusIndicator"
+             x:Name="Root"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:controls="clr-namespace:Nornia.Desktop.Views.Controls">
+  <UserControl.Resources>
+    <Style x:Key="FileStatusLetterStyle" TargetType="TextBlock">
+      <Setter Property="FontSize" Value="{DynamicResource TypeBody}" />
+      <Setter Property="FontWeight" Value="Bold" />
+      <Setter Property="Foreground" Value="{DynamicResource ScmModifiedBrush}" />
+      <Style.Triggers>
+        <DataTrigger Binding="{Binding StatusKind, ElementName=Root}" Value="{x:Static controls:SidebarFileStatusKind.Added}"><Setter Property="Foreground" Value="{DynamicResource SuccessBrush}" /></DataTrigger>
+        <DataTrigger Binding="{Binding StatusKind, ElementName=Root}" Value="{x:Static controls:SidebarFileStatusKind.Deleted}"><Setter Property="Foreground" Value="{DynamicResource ScmDeletedBrush}" /></DataTrigger>
+        <DataTrigger Binding="{Binding StatusKind, ElementName=Root}" Value="{x:Static controls:SidebarFileStatusKind.Conflict}"><Setter Property="Foreground" Value="{DynamicResource ScmDeletedBrush}" /></DataTrigger>
+        <DataTrigger Binding="{Binding StatusKind, ElementName=Root}" Value="{x:Static controls:SidebarFileStatusKind.Renamed}"><Setter Property="Foreground" Value="{DynamicResource InfoAccentBrush}" /></DataTrigger>
+        <DataTrigger Binding="{Binding StatusKind, ElementName=Root}" Value="{x:Static controls:SidebarFileStatusKind.Copied}"><Setter Property="Foreground" Value="{DynamicResource InfoAccentBrush}" /></DataTrigger>
+      </Style.Triggers>
+    </Style>
+    <Style x:Key="FileStatusDotStyle" TargetType="Ellipse">
+      <Setter Property="Fill" Value="{DynamicResource ScmModifiedBrush}" />
+      <Style.Triggers>
+        <DataTrigger Binding="{Binding StatusKind, ElementName=Root}" Value="{x:Static controls:SidebarFileStatusKind.Added}"><Setter Property="Fill" Value="{DynamicResource SuccessBrush}" /></DataTrigger>
+        <DataTrigger Binding="{Binding StatusKind, ElementName=Root}" Value="{x:Static controls:SidebarFileStatusKind.Deleted}"><Setter Property="Fill" Value="{DynamicResource ScmDeletedBrush}" /></DataTrigger>
+        <DataTrigger Binding="{Binding StatusKind, ElementName=Root}" Value="{x:Static controls:SidebarFileStatusKind.Conflict}"><Setter Property="Fill" Value="{DynamicResource ScmDeletedBrush}" /></DataTrigger>
+        <DataTrigger Binding="{Binding StatusKind, ElementName=Root}" Value="{x:Static controls:SidebarFileStatusKind.Renamed}"><Setter Property="Fill" Value="{DynamicResource InfoAccentBrush}" /></DataTrigger>
+        <DataTrigger Binding="{Binding StatusKind, ElementName=Root}" Value="{x:Static controls:SidebarFileStatusKind.Copied}"><Setter Property="Fill" Value="{DynamicResource InfoAccentBrush}" /></DataTrigger>
+      </Style.Triggers>
+    </Style>
+  </UserControl.Resources>
+
+  <Grid Width="{DynamicResource IconMonogramSlot}" Height="{DynamicResource IconMonogramCell}"
+        ToolTip="{Binding StatusToolTip, ElementName=Root}"
+        AutomationProperties.Name="{Binding StatusToolTip, ElementName=Root}">
+    <TextBlock x:Name="Letter"
+               Text="{Binding DisplayLetter, ElementName=Root}"
+               Style="{StaticResource FileStatusLetterStyle}"
+               HorizontalAlignment="Center"
+               VerticalAlignment="Center" />
+    <Ellipse x:Name="Dot" Width="6" Height="6"
+             Style="{StaticResource FileStatusDotStyle}"
+             HorizontalAlignment="Center"
+             VerticalAlignment="Center" />
+  </Grid>
+</UserControl>

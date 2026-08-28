@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <Optimize>true</Optimize>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="BenchmarkDotNet" Version="0.14.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\\..\\src\\Nornia.Core\\Nornia.Core.csproj" />
+    <ProjectReference Include="..\\..\\src\\Nornia.Package\\Nornia.Package.csproj" />
+    <ProjectReference Include="..\\..\\src\\Nornia.Project\\Nornia.Project.csproj" />
+  </ItemGroup>
+</Project>

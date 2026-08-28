@@ -1,0 +1,255 @@
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <!--
+    VS Code 2026 Dark workbench tokens.
+    Values are aligned with microsoft/vscode extensions/theme-defaults/themes/2026-dark.json.
+    VS Code JSON colors use #RRGGBBAA; WPF values below use #AARRGGBB.
+  -->
+
+  <!-- Core surfaces -->
+  <SolidColorBrush x:Key="WindowBrush" Color="#191A1B" />
+  <SolidColorBrush x:Key="TitleBarBrush" Color="#191A1B" />
+  <SolidColorBrush x:Key="EditorBrush" Color="#121314" />
+  <SolidColorBrush x:Key="SideBarBrush" Color="#191A1B" />
+  <SolidColorBrush x:Key="ActivityBarBrush" Color="#191A1B" />
+  <SolidColorBrush x:Key="PanelBrush" Color="#191A1B" />
+  <SolidColorBrush x:Key="CardBrush" Color="#242526" />
+  <SolidColorBrush x:Key="InputBrush" Color="#191A1B" />
+  <!-- text-caret / cursor color on InputBrush surfaces -->
+  <SolidColorBrush x:Key="CaretBrush" Color="#BBBEBF" />
+  <SolidColorBrush x:Key="HoverBrush" Color="#242526" />
+  <!-- WPF uses #AARRGGBB: VS Code #FFFFFF22 -> translucent white #22FFFFFF. -->
+  <SolidColorBrush x:Key="SelectionBrush" Color="#22FFFFFF" />
+  <SolidColorBrush x:Key="BorderBrush" Color="#2A2B2C" />
+  <SolidColorBrush x:Key="StrongBorderBrush" Color="#333536" />
+  <SolidColorBrush x:Key="SashBrush" Color="#2A2B2C" />
+  <SolidColorBrush x:Key="SashHoverBrush" Color="#3994BC" />
+  <!-- 悬浮窗表面(VS Code editorHoverWidget):提交详情 ToolTip 的背景与边框 -->
+  <SolidColorBrush x:Key="ToolTipBackgroundBrush" Color="#202122" />
+  <SolidColorBrush x:Key="ToolTipBorderBrush" Color="#2A2B2C" />
+
+  <!-- Accent / controls -->
+  <SolidColorBrush x:Key="AccentBrush" Color="#297AA0" />
+  <SolidColorBrush x:Key="ButtonBrush" Color="#297AA0" />
+  <SolidColorBrush x:Key="ButtonHoverBrush" Color="#2B7DA3" />
+  <SolidColorBrush x:Key="ButtonSecondaryBrush" Color="#242526" />
+
+  <!-- ===== Interaction states (VS Code style: hover / pressed / focus / disabled) =====
+       Pressed tints sit between hover and selection so a mouse-down reads clearly, and the
+       button-pressed shades darken the solid accent surfaces without losing hierarchy. -->
+  <SolidColorBrush x:Key="PressedBrush" Color="#313233" />
+  <SolidColorBrush x:Key="PressedBorderBrush" Color="#3994BC" />
+  <SolidColorBrush x:Key="ButtonPressedBrush" Color="#1F5C78" />
+  <SolidColorBrush x:Key="DangerPressedBrush" Color="#7B3028" />
+
+  <!-- Foregrounds -->
+  <SolidColorBrush x:Key="TextBrush" Color="#BFBFBF" />
+  <SolidColorBrush x:Key="BrightTextBrush" Color="#FFFFFF" />
+  <SolidColorBrush x:Key="MutedTextBrush" Color="#8C8C8C" />
+  <!-- contrast vs #181818 ~5.1:1 (WCAG AA for small text) -->
+  <SolidColorBrush x:Key="SubtleTextBrush" Color="#8C8C8C" />
+
+  <!-- Semantic status -->
+  <SolidColorBrush x:Key="DangerBrush" Color="#F48771" />
+  <SolidColorBrush x:Key="SuccessBrush" Color="#72C892" />
+  <SolidColorBrush x:Key="WarningBrush" Color="#E5BA7D" />
+  <!-- VS Code SCM 状态字母专用色（M / D） -->
+  <SolidColorBrush x:Key="ScmModifiedBrush" Color="#E5BA7D" />
+  <SolidColorBrush x:Key="ScmDeletedBrush" Color="#F48771" />
+  <SolidColorBrush x:Key="InfoBrush" Color="#1E3A47" />
+  <SolidColorBrush x:Key="InfoAccentBrush" Color="#48A0C7" />
+  <SolidColorBrush x:Key="SubtitleBrush" Color="#8C8C8C" />
+  <SolidColorBrush x:Key="SideHeaderBrush" Color="#242526" />
+  <SolidColorBrush x:Key="ActiveGlyphBrush" Color="#48A0C7" />
+  <SolidColorBrush x:Key="TabGlyphBrush" Color="#48A0C7" />
+  <SolidColorBrush x:Key="NavGlyphBrush" Color="#8C8C8C" />
+  <SolidColorBrush x:Key="ActivityHoverBrush" Color="#14FFFFFF" />
+  <SolidColorBrush x:Key="LinkBrush" Color="#48A0C7" />
+  <SolidColorBrush x:Key="CloseHoverBrush" Color="#F48771" />
+  <SolidColorBrush x:Key="SelectionActiveBrush" Color="#22FFFFFF" />
+  <SolidColorBrush x:Key="TextSelectionBrush" Color="#DD276782" />
+
+  <!-- ===== VS Code 2026 Dark workbench tokens ===== -->
+  <SolidColorBrush x:Key="FocusBorderBrush" Color="#3994BC" />
+  <SolidColorBrush x:Key="DescriptionForegroundBrush" Color="#8C8C8C" />
+  <SolidColorBrush x:Key="ErrorTextBrush" Color="#F48771" />
+  <SolidColorBrush x:Key="InputBorderBrush" Color="#333536" />
+
+  <!-- Activity bar (modern: translucent active/hover backgrounds) -->
+  <SolidColorBrush x:Key="ActivityBarForegroundBrush" Color="#BFBFBF" />
+  <SolidColorBrush x:Key="ActivityBarInactiveForegroundBrush" Color="#8C8C8C" />
+  <SolidColorBrush x:Key="ActivityBarActiveBackgroundBrush" Color="#313233" />
+  <SolidColorBrush x:Key="ActivityBarHoverBackgroundBrush" Color="#14FFFFFF" />
+  <SolidColorBrush x:Key="ActivityBarBadgeBackgroundBrush" Color="#307E9F" />
+  <SolidColorBrush x:Key="ActivityBarBadgeForegroundBrush" Color="#FFFFFF" />
+  <SolidColorBrush x:Key="SidebarBadgeBackgroundBrush" Color="#307E9F" />
+  <SolidColorBrush x:Key="SidebarBadgeForegroundBrush" Color="#FFFFFF" />
+
+  <!-- Title bar (VS Code-style command center pill: translucent tint over the caption strip) -->
+  <SolidColorBrush x:Key="TitleBarCommandCenterBackgroundBrush" Color="#14FFFFFF" />
+
+  <!-- Side bar -->
+  <SolidColorBrush x:Key="SideBarTitleForegroundBrush" Color="#BFBFBF" />
+  <SolidColorBrush x:Key="SideBarSectionHeaderBackgroundBrush" Color="#191A1B" />
+  <SolidColorBrush x:Key="SideBarSectionHeaderForegroundBrush" Color="#BFBFBF" />
+  <SolidColorBrush x:Key="SideBarSectionHeaderBorderBrush" Color="#2A2B2C" />
+
+  <!-- Editor group header + tabs -->
+  <SolidColorBrush x:Key="EditorGroupHeaderTabsBackgroundBrush" Color="#191A1B" />
+  <SolidColorBrush x:Key="EditorGroupActiveBorderBrush" Color="#3994BC" />
+  <SolidColorBrush x:Key="DropZoneHighlightBrush" Color="#263994BC" />
+  <SolidColorBrush x:Key="TabBorderBrush" Color="#2A2B2C" />
+  <SolidColorBrush x:Key="TabActiveBackgroundBrush" Color="#121314" />
+  <SolidColorBrush x:Key="TabActiveForegroundBrush" Color="#BFBFBF" />
+  <SolidColorBrush x:Key="TabActiveBorderTopBrush" Color="#3994BC" />
+  <SolidColorBrush x:Key="TabInactiveBackgroundBrush" Color="#191A1B" />
+  <SolidColorBrush x:Key="TabInactiveForegroundBrush" Color="#8C8C8C" />
+  <SolidColorBrush x:Key="TabHoverBackgroundBrush" Color="#202122" />
+
+  <!-- Panel -->
+  <SolidColorBrush x:Key="PanelTitleActiveBorderBrush" Color="#3994BC" />
+  <SolidColorBrush x:Key="PanelTitleActiveForegroundBrush" Color="#BFBFBF" />
+  <SolidColorBrush x:Key="PanelTitleInactiveForegroundBrush" Color="#8C8C8C" />
+
+  <!-- Status bar (Dark Modern keeps a dark status bar, unlike the classic blue Dark+) -->
+  <SolidColorBrush x:Key="StatusBarBackgroundBrush" Color="#191A1B" />
+  <SolidColorBrush x:Key="StatusBarForegroundBrush" Color="#8C8C8C" />
+  <SolidColorBrush x:Key="StatusBarBorderBrush" Color="#2A2B2C" />
+  <SolidColorBrush x:Key="StatusBarItemHoverBackgroundBrush" Color="#323233" />
+  <SolidColorBrush x:Key="StatusBarItemPressedBackgroundBrush" Color="#4B4C4D" />
+  <!-- Status-bar feedback colors tuned to remain legible on the dark neutral surface. -->
+  <SolidColorBrush x:Key="StatusBarSuccessBrush" Color="#72C892" />
+  <SolidColorBrush x:Key="StatusBarWarningBrush" Color="#E5BA7D" />
+  <SolidColorBrush x:Key="StatusBarErrorBrush" Color="#F48771" />
+
+  <!-- Menus / overlays / badges -->
+  <SolidColorBrush x:Key="MenuBackgroundBrush" Color="#202122" />
+  <SolidColorBrush x:Key="MenuSelectionBackgroundBrush" Color="#263994BC" />
+  <SolidColorBrush x:Key="QuickInputBackgroundBrush" Color="#191A1B" />
+  <SolidColorBrush x:Key="QuickInputBackdropBrush" Color="#99000000" />
+  <SolidColorBrush x:Key="BadgeBackgroundBrush" Color="#307E9F" />
+  <SolidColorBrush x:Key="BadgeForegroundBrush" Color="#FFFFFF" />
+
+  <!-- Editor -->
+  <SolidColorBrush x:Key="EditorLineNumberBrush" Color="#858889" />
+  <SolidColorBrush x:Key="EditorLineNumberActiveBrush" Color="#BBBEBF" />
+  <SolidColorBrush x:Key="EditorGutterAddedBrush" Color="#72C892" />
+  <SolidColorBrush x:Key="EditorGutterDeletedBrush" Color="#F48771" />
+  <SolidColorBrush x:Key="EditorGutterModifiedBrush" Color="#6AB890" />
+
+  <!-- ===== Read-only code editor tokens (VS Code 2026 Dark) ===== -->
+  <SolidColorBrush x:Key="CodeLineNumberBrush" Color="#858889" />
+  <SolidColorBrush x:Key="CodeLineNumberActiveBrush" Color="#BBBEBF" />
+  <SolidColorBrush x:Key="CodeCurrentLineBrush" Color="#242526" />
+  <SolidColorBrush x:Key="CodeCurrentLineBorderBrush" Color="#2A2B2C" />
+  <!-- VS Code editor.selectionBackground (#276782dd, WPF ARGB) -->
+  <SolidColorBrush x:Key="CodeSelectionBrush" Color="#DD276782" />
+  <SolidColorBrush x:Key="CodeSearchMatchBrush" Color="#80276782" />
+  <SolidColorBrush x:Key="CodeSearchCurrentMatchBrush" Color="#90276782" />
+  <SolidColorBrush x:Key="CodeFoldMarkerBrush" Color="#2A2B2C" />
+  <SolidColorBrush x:Key="CodeFoldMarkerForegroundBrush" Color="#8C8C8C" />
+  <!-- 折叠栏(vscode-main foldingDecorations 对齐):折叠段半透明背景(选区色 30%)与
+       chevron 前景(foldingControlForeground);AvalonEdit 的 "…" 占位走默认正文色。 -->
+  <SolidColorBrush x:Key="CodeFoldBackgroundBrush" Color="#4D264F78" />
+  <SolidColorBrush x:Key="CodeFoldGutterForegroundBrush" Color="#C5C5C5" />
+  <!-- VS Code editorIndentGuide color (WPF ARGB) -->
+  <SolidColorBrush x:Key="CodeIndentationGuideBrush" Color="#4D838485" />
+  <SolidColorBrush x:Key="CodeMinimapBackgroundBrush" Color="#1E1E1E" />
+  <SolidColorBrush x:Key="CodeMinimapTextBrush" Color="#4A4E55" />
+  <!-- Rounded-modern additions: active indent guide, minimap match marker, diff expand placeholder -->
+  <SolidColorBrush x:Key="CodeIndentationGuideActiveBrush" Color="#838485" />
+  <SolidColorBrush x:Key="CodeMinimapMatchBrush" Color="#FFCC00" />
+  <SolidColorBrush x:Key="DiffExpandPlaceholderBrush" Color="#3794FF" />
+
+  <!-- ScrollBar (VS Code: ~10px, translucent rounded thumb, no arrows) -->
+  <SolidColorBrush x:Key="ScrollBarThumbBrush" Color="#85A8A9AA" />
+  <SolidColorBrush x:Key="ScrollBarThumbHoverBrush" Color="#90A8A9AA" />
+  <SolidColorBrush x:Key="ScrollBarThumbActiveBrush" Color="#9CA8A9AA" />
+
+  <!-- SCM 树状视图的层级导线(折叠图标下的竖线,仿 VS Code tree indent guides) -->
+  <SolidColorBrush x:Key="TreeGuideBrush" Color="#3DFFFFFF" />
+
+  <!-- 提交图形泳道调色板(GitGraphCell 按分支语义着色;GraphLane* 为本地分支, GraphRemote* 为远端分支, GraphCurrentBranch 为当前分支高亮) -->
+  <SolidColorBrush x:Key="GraphLane1Brush" Color="#4A9EFF" />
+  <SolidColorBrush x:Key="GraphLane2Brush" Color="#3FB950" />
+  <SolidColorBrush x:Key="GraphLane3Brush" Color="#E3B341" />
+  <SolidColorBrush x:Key="GraphLane4Brush" Color="#BC8CFF" />
+  <SolidColorBrush x:Key="GraphLane5Brush" Color="#39C5CF" />
+  <SolidColorBrush x:Key="GraphLane6Brush" Color="#F778BA" />
+  <SolidColorBrush x:Key="GraphRemote1Brush" Color="#7AAFFF" />
+  <SolidColorBrush x:Key="GraphRemote2Brush" Color="#71D67C" />
+  <SolidColorBrush x:Key="GraphRemote3Brush" Color="#EDC85A" />
+  <SolidColorBrush x:Key="GraphRemote4Brush" Color="#C99CFF" />
+  <SolidColorBrush x:Key="GraphRemote5Brush" Color="#6FD8E0" />
+  <SolidColorBrush x:Key="GraphRemote6Brush" Color="#FF9BCB" />
+  <SolidColorBrush x:Key="GraphCurrentBranchBrush" Color="#2D9DFF" />
+
+  <!-- File-type icon hue tokens (Nornia-specific; retained across VS Code workbench sync) -->
+  <SolidColorBrush x:Key="FileTypeIconBlueBrush" Color="#519ABA" />
+  <SolidColorBrush x:Key="FileTypeIconGreenBrush" Color="#89D185" />
+  <SolidColorBrush x:Key="FileTypeIconYellowBrush" Color="#E2C08D" />
+  <SolidColorBrush x:Key="FileTypeIconOrangeBrush" Color="#E08A3C" />
+  <SolidColorBrush x:Key="FileTypeIconPurpleBrush" Color="#C586C0" />
+  <SolidColorBrush x:Key="FileTypeIconRedBrush" Color="#F48771" />
+  <SolidColorBrush x:Key="FileTypeIconTealBrush" Color="#4EC9B0" />
+  <SolidColorBrush x:Key="FileTypeIconGrayBrush" Color="#9D9D9D" />
+
+  <!-- Split-button inner divider (sits on the primary button surface) -->
+  <SolidColorBrush x:Key="ButtonSplitDividerBrush" Color="#33FFFFFF" />
+
+  <!-- diff viewer tokens (VS Code 2026 Dark palette; Added/Removed 柔和化贴近 EditorBrush
+       亮度,保证叠加语法高亮(如 CodeTokenComment 绿)对比度 ≥3.0) -->
+  <SolidColorBrush x:Key="DiffAddedBrush" Color="#26347D39" />
+  <SolidColorBrush x:Key="DiffRemovedBrush" Color="#26C93C37" />
+  <SolidColorBrush x:Key="DiffModifiedBrush" Color="#242526" />
+  <SolidColorBrush x:Key="DiffModifiedBarBrush" Color="#6AB890" />
+  <SolidColorBrush x:Key="DiffAddedIntralineBrush" Color="#4D57AB5A" />
+  <SolidColorBrush x:Key="DiffRemovedIntralineBrush" Color="#4DF47067" />
+  <SolidColorBrush x:Key="DiffHeaderBrush" Color="#242526" />
+  <SolidColorBrush x:Key="DiffAddedTextBrush" Color="#72C892" />
+  <SolidColorBrush x:Key="DiffRemovedTextBrush" Color="#F48771" />
+  <SolidColorBrush x:Key="DiffLineNumberBrush" Color="#858889" />
+  <SolidColorBrush x:Key="DiffEditorBorderBrush" Color="#2A2B2C" />
+  <SolidColorBrush x:Key="DiffEditorSashBrush" Color="#333536" />
+  <SolidColorBrush x:Key="DiffOverviewRailBrush" Color="#0D0E0F" />
+  <SolidColorBrush x:Key="DiffOverviewViewportBrush" Color="#66858889" />
+  <SolidColorBrush x:Key="DiffUnchangedRegionBrush" Color="#1B1C1D" />
+  <SolidColorBrush x:Key="DiffPlaceholderForegroundBrush" Color="#858889" />
+  <SolidColorBrush x:Key="DiffToolbarSeparatorBrush" Color="#2A2B2C" />
+
+  <!-- ===== Existing Nornia syntax highlighting palette (intentionally retained) =====
+       ThemeHighlightingColorizer maps AvalonEdit fallback HighlightingColor names onto the
+       shared CodeToken* palette
+       tokens, so code colors follow the active theme instead of the built-in light defaults. -->
+  <!-- Editor semantic-token aliases used by the TextMate/Roslyn presentation pipeline. -->
+  <SolidColorBrush x:Key="CodeTokenCommentBrush" Color="#76B063" />
+  <SolidColorBrush x:Key="CodeTokenKeywordBrush" Color="#4FC1FF" />
+  <SolidColorBrush x:Key="CodeTokenStringBrush" Color="#CE9178" />
+  <SolidColorBrush x:Key="CodeTokenNumberBrush" Color="#B5CEA8" />
+  <SolidColorBrush x:Key="CodeTokenTypeBrush" Color="#4EC9B0" />
+  <SolidColorBrush x:Key="CodeTokenFunctionBrush" Color="#DCDCAA" />
+  <SolidColorBrush x:Key="CodeTokenTagBrush" Color="#4FC1FF" />
+  <SolidColorBrush x:Key="CodeTokenAttributeBrush" Color="#9CDCFE" />
+  <SolidColorBrush x:Key="CodeTokenLinkBrush" Color="#3794FF" />
+
+  <!-- ===== Terminal palette (ANSI 16 + defaults + cursor, VS Code Dark+ terminal values) ===== -->
+  <SolidColorBrush x:Key="TerminalDefaultForegroundBrush" Color="#CCCCCC" />
+  <SolidColorBrush x:Key="TerminalDefaultBackgroundBrush" Color="#1E1E1E" />
+  <SolidColorBrush x:Key="TerminalCursorBrush" Color="#FFFFFF" />
+  <SolidColorBrush x:Key="TerminalBlackBrush" Color="#000000" />
+  <SolidColorBrush x:Key="TerminalRedBrush" Color="#CD3131" />
+  <SolidColorBrush x:Key="TerminalGreenBrush" Color="#0DBC79" />
+  <SolidColorBrush x:Key="TerminalYellowBrush" Color="#E5E510" />
+  <SolidColorBrush x:Key="TerminalBlueBrush" Color="#2472C8" />
+  <SolidColorBrush x:Key="TerminalMagentaBrush" Color="#BC3FBC" />
+  <SolidColorBrush x:Key="TerminalCyanBrush" Color="#11A8CD" />
+  <SolidColorBrush x:Key="TerminalWhiteBrush" Color="#E5E5E5" />
+  <SolidColorBrush x:Key="TerminalBrightBlackBrush" Color="#666666" />
+  <SolidColorBrush x:Key="TerminalBrightRedBrush" Color="#F14C4C" />
+  <SolidColorBrush x:Key="TerminalBrightGreenBrush" Color="#23D18B" />
+  <SolidColorBrush x:Key="TerminalBrightYellowBrush" Color="#F5F543" />
+  <SolidColorBrush x:Key="TerminalBrightBlueBrush" Color="#3B8EEA" />
+  <SolidColorBrush x:Key="TerminalBrightMagentaBrush" Color="#D670D6" />
+  <SolidColorBrush x:Key="TerminalBrightCyanBrush" Color="#29B8DB" />
+  <SolidColorBrush x:Key="TerminalBrightWhiteBrush" Color="#E5E5E5" />
+</ResourceDictionary>

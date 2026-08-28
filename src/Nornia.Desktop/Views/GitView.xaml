@@ -1,0 +1,1270 @@
+<UserControl x:Class="Nornia.Desktop.Views.GitView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:views="clr-namespace:Nornia.Desktop.Views"
+             xmlns:controls="clr-namespace:Nornia.Desktop.Views.Controls"
+             xmlns:b="clr-namespace:Nornia.Desktop.Behaviors"
+             xmlns:vm="clr-namespace:Nornia.Desktop.ViewModels">
+  <UserControl.Resources>
+    <!-- Icon-only compact actions inside change rows (VS Code SCM inline actions). -->
+    <Style x:Key="ScmRowActionButtonStyle" TargetType="Button" BasedOn="{StaticResource IconButton}">
+      <Setter Property="FontSize" Value="{DynamicResource IconInline}" />
+      <Setter Property="Padding" Value="4,1" />
+      <Setter Property="MinWidth" Value="22" />
+      <Setter Property="MinHeight" Value="18" />
+      <Setter Property="Margin" Value="0" />
+    </Style>
+
+    <!-- Change-list row actions use a slightly larger glyph than other compact SCM actions. -->
+    <Style x:Key="ScmChangeRowActionButtonStyle" TargetType="Button" BasedOn="{StaticResource ScmRowActionButtonStyle}">
+      <Setter Property="FontSize" Value="{DynamicResource TypeBody}" />
+    </Style>
+
+    <!-- Icon-only batch actions on section headers (VS Code section header actions). -->
+    <Style x:Key="ScmHeaderActionButtonStyle" TargetType="Button" BasedOn="{StaticResource IconButton}">
+      <Setter Property="FontSize" Value="{DynamicResource IconInline}" />
+      <Setter Property="Padding" Value="4,2" />
+      <Setter Property="MinWidth" Value="24" />
+      <Setter Property="MinHeight" Value="20" />
+      <Setter Property="Margin" Value="4,0,0,0" />
+    </Style>
+
+    <!-- V8 统一文件行模板的行类型派生值(平铺/树状/历史三类文件行共用一个模板)。 -->
+    <views:ScmFileRowConverter x:Key="ScmFileRow" />
+    <!-- 树状行重命名后缀列宽(定长 200px 已废除,改为 star 动态分配)。 -->
+    <views:RenameSuffixColumnWidthConverter x:Key="RenameSuffixColumnWidth" />
+    <!-- V1: 分区行高(展开且有条目 → * 真虚拟化;否则 Auto 收拢)。 -->
+    <views:ScmSectionRowHeightConverter x:Key="ScmSectionRowHeight" />
+
+    <!-- A partially staged file is present in both lists. The row's IsStaged value describes the
+         Git index, not which SCM section rendered the row, so action visibility must follow the
+         owning ListBox section. -->
+    <Style x:Key="ScmUnstagedActionButtonStyle" TargetType="Button" BasedOn="{StaticResource ScmChangeRowActionButtonStyle}">
+      <Setter Property="Visibility" Value="Collapsed" />
+      <Style.Triggers>
+        <DataTrigger Binding="{Binding Tag, RelativeSource={RelativeSource AncestorType=ListBox}}" Value="unstaged">
+          <Setter Property="Visibility" Value="Visible" />
+        </DataTrigger>
+      </Style.Triggers>
+    </Style>
+    <Style x:Key="ScmStagedActionButtonStyle" TargetType="Button" BasedOn="{StaticResource ScmChangeRowActionButtonStyle}">
+      <Setter Property="Visibility" Value="Collapsed" />
+      <Style.Triggers>
+        <DataTrigger Binding="{Binding Tag, RelativeSource={RelativeSource AncestorType=ListBox}}" Value="staged">
+          <Setter Property="Visibility" Value="Visible" />
+        </DataTrigger>
+      </Style.Triggers>
+    </Style>
+
+    <!-- V8 统一行模板内的行类型门控:复制/打开 diff 只在历史文件行显示,其余按钮
+         (reveal/暂存/取消暂存/丢弃)只在更改行显示(暂存 vs 未暂存再由列表 Tag 决定)。 -->
+    <Style x:Key="ScmChangeOnlyActionButtonStyle" TargetType="Button" BasedOn="{StaticResource ScmChangeRowActionButtonStyle}">
+      <Style.Triggers>
+        <DataTrigger Binding="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=IsChangeRow}" Value="False">
+          <Setter Property="Visibility" Value="Collapsed" />
+        </DataTrigger>
+      </Style.Triggers>
+    </Style>
+    <Style x:Key="ScmCommitOnlyActionButtonStyle" TargetType="Button" BasedOn="{StaticResource ScmRowActionButtonStyle}">
+      <Setter Property="Visibility" Value="Collapsed" />
+      <Style.Triggers>
+        <DataTrigger Binding="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=IsCommitFile}" Value="True">
+          <Setter Property="Visibility" Value="Visible" />
+        </DataTrigger>
+      </Style.Triggers>
+    </Style>
+
+    <!-- VS Code SCM resource label: file name + (muted) parent directory on one row -->
+    <Style x:Key="ScmFileNameTextStyle" TargetType="TextBlock">
+      <Setter Property="FontWeight" Value="Normal" />
+      <!-- 行文本统一 body 档(13),与目录后缀/工作区树等列表行同档 -->
+      <Setter Property="FontSize" Value="{DynamicResource TypeBody}" />
+      <!-- keyed 样式会覆盖 App 级隐式样式,前景色必须显式声明,否则回落主题默认黑色 -->
+      <Setter Property="Foreground" Value="{DynamicResource TextBrush}" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+      <Setter Property="VerticalAlignment" Value="Center" />
+      <!-- 定宽 MaxWidth 已废除:名称长度由行内 star 列按可显示范围分配(侧栏越宽显示越长) -->
+    </Style>
+    <Style x:Key="ScmDirectoryTextStyle" TargetType="TextBlock">
+      <Setter Property="FontSize" Value="{DynamicResource TypeBody}" />
+      <Setter Property="Foreground" Value="{DynamicResource MutedTextBrush}" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+      <Setter Property="VerticalAlignment" Value="Center" />
+      <Setter Property="Margin" Value="8,0,0,0" />
+    </Style>
+
+    <!-- Compact list row shared by every collapsible section (changes / history / commit files):
+         hover + selection-persistent + pressed feedback, keyboard-focus ring visible. Folder rows in
+         the tree layout never highlight (they toggle, not select). -->
+    <Style x:Key="ScmRowStyle" TargetType="ListBoxItem">
+      <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+      <Setter Property="Padding" Value="8,1" />
+      <Setter Property="FocusVisualStyle" Value="{StaticResource AppFocusRing}" />
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ListBoxItem">
+            <Border x:Name="Row" Background="Transparent" Padding="{TemplateBinding Padding}" MinHeight="{DynamicResource SizeRowSm}">
+              <!-- Forward the ListBoxItem content alignment so the row content can fill its container. -->
+              <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                VerticalAlignment="{TemplateBinding VerticalContentAlignment}" />
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Row" Property="Background" Value="{DynamicResource HoverBrush}" /></Trigger>
+              <Trigger Property="IsSelected" Value="True"><Setter TargetName="Row" Property="Background" Value="{DynamicResource SelectionBrush}" /></Trigger>
+              <Trigger Property="IsMouseCaptured" Value="True"><Setter TargetName="Row" Property="Background" Value="{DynamicResource PressedBrush}" /></Trigger>
+              <Trigger Property="IsKeyboardFocusWithin" Value="True"><Setter TargetName="Row" Property="Background" Value="{DynamicResource SelectionActiveBrush}" /></Trigger>
+              <DataTrigger Binding="{Binding IsFolder}" Value="True">
+                <Setter TargetName="Row" Property="Background" Value="Transparent" />
+              </DataTrigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <!-- 提交图形行:去掉内边距让左侧泳道靠近侧栏边缘、并让 GitGraphCell 占满整行。文本列在
+         模板内自带 Margin,行视觉密度与其余 SCM 行保持一致。 -->
+    <!-- History rows still participate in ListBox selection (multi-select, keyboard and context
+         actions), but selection is intentionally not painted. The graph itself is the visual
+         affordance and the standard blue selection wash obscures its lanes and commit badges. -->
+    <Style x:Key="ScmGraphRowStyle" TargetType="ListBoxItem">
+      <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="FocusVisualStyle" Value="{StaticResource AppFocusRing}" />
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ListBoxItem">
+            <Border x:Name="Row" Background="Transparent" Padding="{TemplateBinding Padding}" MinHeight="{DynamicResource SizeRowSm}">
+              <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                VerticalAlignment="{TemplateBinding VerticalContentAlignment}" />
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Row" Property="Background" Value="{DynamicResource HoverBrush}" /></Trigger>
+              <Trigger Property="IsMouseCaptured" Value="True"><Setter TargetName="Row" Property="Background" Value="{DynamicResource PressedBrush}" /></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <!-- Commit split-button halves (VS Code: single rounded container, internal divider, chevron
+         only rounds its right corners). Both replicate the PrimaryButton visual language (accent
+         background, hover→ButtonHoverBrush, pressed→ButtonPressedBrush, keyboard focus ring). -->
+    <Style x:Key="CommitSplitMainButtonStyle" TargetType="Button" BasedOn="{StaticResource PrimaryButton}">
+      <Setter Property="HorizontalAlignment" Value="Stretch" />
+      <Setter Property="Margin" Value="0" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="BorderThickness" Value="0" />
+      <Setter Property="MinHeight" Value="26" />
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="B" Background="{TemplateBinding Background}" CornerRadius="3,0,0,3"
+                    BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}">
+              <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+            </Border>
+            <ControlTemplate.Triggers>
+              <DataTrigger Binding="{Binding DataContext.IsBusy, RelativeSource={RelativeSource AncestorType=UserControl}}" Value="True"><Setter Property="IsEnabled" Value="False" /></DataTrigger>
+              <Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.45" /><Setter Property="Cursor" Value="Arrow" /></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="CommitSplitChevronButtonStyle" TargetType="Button" BasedOn="{StaticResource PrimaryButton}">
+      <Setter Property="Margin" Value="0" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="BorderThickness" Value="0" />
+      <Setter Property="MinWidth" Value="24" />
+      <Setter Property="MinHeight" Value="26" />
+      <Setter Property="VerticalAlignment" Value="Stretch" />
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="Button">
+            <Border x:Name="B" Background="{TemplateBinding Background}" CornerRadius="0,3,3,0"
+                    BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}">
+              <Grid>
+                <!-- 两个按钮模板之间使用居中的短白色分隔线,不贯穿整个按钮高度;
+                     颜色走主题令牌(深色 20% 白 / 浅色 50% 白 / 高对比纯白)。 -->
+                <Border Width="1" Height="12" HorizontalAlignment="Left" VerticalAlignment="Center"
+                        Background="{DynamicResource ButtonSplitDividerBrush}" />
+                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+              </Grid>
+            </Border>
+            <ControlTemplate.Triggers>
+              <DataTrigger Binding="{Binding DataContext.IsBusy, RelativeSource={RelativeSource AncestorType=UserControl}}" Value="True"><Setter Property="IsEnabled" Value="False" /></DataTrigger>
+              <Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.45" /><Setter Property="Cursor" Value="Arrow" /></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <!-- V8 统一文件行模板:平铺更改行(GitChangeItem)、树状更改文件行(ScmFileNode)与历史提交
+         文件行(LogFileRow)共用这一个模板 —— 原 ScmChangeRowTemplate / ScmTreeFileRowTemplate /
+         ScmCommitFileRowTemplate 三份重复模板合并而来。因行类型而异的显示值与交互值由
+         ScmFileRowConverter 派生;staged/unstaged 仍由所属 ListBox 的 Tag 区分(见
+         ScmUnstaged/StagedActionButtonStyle),history 由行类型区分;视觉逐项保持原样。 -->
+    <DataTemplate x:Key="ScmFileRowTemplate">
+      <Border x:Name="FileRow" MinHeight="{DynamicResource SizeRowSm}">
+        <Border.Style>
+          <Style TargetType="Border">
+            <Setter Property="Background" Value="Transparent" />
+            <Style.Triggers>
+              <!-- 历史文件行:整行悬停高亮 + 手型光标(非 ListBox 选择语义,原模板行为);
+                   更改行的高亮仍由 ScmRowStyle 的 ListBoxItem 模板承担。 -->
+              <MultiDataTrigger>
+                <MultiDataTrigger.Conditions>
+                  <Condition Binding="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=IsCommitFile}" Value="True" />
+                  <Condition Binding="{Binding IsMouseOver, RelativeSource={RelativeSource Self}}" Value="True" />
+                </MultiDataTrigger.Conditions>
+                <Setter Property="Background" Value="{DynamicResource HoverBrush}" />
+              </MultiDataTrigger>
+              <DataTrigger Binding="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=IsCommitFile}" Value="True">
+                <Setter Property="Cursor" Value="Hand" />
+              </DataTrigger>
+            </Style.Triggers>
+          </Style>
+        </Border.Style>
+        <Grid Margin="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=IndentMargin}">
+          <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+          <Grid.InputBindings>
+            <!-- 历史文件行:单击以该提交的 diff 打开(原模板行为);对更改行不可执行(参数类型
+                 不匹配,CanExecute 为 false)。更改行:双击打开常驻文件标签(单击仍走选中开预览)。 -->
+            <MouseBinding Gesture="LeftClick"
+                          Command="{Binding DataContext.OpenLogFileDiffCommand, RelativeSource={RelativeSource AncestorType=UserControl}}"
+                          CommandParameter="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=LogFileTarget}" />
+            <MouseBinding Gesture="LeftDoubleClick"
+                          Command="{Binding DataContext.OpenChangeFilePermanentCommand, RelativeSource={RelativeSource AncestorType=views:GitView}}"
+                          CommandParameter="{Binding}" />
+          </Grid.InputBindings>
+          <!-- V8: 树状行层级导线改用共享 SidebarTreeGuideLayer(与资源管理器/搜索同源):
+               单次 OnRender 画 N 条 1px 竖线,取代每行嵌套 ItemsControl+Canvas;
+               平铺/历史行无 AncestorGuideLefts 属性 → 绑定为空,不画线。 -->
+          <controls:SidebarTreeGuideLayer GuideLefts="{Binding AncestorGuideLefts}"
+                                          ShowGuides="{Binding AreTreeGuidesVisible, RelativeSource={RelativeSource AncestorType=views:GitView}}" />
+          <DockPanel MinWidth="0" VerticalAlignment="Center">
+            <controls:SidebarFileTypeBadge DockPanel.Dock="Left"
+                                       Path="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=BadgePath}">
+              <!-- 平铺行语言缩写徽标与文件名间距 2px(原模板);树状/历史行为 0。 -->
+              <controls:SidebarFileTypeBadge.Style>
+                <Style TargetType="controls:SidebarFileTypeBadge">
+                  <Setter Property="Margin" Value="0" />
+                  <Style.Triggers>
+                    <DataTrigger Binding="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=IsFlatRow}" Value="True">
+                      <Setter Property="Margin" Value="0,0,2,0" />
+                    </DataTrigger>
+                  </Style.Triggers>
+                </Style>
+              </controls:SidebarFileTypeBadge.Style>
+            </controls:SidebarFileTypeBadge>
+            <!-- 名称/重命名后缀/目录段不再定长 200px:主名称恒占 2 star,后缀与目录段可见时各占
+                 1 star(隐藏时列宽 0),显示长度随行的可显示范围(侧栏宽度/缩进深度)动态伸缩,
+                 空间不足时按段省略号截断。 -->
+            <Grid MinWidth="0">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="2*" />
+                <ColumnDefinition Width="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=RenameSuffixColumnWidth}" />
+                <ColumnDefinition Width="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=DirectoryColumnWidth}" />
+              </Grid.ColumnDefinitions>
+              <TextBlock x:Name="NameText" Grid.Column="0"
+                         Text="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=Name}"
+                         FontSize="{DynamicResource TypeBody}" Foreground="{DynamicResource TextBrush}"
+                         FontWeight="Normal" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"
+                         ToolTip="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=ToolTip}" />
+              <Grid Grid.Column="1" MinWidth="0"
+                    Visibility="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=RenameSuffixVisibility}">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="Auto" />
+                  <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=RenameSuffixGlyph}"
+                           FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconInline}" Style="{StaticResource ScmDirectoryTextStyle}" />
+                <TextBlock Grid.Column="1" Text="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=RenameSuffix}"
+                           Style="{StaticResource ScmDirectoryTextStyle}"
+                           ToolTip="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=RenameSuffix}" />
+              </Grid>
+              <TextBlock Grid.Column="2" Text="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=Directory}"
+                         Style="{StaticResource ScmDirectoryTextStyle}"
+                         Visibility="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=DirectoryVisibility}"
+                         ToolTip="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=ToolTip}" />
+            </Grid>
+          </DockPanel>
+        <!-- Hover / selected rows reveal the per-row actions (VS Code):更改行按 ListBoxItem
+             悬停/选中显示,历史文件行按行自身悬停显示。 -->
+        <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+          <StackPanel.Style>
+            <Style TargetType="StackPanel">
+              <Setter Property="Visibility" Value="Collapsed" />
+              <Style.Triggers>
+                <MultiDataTrigger>
+                  <MultiDataTrigger.Conditions>
+                    <Condition Binding="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=IsChangeRow}" Value="True" />
+                    <Condition Binding="{Binding IsMouseOver, RelativeSource={RelativeSource AncestorType=ListBoxItem}}" Value="True" />
+                  </MultiDataTrigger.Conditions>
+                  <Setter Property="Visibility" Value="Visible" />
+                </MultiDataTrigger>
+                <MultiDataTrigger>
+                  <MultiDataTrigger.Conditions>
+                    <Condition Binding="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=IsChangeRow}" Value="True" />
+                    <Condition Binding="{Binding IsSelected, RelativeSource={RelativeSource AncestorType=ListBoxItem}}" Value="True" />
+                  </MultiDataTrigger.Conditions>
+                  <Setter Property="Visibility" Value="Visible" />
+                </MultiDataTrigger>
+                <MultiDataTrigger>
+                  <MultiDataTrigger.Conditions>
+                    <Condition Binding="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=IsCommitFile}" Value="True" />
+                    <Condition Binding="{Binding IsMouseOver, ElementName=FileRow}" Value="True" />
+                  </MultiDataTrigger.Conditions>
+                  <Setter Property="Visibility" Value="Visible" />
+                </MultiDataTrigger>
+              </Style.Triggers>
+            </Style>
+          </StackPanel.Style>
+          <!-- 更改行动作(参数:平铺行传 GitChangeItem,树状行传其 Change,与原模板一致) -->
+          <Button Style="{StaticResource ScmChangeOnlyActionButtonStyle}" Content="{StaticResource CodiconOpenInWindow}" FontFamily="{StaticResource IconFontFamily}"
+                  ToolTip="在资源管理器中显示"
+                  Command="{Binding DataContext.RevealInExplorerCommand, RelativeSource={RelativeSource AncestorType=views:GitView}}"
+                  CommandParameter="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=ChangeTarget}" />
+          <Button Style="{StaticResource ScmUnstagedActionButtonStyle}" Content="{StaticResource CodiconAdd}" FontFamily="{StaticResource IconFontFamily}" ToolTip="暂存"
+                  Command="{Binding DataContext.StageChangeCommand, RelativeSource={RelativeSource AncestorType=views:GitView}}"
+                  CommandParameter="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=ChangeTarget}" />
+          <Button Style="{StaticResource ScmStagedActionButtonStyle}" Content="{StaticResource CodiconRemove}" FontFamily="{StaticResource IconFontFamily}" ToolTip="取消暂存"
+                  Command="{Binding DataContext.UnstageChangeCommand, RelativeSource={RelativeSource AncestorType=views:GitView}}"
+                  CommandParameter="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=ChangeTarget}" />
+          <Button Style="{StaticResource ScmUnstagedActionButtonStyle}" Content="{StaticResource CodiconDiscard}" FontFamily="{StaticResource IconFontFamily}" ToolTip="丢弃更改" Foreground="{DynamicResource DangerBrush}"
+                  Command="{Binding DataContext.DiscardChangeCommand, RelativeSource={RelativeSource AncestorType=views:GitView}}"
+                  CommandParameter="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=ChangeTarget}" />
+          <!-- 历史文件行动作(复制路径 / 打开 diff) -->
+          <Button Style="{StaticResource ScmCommitOnlyActionButtonStyle}" Content="{StaticResource CodiconCopy}" FontFamily="{StaticResource IconFontFamily}" ToolTip="复制路径"
+                  Command="{Binding DataContext.CopyLogFilePathCommand, RelativeSource={RelativeSource AncestorType=UserControl}}" CommandParameter="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=LogFileTarget}" />
+          <Button Style="{StaticResource ScmCommitOnlyActionButtonStyle}" Content="{StaticResource CodiconDiff}" FontFamily="{StaticResource IconFontFamily}" ToolTip="打开 diff"
+                  Command="{Binding DataContext.OpenLogFileDiffCommand, RelativeSource={RelativeSource AncestorType=UserControl}}" CommandParameter="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=LogFileTarget}" />
+        </StackPanel>
+        <controls:FileChangeStatusIndicator Grid.Column="2"
+                                            StatusLetter="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=StatusLetter}"
+                                            Margin="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=StatusLetterMargin}" />
+        </Grid>
+      </Border>
+    </DataTemplate>
+
+    <!-- 文件夹行的展开/折叠 chevron(跟随 IsCollapsed;须定义在引用它的模板之前,StaticResource 不支持前向引用) -->
+    <Style x:Key="ScmFolderChevronStyle" TargetType="TextBlock">
+      <Setter Property="Text" Value="{StaticResource CodiconChevronDown}" />
+      <Setter Property="FontFamily" Value="{StaticResource IconFontFamily}" />
+      <Setter Property="FontSize" Value="{DynamicResource IconChevron}" />
+      <Setter Property="Foreground" Value="{DynamicResource MutedTextBrush}" />
+      <Style.Triggers>
+        <DataTrigger Binding="{Binding IsCollapsed}" Value="True">
+          <Setter Property="Text" Value="{StaticResource CodiconChevronRight}" />
+        </DataTrigger>
+      </Style.Triggers>
+    </Style>
+
+    <!-- 树状布局:文件夹行(整行点击折叠/展开,不参与选择) -->
+    <DataTemplate x:Key="ScmFolderRowTemplate" DataType="{x:Type vm:ScmFolderNode}">
+      <Grid>
+        <!-- 祖先层级竖线:贯穿本行整高,使上层折叠图标下的竖线连续穿过所有后代行;
+             仿 VS Code 仅在鼠标移入树内时绘制 -->
+        <ItemsControl ItemsSource="{Binding AncestorGuideLefts}" IsHitTestVisible="False" Focusable="False">
+          <ItemsControl.ItemsPanel>
+            <ItemsPanelTemplate><Canvas /></ItemsPanelTemplate>
+          </ItemsControl.ItemsPanel>
+          <!-- Canvas 定位的是每个 item 容器(ContentPresenter);把 Canvas.Left/Top 设在容器上,
+               让容器内的竖线占满,才能把不同层级竖线画在各自对应的折叠图标列下 -->
+          <ItemsControl.ItemContainerStyle>
+            <Style TargetType="ContentPresenter">
+              <Setter Property="Canvas.Left" Value="{Binding}" />
+              <Setter Property="Canvas.Top" Value="0" />
+            </Style>
+          </ItemsControl.ItemContainerStyle>
+          <ItemsControl.ItemTemplate>
+            <DataTemplate>
+              <Border Width="1" HorizontalAlignment="Left"
+                      Height="{Binding ActualHeight, RelativeSource={RelativeSource AncestorType=ListBoxItem}}"
+                      SnapsToDevicePixels="True" Background="{DynamicResource TreeGuideBrush}">
+                <Border.Style>
+                  <Style TargetType="Border">
+                    <Setter Property="Visibility" Value="Collapsed" />
+                    <Style.Triggers>
+                      <DataTrigger Binding="{Binding AreTreeGuidesVisible, RelativeSource={RelativeSource AncestorType=views:GitView}}" Value="True">
+                        <Setter Property="Visibility" Value="Visible" />
+                      </DataTrigger>
+                    </Style.Triggers>
+                  </Style>
+                </Border.Style>
+              </Border>
+            </DataTemplate>
+          </ItemsControl.ItemTemplate>
+        </ItemsControl>
+        <Border x:Name="FolderRow" Margin="{Binding IndentMargin}" Background="Transparent" Cursor="Hand"
+                MouseLeftButtonUp="FolderRow_MouseLeftButtonUp">
+          <Grid>
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="18" />
+              <ColumnDefinition Width="*" />
+              <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <!-- 折叠图标列不画自身层的竖线:子行已按 AncestorGuideLefts 把该列(12d + 8.5)重画到
+                 自身整行高度,竖线从第一个子行接续,折叠按钮区保持干净 -->
+            <TextBlock Grid.Column="0" Style="{StaticResource ScmFolderChevronStyle}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+            <!-- 文件夹行不放图标(VS Code SCM 树:仅 chevron + 名称);名称左缘 = 18px chevron 列右缘
+                 与同级文件行的文件名左缘完全对齐。 -->
+            <TextBlock Grid.Column="1" Text="{Binding Name}" FontSize="{DynamicResource TypeBody}" FontWeight="SemiBold"
+                       Foreground="{DynamicResource SideBarSectionHeaderForegroundBrush}"
+                       Margin="0" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+            <!-- 文件夹悬停操作:当前树列表的 Tag 决定是未暂存还是已暂存,避免同一模板在两区重复定义。 -->
+            <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center" Margin="4,0,0,0">
+              <StackPanel.Style>
+                <Style TargetType="StackPanel">
+                  <Setter Property="Visibility" Value="Collapsed" />
+                  <Style.Triggers>
+                    <DataTrigger Binding="{Binding IsMouseOver, RelativeSource={RelativeSource AncestorType=ListBoxItem}}" Value="True">
+                      <Setter Property="Visibility" Value="Visible" />
+                    </DataTrigger>
+                    <DataTrigger Binding="{Binding IsSelected, RelativeSource={RelativeSource AncestorType=ListBoxItem}}" Value="True">
+                      <Setter Property="Visibility" Value="Visible" />
+                    </DataTrigger>
+                  </Style.Triggers>
+                </Style>
+              </StackPanel.Style>
+              <Button Style="{StaticResource ScmUnstagedActionButtonStyle}" Content="{StaticResource CodiconDiscard}"
+                      FontFamily="{StaticResource IconFontFamily}" ToolTip="丢弃文件夹更改"
+                      AutomationProperties.Name="丢弃文件夹更改" Foreground="{DynamicResource DangerBrush}"
+                      Command="{Binding DataContext.DiscardFolderCommand, RelativeSource={RelativeSource AncestorType=views:GitView}}"
+                      CommandParameter="{Binding}" />
+              <Button Style="{StaticResource ScmUnstagedActionButtonStyle}" Content="{StaticResource CodiconAdd}"
+                      FontFamily="{StaticResource IconFontFamily}" ToolTip="暂存文件夹"
+                      AutomationProperties.Name="暂存文件夹"
+                      Command="{Binding DataContext.StageFolderCommand, RelativeSource={RelativeSource AncestorType=views:GitView}}"
+                      CommandParameter="{Binding}" />
+              <Button Style="{StaticResource ScmStagedActionButtonStyle}" Content="{StaticResource CodiconRemove}"
+                      FontFamily="{StaticResource IconFontFamily}" ToolTip="取消暂存文件夹"
+                      AutomationProperties.Name="取消暂存文件夹"
+                      Command="{Binding DataContext.UnstageFolderCommand, RelativeSource={RelativeSource AncestorType=views:GitView}}"
+                      CommandParameter="{Binding}" />
+            </StackPanel>
+          </Grid>
+        </Border>
+      </Grid>
+    </DataTemplate>
+
+    <!-- 树状布局:文件行(目录已由层级表达,只保留重命名装饰) -->
+    <DataTemplate x:Key="ScmTreeFileRowTemplate" DataType="{x:Type vm:ScmFileNode}">
+      <Grid>
+        <!-- 双击打开常驻文件标签(单击开预览 diff,VS Code SCM 语义) -->
+        <Grid.InputBindings>
+          <MouseBinding Gesture="LeftDoubleClick"
+                        Command="{Binding DataContext.OpenChangeFilePermanentCommand, RelativeSource={RelativeSource AncestorType=views:GitView}}"
+                        CommandParameter="{Binding}" />
+        </Grid.InputBindings>
+        <!-- 祖先层级竖线:贯穿本行整高,延续上层折叠图标下的竖线(文件行是叶子,自身不再延伸);
+             仿 VS Code 仅在鼠标移入树内时绘制 -->
+        <ItemsControl ItemsSource="{Binding AncestorGuideLefts}" IsHitTestVisible="False" Focusable="False">
+          <ItemsControl.ItemsPanel>
+            <ItemsPanelTemplate><Canvas /></ItemsPanelTemplate>
+          </ItemsControl.ItemsPanel>
+          <!-- Canvas 定位的是每个 item 容器(ContentPresenter);把 Canvas.Left/Top 设在容器上,
+               让容器内的竖线占满,才能把不同层级竖线画在各自对应的折叠图标列下 -->
+          <ItemsControl.ItemContainerStyle>
+            <Style TargetType="ContentPresenter">
+              <Setter Property="Canvas.Left" Value="{Binding}" />
+              <Setter Property="Canvas.Top" Value="0" />
+            </Style>
+          </ItemsControl.ItemContainerStyle>
+          <ItemsControl.ItemTemplate>
+            <DataTemplate>
+              <Border Width="1" HorizontalAlignment="Left"
+                      Height="{Binding ActualHeight, RelativeSource={RelativeSource AncestorType=ListBoxItem}}"
+                      SnapsToDevicePixels="True" Background="{DynamicResource TreeGuideBrush}">
+                <Border.Style>
+                  <Style TargetType="Border">
+                    <Setter Property="Visibility" Value="Collapsed" />
+                    <Style.Triggers>
+                      <DataTrigger Binding="{Binding AreTreeGuidesVisible, RelativeSource={RelativeSource AncestorType=views:GitView}}" Value="True">
+                        <Setter Property="Visibility" Value="Visible" />
+                      </DataTrigger>
+                    </Style.Triggers>
+                  </Style>
+                </Border.Style>
+              </Border>
+            </DataTemplate>
+          </ItemsControl.ItemTemplate>
+        </ItemsControl>
+        <Grid Margin="{Binding IndentMargin}">
+          <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+          <DockPanel MinWidth="0" VerticalAlignment="Center">
+            <!-- VS Code 风格语言缩写:透明底 + 语言色相的 Monogram 文字 -->
+            <controls:SidebarFileTypeBadge DockPanel.Dock="Left" Path="{Binding Change.Path}" Margin="0" />
+            <!-- 可显示长度不定长:名称占 2 star,重命名后缀段可见时占 1 star(隐藏时列宽 0),
+                 随行的可显示范围(侧栏宽度/缩进深度)动态伸缩。 -->
+            <Grid MinWidth="0">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="2*" />
+                <ColumnDefinition Width="{Binding Change.RenameSuffix, Converter={StaticResource RenameSuffixColumnWidth}}" />
+              </Grid.ColumnDefinitions>
+              <TextBlock Grid.Column="0" Text="{Binding Change.FileName}" Style="{StaticResource ScmFileNameTextStyle}"
+                         ToolTip="{Binding Change.DisplayPath}" />
+              <Grid Grid.Column="1" MinWidth="0"
+                    Visibility="{Binding Change.RenameSuffix, Converter={StaticResource StringEmptyToCollapsedConverter}}">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="Auto" />
+                  <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="{Binding Change.RenameSuffixGlyph}" FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconInline}" Style="{StaticResource ScmDirectoryTextStyle}" />
+                <TextBlock Grid.Column="1" Text="{Binding Change.RenameSuffix}" Style="{StaticResource ScmDirectoryTextStyle}"
+                           ToolTip="{Binding Change.RenameSuffix}" />
+              </Grid>
+            </Grid>
+          </DockPanel>
+        <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+          <StackPanel.Style>
+            <Style TargetType="StackPanel">
+              <Setter Property="Visibility" Value="Collapsed" />
+              <Style.Triggers>
+                <DataTrigger Binding="{Binding IsMouseOver, RelativeSource={RelativeSource AncestorType=ListBoxItem}}" Value="True"><Setter Property="Visibility" Value="Visible" /></DataTrigger>
+                <DataTrigger Binding="{Binding IsSelected, RelativeSource={RelativeSource AncestorType=ListBoxItem}}" Value="True"><Setter Property="Visibility" Value="Visible" /></DataTrigger>
+              </Style.Triggers>
+            </Style>
+          </StackPanel.Style>
+          <Button Style="{StaticResource ScmChangeRowActionButtonStyle}" Content="{StaticResource CodiconOpenInWindow}" FontFamily="{StaticResource IconFontFamily}"
+                  ToolTip="在资源管理器中显示"
+                  Command="{Binding DataContext.RevealInExplorerCommand, RelativeSource={RelativeSource AncestorType=views:GitView}}" CommandParameter="{Binding Change}" />
+          <Button Style="{StaticResource ScmUnstagedActionButtonStyle}" Content="{StaticResource CodiconAdd}" FontFamily="{StaticResource IconFontFamily}" ToolTip="暂存"
+                  Command="{Binding DataContext.StageChangeCommand, RelativeSource={RelativeSource AncestorType=views:GitView}}" CommandParameter="{Binding Change}" />
+          <Button Style="{StaticResource ScmStagedActionButtonStyle}" Content="{StaticResource CodiconRemove}" FontFamily="{StaticResource IconFontFamily}" ToolTip="取消暂存"
+                  Command="{Binding DataContext.UnstageChangeCommand, RelativeSource={RelativeSource AncestorType=views:GitView}}" CommandParameter="{Binding Change}" />
+          <Button Style="{StaticResource ScmUnstagedActionButtonStyle}" Content="{StaticResource CodiconDiscard}" FontFamily="{StaticResource IconFontFamily}" ToolTip="丢弃更改" Foreground="{DynamicResource DangerBrush}"
+                  Command="{Binding DataContext.DiscardChangeCommand, RelativeSource={RelativeSource AncestorType=views:GitView}}" CommandParameter="{Binding Change}" />
+        </StackPanel>
+        <controls:FileChangeStatusIndicator Grid.Column="2" StatusLetter="{Binding Change.StatusLetter}"
+                                            Margin="8,0,0,0" />
+        </Grid>
+      </Grid>
+    </DataTemplate>
+
+    <!-- 提交折叠栏 chevron:展开=向下、折叠=向右(与文件夹行 chevron 同字形,方向相反)。
+         须定义在引用它的模板之前,StaticResource 不支持前向引用 -->
+    <!-- 提交折叠栏内联的一个更改文件行:整行左键以该提交的 diff 在共享编辑器打开,
+         悬浮露出 复制路径 / 打开 diff 行内动作(与更改行模板同一交互语言) -->
+    <DataTemplate x:Key="ScmCommitFileRowTemplate">
+      <Border x:Name="FileRow" Cursor="Hand" MinHeight="{DynamicResource SizeRowSm}">
+        <Border.InputBindings>
+          <MouseBinding Gesture="LeftClick"
+                        Command="{Binding DataContext.OpenLogFileDiffCommand, RelativeSource={RelativeSource AncestorType=UserControl}}"
+                        CommandParameter="{Binding}" />
+        </Border.InputBindings>
+        <Grid>
+          <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+          <DockPanel MinWidth="0" VerticalAlignment="Center">
+            <!-- VS Code 风格语言缩写:透明底 + 语言色相的 Monogram 文字 -->
+            <controls:SidebarFileTypeBadge DockPanel.Dock="Left" Path="{Binding Change.Path}" Margin="0" />
+            <TextBlock Text="{Binding Path}" FontSize="{DynamicResource TypeBody}" TextTrimming="CharacterEllipsis"
+                       ToolTip="{Binding DisplayPath}" VerticalAlignment="Center" />
+          </DockPanel>
+          <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+            <StackPanel.Style>
+              <Style TargetType="StackPanel">
+                <Setter Property="Visibility" Value="Collapsed" />
+                <Style.Triggers>
+                  <DataTrigger Binding="{Binding IsMouseOver, ElementName=FileRow}" Value="True"><Setter Property="Visibility" Value="Visible" /></DataTrigger>
+                </Style.Triggers>
+              </Style>
+            </StackPanel.Style>
+            <Button Style="{StaticResource ScmRowActionButtonStyle}" Content="{StaticResource CodiconCopy}" FontFamily="{StaticResource IconFontFamily}" ToolTip="复制路径"
+                    Command="{Binding DataContext.CopyLogFilePathCommand, RelativeSource={RelativeSource AncestorType=UserControl}}" CommandParameter="{Binding}" />
+            <Button Style="{StaticResource ScmRowActionButtonStyle}" Content="{StaticResource CodiconDiff}" FontFamily="{StaticResource IconFontFamily}" ToolTip="打开 diff"
+                    Command="{Binding DataContext.OpenLogFileDiffCommand, RelativeSource={RelativeSource AncestorType=UserControl}}" CommandParameter="{Binding}" />
+          </StackPanel>
+          <controls:FileChangeStatusIndicator Grid.Column="2" StatusLetter="{Binding StatusLetter}"
+                                              Margin="8,0,8,0" />
+        </Grid>
+        <Border.Style>
+          <Style TargetType="Border">
+            <Setter Property="Background" Value="Transparent" />
+            <Style.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter Property="Background" Value="{DynamicResource HoverBrush}" /></Trigger>
+            </Style.Triggers>
+          </Style>
+        </Border.Style>
+      </Border>
+    </DataTemplate>
+
+    <!-- 引用徽标(提交行与悬浮窗共用):本地/远端分支和标签统一使用图标 + 名称的紧凑标签,
+         颜色 = 引用颜色(与图形泳道同源:GraphCurrentBranchBrush 当前分支 / GraphLane* 本地分支 /
+         GraphRemote* 远端分支,标签使用 InfoAccentBrush)。
+         对齐与尺寸遵循 VS Code scm.css:18px 行高、10px 圆角、图标/名称 4px 间隔;
+         背景经 DataTrigger + DynamicResource 按 ColorKey 映射,主题切换即时换肤;
+         图标与名称用 PanelBrush(对应 VS Code 的 historyItemHoverLabelForeground)。 -->
+    <DataTemplate x:Key="ScmRefBadgeTemplate">
+      <Border>
+        <Border.Style>
+          <Style TargetType="Border" BasedOn="{StaticResource SidebarReferenceBadgeStyle}">
+            <Setter Property="Background" Value="{DynamicResource GraphLane1Brush}" />
+            <Style.Triggers>
+              <DataTrigger Binding="{Binding ColorKey}" Value="GraphCurrentBranchBrush"><Setter Property="Background" Value="{DynamicResource GraphCurrentBranchBrush}" /></DataTrigger>
+              <DataTrigger Binding="{Binding ColorKey}" Value="GraphLane2Brush"><Setter Property="Background" Value="{DynamicResource GraphLane2Brush}" /></DataTrigger>
+              <DataTrigger Binding="{Binding ColorKey}" Value="GraphLane3Brush"><Setter Property="Background" Value="{DynamicResource GraphLane3Brush}" /></DataTrigger>
+              <DataTrigger Binding="{Binding ColorKey}" Value="GraphLane4Brush"><Setter Property="Background" Value="{DynamicResource GraphLane4Brush}" /></DataTrigger>
+              <DataTrigger Binding="{Binding ColorKey}" Value="GraphLane5Brush"><Setter Property="Background" Value="{DynamicResource GraphLane5Brush}" /></DataTrigger>
+              <DataTrigger Binding="{Binding ColorKey}" Value="GraphLane6Brush"><Setter Property="Background" Value="{DynamicResource GraphLane6Brush}" /></DataTrigger>
+              <DataTrigger Binding="{Binding ColorKey}" Value="GraphRemote1Brush"><Setter Property="Background" Value="{DynamicResource GraphRemote1Brush}" /></DataTrigger>
+              <DataTrigger Binding="{Binding ColorKey}" Value="GraphRemote2Brush"><Setter Property="Background" Value="{DynamicResource GraphRemote2Brush}" /></DataTrigger>
+              <DataTrigger Binding="{Binding ColorKey}" Value="GraphRemote3Brush"><Setter Property="Background" Value="{DynamicResource GraphRemote3Brush}" /></DataTrigger>
+              <DataTrigger Binding="{Binding ColorKey}" Value="GraphRemote4Brush"><Setter Property="Background" Value="{DynamicResource GraphRemote4Brush}" /></DataTrigger>
+              <DataTrigger Binding="{Binding ColorKey}" Value="GraphRemote5Brush"><Setter Property="Background" Value="{DynamicResource GraphRemote5Brush}" /></DataTrigger>
+              <DataTrigger Binding="{Binding ColorKey}" Value="GraphRemote6Brush"><Setter Property="Background" Value="{DynamicResource GraphRemote6Brush}" /></DataTrigger>
+              <DataTrigger Binding="{Binding ColorKey}" Value="InfoAccentBrush"><Setter Property="Background" Value="{DynamicResource InfoAccentBrush}" /></DataTrigger>
+            </Style.Triggers>
+          </Style>
+        </Border.Style>
+        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+          <TextBlock Text="{Binding Glyph}" FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconInline}"
+                     Foreground="{DynamicResource PanelBrush}" VerticalAlignment="Center" Margin="1,0,3,0" />
+          <TextBlock Text="{Binding Name}" FontSize="{DynamicResource IconInline}" Foreground="{DynamicResource PanelBrush}"
+                     VerticalAlignment="Center" TextTrimming="CharacterEllipsis" MaxWidth="100" Margin="0,0,4,0" />
+        </StackPanel>
+      </Border>
+    </DataTemplate>
+
+    <!-- 提交悬浮窗表面(VS Code editorHoverWidget 风格):主题背景 + 1px 主题边框 + 圆角 + 投影;
+         内容由 ScmCommitBarTemplate 的 ToolTip 按提交/引用结构化组织。 -->
+    <Style x:Key="ScmCommitToolTipStyle" TargetType="ToolTip">
+      <Setter Property="FontSize" Value="{DynamicResource TypeBody}" />
+      <Setter Property="Foreground" Value="{DynamicResource TextBrush}" />
+      <!-- 提交悬浮窗统一从折叠栏右侧展开,避免遮住当前提交行和左侧泳道。 -->
+      <Setter Property="Placement" Value="Right" />
+      <Setter Property="HorizontalOffset" Value="0" />
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ToolTip">
+            <Border Background="{DynamicResource ToolTipBackgroundBrush}" BorderBrush="{DynamicResource ToolTipBorderBrush}"
+                    BorderThickness="1" CornerRadius="{StaticResource RadiusMd}" Padding="8,4"
+                    SnapsToDevicePixels="True" Effect="{StaticResource ShadowPopupEffect}">
+              <ContentPresenter />
+            </Border>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
+    <!-- 提交折叠栏:一条分支一条线(泳道图)、提交为线上的圆点;整行左键展开/收起,
+         展开后内联显示该提交的更改文件(懒加载,加载中/无文件更改有占位);
+         悬浮窗按 VS Code editorHoverWidget 风格展示作者/时间/正文与分支徽标 -->
+    <DataTemplate x:Key="ScmCommitBarTemplate" DataType="{x:Type vm:GitLogRow}">
+      <StackPanel>
+        <Border Cursor="Hand" HorizontalAlignment="Stretch" MinWidth="0" Background="Transparent"
+                MinHeight="{DynamicResource SizeRowSm}"
+                ToolTipService.Placement="Right" ToolTipService.HorizontalOffset="0"
+                MouseLeftButtonUp="CommitBar_MouseLeftButtonUp">
+          <Border.ToolTip>
+            <ToolTip Style="{StaticResource ScmCommitToolTipStyle}">
+              <StackPanel MaxWidth="440" MinWidth="260">
+                <!-- 作者 + 时间行(VS Code: $(git-commit) 作者名 + 邮箱, $(history) 提交时间) -->
+                <StackPanel>
+                  <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="{StaticResource CodiconGitCommit}" FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconInline}"
+                               Foreground="{DynamicResource MutedTextBrush}" VerticalAlignment="Center" Margin="0,0,6,0" />
+                    <TextBlock Text="{Binding Commit.AuthorName}" FontWeight="SemiBold" VerticalAlignment="Center" />
+                    <TextBlock Text="{Binding Commit.AuthorEmail}" Foreground="{DynamicResource MutedTextBrush}" VerticalAlignment="Center"
+                               Margin="6,0,0,0" TextTrimming="CharacterEllipsis" MaxWidth="150"
+                               Visibility="{Binding Commit.AuthorEmail, Converter={StaticResource StringEmptyToCollapsedConverter}}" />
+                  </StackPanel>
+                  <StackPanel Orientation="Horizontal" Margin="0,2,0,0">
+                    <TextBlock Text="{StaticResource CodiconHistory}" FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconInline}"
+                               Foreground="{DynamicResource MutedTextBrush}" VerticalAlignment="Center" Margin="0,0,4,0" />
+                    <TextBlock Text="{Binding Commit.AuthorDate, StringFormat=yyyy-MM-dd HH:mm}" Foreground="{DynamicResource MutedTextBrush}" VerticalAlignment="Center" />
+                    <TextBlock Text="{Binding CommitAgeText, StringFormat=（距今 {0}）}" Foreground="{DynamicResource MutedTextBrush}" VerticalAlignment="Center" Margin="6,0,0,0" />
+                  </StackPanel>
+                </StackPanel>
+                <Border Height="1" Background="{DynamicResource ToolTipBorderBrush}" Margin="0,6" Opacity="0.6" />
+                <!-- 提交信息全文(主题 + 正文):markdown 渲染,规则对齐 VS Code 历史项悬浮窗
+                     (每条消息行独立成段;支持标题/列表/代码块/加粗/行内代码/链接等) -->
+                <controls:MarkdownMessageView Markdown="{Binding FullMessage}"
+                                              MaxWidth="440" MaxHeight="260" Margin="0,2,0,0" />
+                <!-- 变更统计(VS Code shortStats 段):文件数 + 新增/删除行;无统计时整段收起 -->
+                <StackPanel>
+                  <StackPanel.Style>
+                    <Style TargetType="StackPanel">
+                      <Setter Property="Visibility" Value="Collapsed" />
+                      <Style.Triggers>
+                        <DataTrigger Binding="{Binding HasStats}" Value="True"><Setter Property="Visibility" Value="Visible" /></DataTrigger>
+                      </Style.Triggers>
+                    </Style>
+                  </StackPanel.Style>
+                  <Border Height="1" Background="{DynamicResource ToolTipBorderBrush}" Margin="0,6" Opacity="0.6" />
+                  <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="{Binding Commit.Stats.FilesChanged, StringFormat={}{0} 个文件更改}"
+                               Foreground="{DynamicResource MutedTextBrush}" VerticalAlignment="Center" />
+                    <TextBlock Text="{Binding Commit.Stats.Insertions, StringFormat=+{0} 新增}"
+                               Foreground="{DynamicResource SuccessBrush}" VerticalAlignment="Center" Margin="10,0,0,0"
+                               Visibility="{Binding Commit.Stats.Insertions, Converter={StaticResource NonZeroCountToVisibilityConverter}}" />
+                    <TextBlock Text="{Binding Commit.Stats.Deletions, StringFormat=-{0} 删除}"
+                               Foreground="{DynamicResource ScmDeletedBrush}" VerticalAlignment="Center" Margin="10,0,0,0"
+                               Visibility="{Binding Commit.Stats.Deletions, Converter={StaticResource NonZeroCountToVisibilityConverter}}" />
+                  </StackPanel>
+                </StackPanel>
+                <!-- 引用徽标段(分支/远端分支/标签;无引用时整段收起) -->
+                <StackPanel>
+                  <StackPanel.Visibility>
+                    <Binding Path="HasRefBadges" Converter="{StaticResource BooleanToVisibilityConverter}" />
+                  </StackPanel.Visibility>
+                  <Border Height="1" Background="{DynamicResource ToolTipBorderBrush}" Margin="0,6" Opacity="0.6" />
+                  <ItemsControl ItemsSource="{Binding RefBadges}" ItemTemplate="{StaticResource ScmRefBadgeTemplate}"
+                                VerticalAlignment="Center">
+                    <ItemsControl.ItemsPanel>
+                      <ItemsPanelTemplate><WrapPanel /></ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                  </ItemsControl>
+                </StackPanel>
+                <Border Height="1" Background="{DynamicResource ToolTipBorderBrush}" Margin="0,6" Opacity="0.6" />
+                <!-- 哈希:短哈希 + 完整哈希(等宽,灰) -->
+                <TextBlock FontFamily="{StaticResource MonoFontFamily}" Foreground="{DynamicResource MutedTextBrush}">
+                  <Run Text="{Binding Commit.ShortHash}" /><Run Text=" (" /><Run Text="{Binding Commit.Hash}" /><Run Text=")" />
+                </TextBlock>
+              </StackPanel>
+            </ToolTip>
+          </Border.ToolTip>
+          <Grid MinWidth="0">
+            <Grid.ColumnDefinitions>
+              <!-- 图形列宽与 GitGraphLayout.CellWidth 同步(GitGraphCell 按该宽度排布泳道);
+                   Auto 让无泳道的列表(传入/传出)在单元格折叠时此列自动收起为 0 -->
+              <ColumnDefinition Width="Auto" />
+              <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+            <controls:GitGraphCell Grid.Column="0" Row="{Binding Graph}" MinHeight="{DynamicResource SizeRowSm}"
+                                   Visibility="{Binding Graph, Converter={StaticResource NullToCollapsedConverter}}" />
+            <!-- 正文只保留提交信息首行(主题);整行即折叠开关(无独立箭头按钮,MouseBinding
+                 挂在 Border 上),哈希/日期/作者由悬浮窗承载;分支徽标右对齐覆盖在主题文字上
+                 (徽标独立占用右侧列),多个徽标横向并排(同一提交的本地+远端分支一左一右,
+                 而非默认 ItemsControl 的纵向堆叠),徽标区不参与命中(IsHitTestVisible=False);
+                 主题列使用星号宽度和单行省略号,不会把文字撑出折叠栏。 -->
+            <Grid Grid.Column="1" Margin="0,1" MinWidth="0" VerticalAlignment="Center">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+              </Grid.ColumnDefinitions>
+              <TextBlock Grid.Column="0" Text="{Binding DirectionGlyph}" FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconInline}"
+                         Margin="0,0,6,0" VerticalAlignment="Center"
+                         Visibility="{Binding DirectionGlyph, Converter={StaticResource NullToCollapsedConverter}}" />
+              <TextBlock Grid.Column="1" Text="{Binding Commit.Subject}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"
+                         TextWrapping="NoWrap" MinWidth="0" HorizontalAlignment="Stretch" VerticalAlignment="Center" />
+              <ItemsControl Grid.Column="2" ItemsSource="{Binding RefBadges}" ItemTemplate="{StaticResource ScmRefBadgeTemplate}"
+                            HorizontalAlignment="Right" VerticalAlignment="Center" IsHitTestVisible="False">
+                <ItemsControl.ItemsPanel>
+                  <ItemsPanelTemplate><StackPanel Orientation="Horizontal" /></ItemsPanelTemplate>
+                </ItemsControl.ItemsPanel>
+              </ItemsControl>
+            </Grid>
+          </Grid>
+        </Border>
+        <!-- 展开内容:该提交的更改文件(懒加载;加载中 / 无文件更改有占位);左列贯穿泳道
+             (PassThrough)让经过本行的其它分支线在展开增高的行内保持连续 -->
+        <Grid Visibility="{Binding IsExpanded, Converter={StaticResource BooleanToVisibilityConverter}}">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="Auto" />
+            <ColumnDefinition Width="*" />
+          </Grid.ColumnDefinitions>
+          <controls:GitGraphCell Grid.Column="0" Row="{Binding Graph}" PassThrough="True" />
+          <StackPanel Grid.Column="1" Margin="0,0,0,2">
+            <TextBlock Text="加载中…" Style="{StaticResource CaptionStyle}" Margin="4,2,0,2"
+                       Visibility="{Binding IsLoading, Converter={StaticResource BooleanToVisibilityConverter}}" />
+            <TextBlock Text="无文件更改" Style="{StaticResource CaptionStyle}" Margin="4,2,0,2"
+                       Visibility="{Binding HasNoFiles, Converter={StaticResource BooleanToVisibilityConverter}}" />
+            <ItemsControl ItemsSource="{Binding Files}" ItemTemplate="{StaticResource ScmCommitFileRowTemplate}" />
+          </StackPanel>
+        </Grid>
+      </StackPanel>
+    </DataTemplate>
+  </UserControl.Resources>
+
+  <!-- VS Code-style source-control sidebar: title actions, repository summary, commit message box,
+       then collapsible sections (changes / staged / branches / history / commit files) in the SCM
+       information order. Selecting a change opens its diff in the shared editor area; section
+       collapse state lives on the GitViewModel for the session. -->
+  <controls:SidebarShell Title="源代码管理">
+    <controls:SidebarShell.HeaderActions>
+      <StackPanel Orientation="Horizontal">
+          <!-- 视图切换：平铺 ↔ 树状分组（VS Code SCM 标题栏布局切换）。
+               标题栏图标按钮不挂 ToolTip（悬停弹窗会在点击瞬间拦截按钮事件,造成偶发失效）,
+               用 AutomationProperties.Name 提供同等无障碍语义。 -->
+          <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconListTree}" FontFamily="{StaticResource IconFontFamily}"
+                  Command="{Binding ToggleScmLayoutCommand}" Margin="0"
+                  AutomationProperties.Name="切换为树状分组视图"
+                  Visibility="{Binding IsListLayout, Converter={StaticResource BooleanToVisibilityConverter}}" />
+          <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconListFlat}" FontFamily="{StaticResource IconFontFamily}"
+                  Command="{Binding ToggleScmLayoutCommand}" Margin="0"
+                  AutomationProperties.Name="切换为平铺列表视图"
+                  Visibility="{Binding IsTreeLayout, Converter={StaticResource BooleanToVisibilityConverter}}" />
+          <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconRefresh}" FontFamily="{StaticResource IconFontFamily}"
+                  Command="{Binding RefreshCommand}" Margin="0" AutomationProperties.Name="刷新 Git 状态" />
+          <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconRepo}" FontFamily="{StaticResource IconFontFamily}"
+                  Command="{Binding OpenRepositoryCommand}" Margin="0" AutomationProperties.Name="打开或更换仓库目录" />
+          <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconMore}" FontFamily="{StaticResource IconFontFamily}"
+                  Margin="0" Click="MoreActionsButton_Click" AutomationProperties.Name="更多操作">
+            <Button.ContextMenu>
+              <ContextMenu>
+                <MenuItem Header="视图：树状分组" IsCheckable="True"
+                          IsChecked="{Binding IsTreeLayout, Mode=OneWay}"
+                          IsEnabled="{Binding IsTreeLayout, Converter={StaticResource InverseBooleanConverter}}"
+                          Command="{Binding ToggleScmLayoutCommand}" />
+                <MenuItem Header="视图：平铺列表" IsCheckable="True"
+                          IsChecked="{Binding IsListLayout, Mode=OneWay}"
+                          IsEnabled="{Binding IsListLayout, Converter={StaticResource InverseBooleanConverter}}"
+                          Command="{Binding ToggleScmLayoutCommand}" />
+                <Separator />
+                <MenuItem Header="丢弃全部更改" Command="{Binding DiscardAllCommand}" />
+                <MenuItem Header="全部暂存" Command="{Binding StageAllCommand}" />
+                <MenuItem Header="取消全部暂存" Command="{Binding UnstageAllCommand}" />
+                <MenuItem Header="贮藏全部更改" Command="{Binding StashAllChangesCommand}" />
+              </ContextMenu>
+            </Button.ContextMenu>
+          </Button>
+      </StackPanel>
+    </controls:SidebarShell.HeaderActions>
+    <controls:SidebarShell.BodyContent>
+      <DockPanel>
+
+      <!-- 两个独立 SCM 视图：更改视图用单一外层滚动区(分区自上而下堆叠,已暂存紧邻未暂存上方),
+           超长列表在各自内部滚动;图表视图的提交列表在 * 行内滚动。折叠时另一视图填满。 -->
+      <Grid Tag="ScmViewsGrid">
+        <Grid.RowDefinitions>
+          <RowDefinition Height="*" MinHeight="28" />
+          <RowDefinition Height="5" />
+          <RowDefinition Height="*" MinHeight="28" />
+        </Grid.RowDefinitions>
+        <controls:CollapsibleSection Grid.Row="0" Title="更改"
+                                     IsExpanded="{Binding IsChangesViewExpanded, Mode=TwoWay}"
+                                     ToggleCommand="{Binding ToggleSectionCommand}"
+                                     ToggleCommandParameter="changesView">
+          <controls:CollapsibleSection.SectionContent>
+          <DockPanel>
+      <!-- Commit area (VS Code SCM): multi-line message box (Ctrl+Enter commits) + primary commit
+           button with a split menu for push/sync variants. The commit target (branch + ↑/↓) is
+           carried by the message watermark, the graph toolbar and the status bar — not repeated here. -->
+      <Border DockPanel.Dock="Top" Padding="8,4,8,6"
+              Visibility="{Binding IsRepository, Converter={StaticResource BooleanToVisibilityConverter}}">
+        <StackPanel>
+          <!-- 空消息时提示文字显示在输入框内部；输入框默认单行,有换行时按内容自动增高。 -->
+          <Grid>
+            <TextBox Text="{Binding CommitMessage, UpdateSourceTrigger=PropertyChanged}" AcceptsReturn="True"
+                     MinHeight="{DynamicResource SizeRowMd}" VerticalContentAlignment="Top"
+                     TextWrapping="Wrap" Padding="6,5,30,5"
+                     ToolTip="输入提交消息（回车换行，Ctrl+Enter 提交）">
+              <TextBox.InputBindings>
+                <KeyBinding Modifiers="Control" Key="Enter" Command="{Binding CommitCommand}" />
+              </TextBox.InputBindings>
+            </TextBox>
+            <TextBlock Text="{Binding CurrentBranch, StringFormat=消息（Ctrl+Enter 提交到 {0}）}"
+                       FontSize="{DynamicResource TypeBody}" Foreground="{DynamicResource MutedTextBrush}"
+                       Margin="8,0,30,0" VerticalAlignment="Center" IsHitTestVisible="False"
+                       TextTrimming="CharacterEllipsis"
+                       Visibility="{Binding HasCommitMessage, Converter={StaticResource InverseBooleanToVisibilityConverter}}" />
+            <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconHistory}" FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconInline}"
+                    HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,1,1,1" MinWidth="22" MinHeight="20" Padding="2,0"
+                    ToolTip="最近的提交消息" Click="MoreActionsButton_Click"
+                    Visibility="{Binding RecentCommitMessages.Count, Converter={StaticResource NonZeroCountToVisibilityConverter}}">
+              <Button.ContextMenu>
+                <ContextMenu ItemsSource="{Binding RecentCommitMessages}" MaxWidth="320">
+                  <ContextMenu.ItemContainerStyle>
+                    <Style TargetType="MenuItem">
+                      <Setter Property="Header" Value="{Binding}" />
+                      <Setter Property="Command"
+                              Value="{Binding DataContext.ApplyCommitMessageCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                      <Setter Property="CommandParameter" Value="{Binding}" />
+                    </Style>
+                  </ContextMenu.ItemContainerStyle>
+                </ContextMenu>
+              </Button.ContextMenu>
+            </Button>
+          </Grid>
+          <!-- 提交主按钮 + 拆分菜单（提交并推送 / 提交并同步，VS Code 单列圆角容器） -->
+          <Grid Margin="0,8,0,0">
+            <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+            <Button Command="{Binding CommitCommand}" Style="{StaticResource CommitSplitMainButtonStyle}"
+                    ToolTip="提交暂存的更改（Ctrl+Enter）">
+              <StackPanel Orientation="Horizontal">
+                <TextBlock Text="{StaticResource CodiconCheck}" FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconInline}" VerticalAlignment="Center" Margin="0,1,8,0" />
+                <TextBlock Text="提交" VerticalAlignment="Center" />
+              </StackPanel>
+            </Button>
+            <Button Grid.Column="1" Style="{StaticResource CommitSplitChevronButtonStyle}"
+                    Content="{StaticResource CodiconChevronDown}" FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconChevron}"
+                    ToolTip="提交选项" IsEnabled="{Binding CanCommit}" Click="MoreActionsButton_Click">
+              <Button.ContextMenu>
+                <ContextMenu>
+                  <MenuItem Header="提交并推送" Command="{Binding CommitAndPushCommand}" />
+                  <MenuItem Header="提交并同步（拉取后推送）" Command="{Binding CommitAndSyncCommand}" />
+                </ContextMenu>
+              </Button.ContextMenu>
+            </Button>
+          </Grid>
+        </StackPanel>
+      </Border>
+
+      <!-- 分区自上而下按 VS Code 顺序堆叠:已暂存的更改直接位于未暂存的更改上方,每个分区
+           只占自身内容高度,相邻分区之间不留空白(剩余空间沉到视图底部,不再被某个分区的
+           列表撑满推到底部)。总内容超过视口时由外层单一滚动区承接;各列表以
+           MaxHeight=视口高 限定自身视口,超长列表在内部滚动 → 虚拟化保持生效
+           (无界 Auto 链会让虚拟化失效)。 -->
+      <!-- 列表的 MaxHeight 用 AncestorType=ScrollViewer 回溯绑定到本滚动区(元素位于
+            SidebarShell 属性元素内,该作用域不允许 x:Name 注册,故不命名、不用 ElementName)。
+            嵌套滚动链:指针在列表内且该列表在滚轮方向已到头/尾时,滚轮转发到本滚动区
+            (ChangesSection_PreviewMouseWheel),外层滚动条因此可用鼠标滚轮驱动。 -->
+      <ScrollViewer
+                    VerticalScrollBarVisibility="Auto"
+                    HorizontalScrollBarVisibility="Disabled"
+                    PreviewMouseWheel="ChangesSection_PreviewMouseWheel">
+        <Grid Margin="0,0,0,12">
+          <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+          </Grid.RowDefinitions>
+
+        <!-- Row 0: 无仓库占位 / 干净提示(均 Auto,无条目时整行收拢) -->
+        <StackPanel Grid.Row="0">
+          <StackPanel Visibility="{Binding IsRepository, Converter={StaticResource InverseBooleanToVisibilityConverter}}">
+            <views:EmptyStateControl Icon="{StaticResource CodiconRepo}" Title="尚未打开 Git 仓库"
+                                      Description="选择仓库目录后，在此查看更改、暂存、分支与提交历史。" />
+            <Button Content="初始化 Git 仓库" Command="{Binding InitializeRepositoryCommand}"
+                    Visibility="{Binding HasWorkspace, Converter={StaticResource BooleanToVisibilityConverter}}"
+                    HorizontalAlignment="Center" Margin="0,4,0,4" />
+            <Button Content="选择仓库…" Command="{Binding OpenRepositoryCommand}" HorizontalAlignment="Center" Margin="0,4,0,12" />
+          </StackPanel>
+          <views:EmptyStateControl Icon="{StaticResource CodiconCheck}" Title="工作区干净，没有更改。"
+                                   Visibility="{Binding IsClean, Converter={StaticResource BooleanToVisibilityConverter}}" />
+        </StackPanel>
+
+            <!-- 已暂存的更改（VS Code：暂存分区在上，计数徽标 + 悬停行内操作；支持拖入暂存） -->
+            <controls:CollapsibleSection Grid.Row="1" Title="已暂存的更改" BadgeCount="{Binding StagedChanges.Count}" AlwaysShowBadge="True"
+                                         Margin="0,8,0,0"
+                                         AllowDrop="True" DragOver="ChangeSection_DragOver" Drop="StagedSection_Drop"
+                                         IsExpanded="{Binding IsStagedSectionExpanded, Mode=TwoWay}"
+                                         ToggleCommand="{Binding ToggleSectionCommand}"
+                                         ToggleCommandParameter="staged">
+              <controls:CollapsibleSection.HeaderContent>
+                <Button Style="{StaticResource ScmHeaderActionButtonStyle}" Content="{StaticResource CodiconRemove}" FontFamily="{StaticResource IconFontFamily}"
+                        ToolTip="取消全部暂存" Command="{Binding UnstageAllCommand}" />
+              </controls:CollapsibleSection.HeaderContent>
+              <controls:CollapsibleSection.SectionContent>
+              <Grid Visibility="{Binding StagedChanges.Count, Converter={StaticResource NonZeroCountToVisibilityConverter}}">
+                <!-- 平铺布局 -->
+                <ListBox Tag="staged" ItemsSource="{Binding StagedChangesView}" SelectedItem="{Binding SelectedStagedChange}"
+                         MaxHeight="{Binding ViewportHeight, RelativeSource={RelativeSource AncestorType=ScrollViewer}}"
+                         PreviewMouseMove="ChangeList_PreviewMouseMove"
+                         SelectionMode="Extended" KeyboardNavigation.TabNavigation="None" Padding="0,2,0,2"
+                         b:MultiSelectorBinding.SelectedItems="{Binding SelectedStagedChanges}"
+                         b:ListSelectionBehavior.SelectOnRightClick="True"
+                         Background="Transparent" BorderThickness="0" ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                         ScrollViewer.VerticalScrollBarVisibility="Auto"
+                         ScrollViewer.CanContentScroll="True"
+                         VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
+                         ItemContainerStyle="{StaticResource ScmRowStyle}" ItemTemplate="{StaticResource ScmFileRowTemplate}"
+                         Visibility="{Binding IsListLayout, Converter={StaticResource BooleanToVisibilityConverter}}">
+                  <ListBox.ContextMenu>
+                    <ContextMenu>
+                      <MenuItem Header="打开文件" Command="{Binding OpenFilePreviewCommand}"
+                                CommandParameter="{Binding PlacementTarget.SelectedItem, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                      <MenuItem Header="复制路径" Command="{Binding CopyChangePathsCommand}" InputGestureText="Ctrl+C" />
+                      <MenuItem Header="在资源管理器中显示" Command="{Binding RevealInExplorerCommand}"
+                                CommandParameter="{Binding PlacementTarget.SelectedItem, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                      <MenuItem Header="打开 diff" Command="{Binding OpenChangeDiffCommand}"
+                                CommandParameter="{Binding PlacementTarget.SelectedItem, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                      <Separator />
+                      <MenuItem Header="取消暂存选中" Command="{Binding UnstageSelectedChangesCommand}" />
+                    </ContextMenu>
+                  </ListBox.ContextMenu>
+                </ListBox>
+                <!-- 树状布局 -->
+                <ListBox Tag="staged" ItemsSource="{Binding StagedTreeRows}" SelectedItem="{Binding SelectedStagedTreeRow}"
+                         MaxHeight="{Binding ViewportHeight, RelativeSource={RelativeSource AncestorType=ScrollViewer}}"
+                         PreviewMouseMove="ChangeList_PreviewMouseMove"
+                         MouseEnter="TreeList_MouseEnter" MouseLeave="TreeList_MouseLeave"
+                         SelectionMode="Extended" KeyboardNavigation.TabNavigation="None" Padding="0,2,0,2"
+                         b:MultiSelectorBinding.SelectedItems="{Binding SelectedStagedTreeRows}"
+                         b:ListSelectionBehavior.SelectOnRightClick="True"
+                         Background="Transparent" BorderThickness="0" ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                         ScrollViewer.VerticalScrollBarVisibility="Auto"
+                         ScrollViewer.CanContentScroll="True"
+                         VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
+                         ItemContainerStyle="{StaticResource ScmRowStyle}"
+                         Visibility="{Binding IsTreeLayout, Converter={StaticResource BooleanToVisibilityConverter}}">
+                  <ListBox.Resources>
+                    <DataTemplate DataType="{x:Type vm:ScmFolderNode}">
+                      <ContentControl Content="{Binding}" ContentTemplate="{StaticResource ScmFolderRowTemplate}" />
+                    </DataTemplate>
+                    <DataTemplate DataType="{x:Type vm:ScmFileNode}">
+                      <ContentControl Content="{Binding}" ContentTemplate="{StaticResource ScmTreeFileRowTemplate}" />
+                    </DataTemplate>
+                  </ListBox.Resources>
+                  <ListBox.ContextMenu>
+                    <ContextMenu>
+                      <MenuItem Header="打开文件" Command="{Binding OpenFilePreviewCommand}"
+                                CommandParameter="{Binding PlacementTarget.SelectedItem.Change, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                      <MenuItem Header="复制路径" Command="{Binding CopyChangePathsCommand}" InputGestureText="Ctrl+C" />
+                      <MenuItem Header="在资源管理器中显示" Command="{Binding RevealInExplorerCommand}"
+                                CommandParameter="{Binding PlacementTarget.SelectedItem.Change, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                      <MenuItem Header="打开 diff" Command="{Binding OpenChangeDiffCommand}"
+                                CommandParameter="{Binding PlacementTarget.SelectedItem.Change, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                      <MenuItem Header="取消暂存文件夹" Command="{Binding UnstageFolderCommand}"
+                                CommandParameter="{Binding PlacementTarget.SelectedItem, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                      <Separator />
+                      <MenuItem Header="取消暂存选中" Command="{Binding UnstageSelectedChangesCommand}" />
+                    </ContextMenu>
+                  </ListBox.ContextMenu>
+                </ListBox>
+              </Grid>
+              </controls:CollapsibleSection.SectionContent>
+            </controls:CollapsibleSection>
+
+            <!-- 未暂存的更改（支持拖出取消暂存） -->
+            <controls:CollapsibleSection Grid.Row="2" Title="未暂存的更改" BadgeCount="{Binding UnstagedChanges.Count}" AlwaysShowBadge="True"
+                                         Margin="0,8,0,0"
+                                         AllowDrop="True" DragOver="ChangeSection_DragOver" Drop="UnstagedSection_Drop"
+                                         IsExpanded="{Binding IsUnstagedSectionExpanded, Mode=TwoWay}"
+                                         ToggleCommand="{Binding ToggleSectionCommand}"
+                                         ToggleCommandParameter="unstaged">
+              <controls:CollapsibleSection.HeaderContent>
+                <StackPanel Orientation="Horizontal">
+                  <Button Style="{StaticResource ScmHeaderActionButtonStyle}" Content="{StaticResource CodiconDiscard}" FontFamily="{StaticResource IconFontFamily}"
+                          ToolTip="丢弃全部更改" Command="{Binding DiscardAllCommand}" Foreground="{DynamicResource DangerBrush}" />
+                  <Button Style="{StaticResource ScmHeaderActionButtonStyle}" Content="{StaticResource CodiconAdd}" FontFamily="{StaticResource IconFontFamily}"
+                          ToolTip="全部暂存" Command="{Binding StageAllCommand}" />
+                </StackPanel>
+              </controls:CollapsibleSection.HeaderContent>
+              <controls:CollapsibleSection.SectionContent>
+              <Grid Visibility="{Binding UnstagedChanges.Count, Converter={StaticResource NonZeroCountToVisibilityConverter}}">
+                <!-- 平铺布局 -->
+                <ListBox Tag="unstaged" ItemsSource="{Binding UnstagedChangesView}" SelectedItem="{Binding SelectedUnstagedChange}"
+                         MaxHeight="{Binding ViewportHeight, RelativeSource={RelativeSource AncestorType=ScrollViewer}}"
+                         PreviewMouseMove="ChangeList_PreviewMouseMove"
+                         SelectionMode="Extended" KeyboardNavigation.TabNavigation="None" Padding="0,2,0,2"
+                         b:MultiSelectorBinding.SelectedItems="{Binding SelectedUnstagedChanges}"
+                         b:ListSelectionBehavior.SelectOnRightClick="True"
+                         Background="Transparent" BorderThickness="0" ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                         ScrollViewer.VerticalScrollBarVisibility="Auto"
+                         ScrollViewer.CanContentScroll="True"
+                         VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
+                         ItemContainerStyle="{StaticResource ScmRowStyle}" ItemTemplate="{StaticResource ScmFileRowTemplate}"
+                         Visibility="{Binding IsListLayout, Converter={StaticResource BooleanToVisibilityConverter}}">
+                  <ListBox.ContextMenu>
+                    <ContextMenu>
+                      <MenuItem Header="打开文件" Command="{Binding OpenFilePreviewCommand}"
+                                CommandParameter="{Binding PlacementTarget.SelectedItem, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                      <MenuItem Header="复制路径" Command="{Binding CopyChangePathsCommand}" InputGestureText="Ctrl+C" />
+                      <MenuItem Header="在资源管理器中显示" Command="{Binding RevealInExplorerCommand}"
+                                CommandParameter="{Binding PlacementTarget.SelectedItem, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                      <MenuItem Header="打开 diff" Command="{Binding OpenChangeDiffCommand}"
+                                CommandParameter="{Binding PlacementTarget.SelectedItem, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                      <Separator />
+                      <MenuItem Header="丢弃选中" Command="{Binding DiscardSelectedChangesCommand}" />
+                      <MenuItem Header="暂存选中" Command="{Binding StageSelectedChangesCommand}" />
+                    </ContextMenu>
+                  </ListBox.ContextMenu>
+                </ListBox>
+                <!-- 树状布局 -->
+                <ListBox Tag="unstaged" ItemsSource="{Binding UnstagedTreeRows}" SelectedItem="{Binding SelectedUnstagedTreeRow}"
+                         MaxHeight="{Binding ViewportHeight, RelativeSource={RelativeSource AncestorType=ScrollViewer}}"
+                         PreviewMouseMove="ChangeList_PreviewMouseMove"
+                         MouseEnter="TreeList_MouseEnter" MouseLeave="TreeList_MouseLeave"
+                         SelectionMode="Extended" KeyboardNavigation.TabNavigation="None" Padding="0,2,0,2"
+                         b:MultiSelectorBinding.SelectedItems="{Binding SelectedUnstagedTreeRows}"
+                         b:ListSelectionBehavior.SelectOnRightClick="True"
+                         Background="Transparent" BorderThickness="0" ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                         ScrollViewer.VerticalScrollBarVisibility="Auto"
+                         ScrollViewer.CanContentScroll="True"
+                         VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
+                         ItemContainerStyle="{StaticResource ScmRowStyle}"
+                         Visibility="{Binding IsTreeLayout, Converter={StaticResource BooleanToVisibilityConverter}}">
+                  <ListBox.Resources>
+                    <DataTemplate DataType="{x:Type vm:ScmFolderNode}">
+                      <ContentControl Content="{Binding}" ContentTemplate="{StaticResource ScmFolderRowTemplate}" />
+                    </DataTemplate>
+                    <DataTemplate DataType="{x:Type vm:ScmFileNode}">
+                      <ContentControl Content="{Binding}" ContentTemplate="{StaticResource ScmTreeFileRowTemplate}" />
+                    </DataTemplate>
+                  </ListBox.Resources>
+                  <ListBox.ContextMenu>
+                    <ContextMenu>
+                      <MenuItem Header="打开文件" Command="{Binding OpenFilePreviewCommand}"
+                                CommandParameter="{Binding PlacementTarget.SelectedItem.Change, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                      <MenuItem Header="复制路径" Command="{Binding CopyChangePathsCommand}" InputGestureText="Ctrl+C" />
+                      <MenuItem Header="在资源管理器中显示" Command="{Binding RevealInExplorerCommand}"
+                                CommandParameter="{Binding PlacementTarget.SelectedItem.Change, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                      <MenuItem Header="打开 diff" Command="{Binding OpenChangeDiffCommand}"
+                                CommandParameter="{Binding PlacementTarget.SelectedItem.Change, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                      <MenuItem Header="丢弃文件夹更改" Command="{Binding DiscardFolderCommand}"
+                                CommandParameter="{Binding PlacementTarget.SelectedItem, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                      <MenuItem Header="暂存文件夹" Command="{Binding StageFolderCommand}"
+                                CommandParameter="{Binding PlacementTarget.SelectedItem, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                      <Separator />
+                      <MenuItem Header="丢弃选中" Command="{Binding DiscardSelectedChangesCommand}" />
+                      <MenuItem Header="暂存选中" Command="{Binding StageSelectedChangesCommand}" />
+                    </ContextMenu>
+                  </ListBox.ContextMenu>
+                </ListBox>
+              </Grid>
+              </controls:CollapsibleSection.SectionContent>
+            </controls:CollapsibleSection>
+
+            <!-- 贮藏：行内 应用 / 丢弃（工作区更改,归"更改"视图） -->
+            <controls:CollapsibleSection Grid.Row="3" Title="贮藏" BadgeCount="{Binding Stashes.Count}"
+                                         Margin="0,8,0,0"
+                                         Visibility="{Binding Stashes.Count, Converter={StaticResource NonZeroCountToVisibilityConverter}}">
+              <controls:CollapsibleSection.SectionContent>
+              <ListBox ItemsSource="{Binding Stashes}"
+                       MaxHeight="{Binding ViewportHeight, RelativeSource={RelativeSource AncestorType=ScrollViewer}}"
+                       KeyboardNavigation.TabNavigation="None" Padding="0,2,0,2"
+                       ScrollViewer.VerticalScrollBarVisibility="Auto"
+                       ScrollViewer.CanContentScroll="True"
+                       VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
+                       Background="Transparent" BorderThickness="0" ItemContainerStyle="{StaticResource ScmRowStyle}">
+                <ListBox.ItemTemplate>
+                  <DataTemplate>
+                    <Grid>
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                      <StackPanel Orientation="Horizontal" MinWidth="0" VerticalAlignment="Center">
+                        <TextBlock Text="{StaticResource CodiconGitBranch}" FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconInline}"
+                                   Foreground="{DynamicResource MutedTextBrush}" VerticalAlignment="Center" Margin="0,0,8,0" />
+                        <TextBlock Text="{Binding Message}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"
+                                   ToolTip="{Binding Message}" />
+                      </StackPanel>
+                      <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                        <StackPanel.Style>
+                          <Style TargetType="StackPanel">
+                            <Setter Property="Visibility" Value="Collapsed" />
+                            <Style.Triggers>
+                              <DataTrigger Binding="{Binding IsMouseOver, RelativeSource={RelativeSource AncestorType=ListBoxItem}}" Value="True"><Setter Property="Visibility" Value="Visible" /></DataTrigger>
+                              <DataTrigger Binding="{Binding IsSelected, RelativeSource={RelativeSource AncestorType=ListBoxItem}}" Value="True"><Setter Property="Visibility" Value="Visible" /></DataTrigger>
+                            </Style.Triggers>
+                          </Style>
+                        </StackPanel.Style>
+                        <Button Style="{StaticResource ScmRowActionButtonStyle}" Content="{StaticResource CodiconGitStashApply}" FontFamily="{StaticResource IconFontFamily}" ToolTip="应用贮藏（并移除）"
+                                Command="{Binding DataContext.PopStashCommand, RelativeSource={RelativeSource AncestorType=UserControl}}" CommandParameter="{Binding}" />
+                        <Button Style="{StaticResource ScmRowActionButtonStyle}" Content="{StaticResource CodiconDiscard}" FontFamily="{StaticResource IconFontFamily}" ToolTip="丢弃贮藏" Foreground="{DynamicResource DangerBrush}"
+                                Command="{Binding DataContext.DropStashCommand, RelativeSource={RelativeSource AncestorType=UserControl}}" CommandParameter="{Binding}" />
+                      </StackPanel>
+                    </Grid>
+                  </DataTemplate>
+                </ListBox.ItemTemplate>
+              </ListBox>
+              </controls:CollapsibleSection.SectionContent>
+            </controls:CollapsibleSection>
+        </Grid>
+      </ScrollViewer>
+          </DockPanel>
+          </controls:CollapsibleSection.SectionContent>
+        </controls:CollapsibleSection>
+
+        <GridSplitter Tag="ScmPanelSplitter" Grid.Row="1" Height="5" HorizontalAlignment="Stretch"
+                      VerticalAlignment="Stretch" Background="Transparent" DragCompleted="ScmPanelSplitter_DragCompleted" />
+
+        <!-- 图表视图：远端同步与历史关系。 -->
+        <controls:CollapsibleSection Grid.Row="2" Title="图表"
+                                     IsExpanded="{Binding IsGraphViewExpanded, Mode=TwoWay}"
+                                     ToggleCommand="{Binding ToggleSectionCommand}"
+                                     ToggleCommandParameter="graphView">
+          <controls:CollapsibleSection.SectionContent>
+          <Grid Margin="0,0,0,12">
+            <Grid.RowDefinitions>
+              <RowDefinition Height="Auto" />
+              <RowDefinition>
+                <RowDefinition.Height>
+                  <MultiBinding Converter="{StaticResource ScmSectionRowHeight}">
+                    <Binding Path="IsRepository" />
+                    <Binding Path="IsLogSectionExpanded" />
+                    <Binding Path="LogRows.Count" />
+                  </MultiBinding>
+                </RowDefinition.Height>
+              </RowDefinition>
+            </Grid.RowDefinitions>
+              <Grid Grid.Row="0" Margin="12,8,12,4">
+                <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                <StackPanel Orientation="Horizontal" VerticalAlignment="Center" MinWidth="0">
+                  <TextBlock Text="{StaticResource CodiconSourceControl}" FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconInline}" Foreground="{DynamicResource MutedTextBrush}" VerticalAlignment="Center" Margin="0,0,8,0" />
+                  <!-- 分支选择放在图表标题行，点击分支名打开可切换的下拉菜单；图表内不再嵌套分支折叠栏。 -->
+                  <Button Style="{StaticResource LinkButton}" Padding="2,1" Margin="0" VerticalAlignment="Center"
+                          ToolTip="切换分支" AutomationProperties.Name="切换分支" Click="CurrentBranchSelector_Click">
+                    <Button.ContextMenu>
+                      <ContextMenu DataContext="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource Self}}"
+                                   ItemsSource="{Binding Branches}">
+                        <ContextMenu.ItemContainerStyle>
+                          <Style TargetType="MenuItem">
+                            <Setter Property="Header" Value="{Binding Name}" />
+                            <Setter Property="IsCheckable" Value="True" />
+                            <Setter Property="IsChecked" Value="{Binding IsCurrent}" />
+                            <Setter Property="Command" Value="{Binding DataContext.SwitchBranchCommand, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                            <Setter Property="CommandParameter" Value="{Binding}" />
+                          </Style>
+                        </ContextMenu.ItemContainerStyle>
+                      </ContextMenu>
+                    </Button.ContextMenu>
+                    <StackPanel Orientation="Horizontal">
+                      <TextBlock Text="{Binding CurrentBranch}" FontWeight="SemiBold" FontSize="{DynamicResource TypeBody}"
+                                 TextTrimming="CharacterEllipsis" ToolTip="{Binding CurrentBranch}" VerticalAlignment="Center" />
+                      <TextBlock Text="{StaticResource CodiconChevronDown}" FontFamily="{StaticResource IconFontFamily}"
+                                 FontSize="{DynamicResource IconChevron}" Margin="6,0,0,0" VerticalAlignment="Center" />
+                    </StackPanel>
+                  </Button>
+                  <TextBlock FontSize="{DynamicResource TypeBody}" Foreground="{DynamicResource SuccessBrush}" VerticalAlignment="Center" Margin="8,0,0,0"
+                             Visibility="{Binding AheadCount, Converter={StaticResource NonZeroCountToVisibilityConverter}}">
+                    <Run Text="{StaticResource CodiconArrowUp}" FontFamily="{StaticResource IconFontFamily}" /><Run Text="{Binding AheadCount, StringFormat={}{0}}" />
+                  </TextBlock>
+                  <TextBlock FontSize="{DynamicResource TypeBody}" Foreground="{DynamicResource WarningBrush}" VerticalAlignment="Center" Margin="8,0,0,0"
+                             Visibility="{Binding BehindCount, Converter={StaticResource NonZeroCountToVisibilityConverter}}">
+                    <Run Text="{StaticResource CodiconArrowDown}" FontFamily="{StaticResource IconFontFamily}" /><Run Text="{Binding BehindCount, StringFormat={}{0}}" />
+                  </TextBlock>
+                </StackPanel>
+                <StackPanel Grid.Column="1" Orientation="Horizontal">
+                  <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconGitFetch}" FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconInline}" ToolTip="获取并刷新" Command="{Binding FetchCommand}" Margin="0" />
+                  <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconCloudDownload}" FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconInline}" ToolTip="拉取（快进）" Command="{Binding PullCommand}" Margin="0" />
+                  <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconCloudUpload}" FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconInline}" ToolTip="推送" Command="{Binding PushCommand}" Margin="0" />
+                  <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconSync}" FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconInline}" ToolTip="安全同步" Command="{Binding SyncCommand}" Margin="0" Foreground="{DynamicResource SuccessBrush}" />
+                </StackPanel>
+              </Grid>
+            <!-- 最近提交：左缘提交图形（VS Code 图表列），底部按页加载更多 -->
+            <controls:CollapsibleSection Grid.Row="1" Title="最近提交"
+                                         Margin="0,8,0,0"
+                                         IsExpanded="{Binding IsLogSectionExpanded, Mode=TwoWay}"
+                                         ToggleCommand="{Binding ToggleSectionCommand}"
+                                         ToggleCommandParameter="log">
+              <controls:CollapsibleSection.SectionContent>
+              <Grid>
+                <Grid.RowDefinitions><RowDefinition Height="*" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+                <!-- 传入的更改/传出的更改 是提交列表顶部的两行(同一 ScmCommitBarTemplate:
+                     布局、单击展开、箭头与文件懒加载机制与提交行完全同构),由 RebuildLogRows
+                     按 上游与 ahead/behind 计数生成,图形为空心圆点(传入=远端色,传出=本地色)。 -->
+                <ListBox Grid.Row="0" ItemsSource="{Binding LogRows}" SelectedItem="{Binding SelectedLogRow}"
+                         SelectionMode="Extended" KeyboardNavigation.TabNavigation="None" Padding="0,2,0,2"
+                         b:MultiSelectorBinding.SelectedItems="{Binding SelectedCommits}"
+                         b:ListSelectionBehavior.SelectOnRightClick="True"
+                         ScrollViewer.VerticalScrollBarVisibility="Auto"
+                         ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                         ScrollViewer.CanContentScroll="True"
+                         VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
+                         Background="Transparent" BorderThickness="0" ItemContainerStyle="{StaticResource ScmGraphRowStyle}"
+                         ItemTemplate="{StaticResource ScmCommitBarTemplate}">
+                <ListBox.ContextMenu>
+                  <ContextMenu>
+                    <MenuItem Header="复制哈希" Command="{Binding CopyCommitHashesCommand}" InputGestureText="Ctrl+C" />
+                    <MenuItem Header="复制主题" Command="{Binding CopyCommitSubjectsCommand}" />
+                  </ContextMenu>
+                </ListBox.ContextMenu>
+              </ListBox>
+              <Button Grid.Row="1" Content="加载更多提交…" Command="{Binding LoadMoreCommitsCommand}" Style="{StaticResource LinkButton}"
+                      HorizontalAlignment="Left" Margin="8,2" Padding="4,2"
+                      Visibility="{Binding CanLoadMoreCommits, Converter={StaticResource BooleanToVisibilityConverter}}" />
+              </Grid>
+              </controls:CollapsibleSection.SectionContent>
+            </controls:CollapsibleSection>
+          </Grid>
+            </controls:CollapsibleSection.SectionContent>
+            </controls:CollapsibleSection>
+      </Grid>
+      </DockPanel>
+    </controls:SidebarShell.BodyContent>
+  </controls:SidebarShell>
+</UserControl>

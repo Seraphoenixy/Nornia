@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <xsd:schema id="root" xmlns="" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:msdata="urn:schemas-microsoft-com:xml-msdata">
+    <xsd:import namespace="http://www.w3.org/2001/XMLSchema" />
+    <xsd:element name="root" msdata:IsDataSet="true">
+      <xsd:complexType>
+        <xsd:choice maxOccurs="unbounded">
+          <xsd:element name="metadata">
+            <xsd:complexType>
+              <xsd:sequence><xsd:element name="value" type="xsd:string" minOccurs="0" /></xsd:sequence>
+              <xsd:attribute name="name" use="required" type="xsd:string" />
+              <xsd:attribute name="type" type="xsd:string" />
+              <xsd:attribute name="mimetype" type="xsd:string" />
+            </xsd:complexType>
+          </xsd:element>
+          <xsd:element name="assembly"><xsd:complexType><xsd:attribute name="alias" type="xsd:string" /><xsd:attribute name="name" type="xsd:string" /></xsd:complexType></xsd:element>
+          <xsd:element name="data">
+            <xsd:complexType>
+              <xsd:sequence><xsd:element name="value" type="xsd:string" minOccurs="0" msdata:Ordinal="1" /><xsd:element name="comment" type="xsd:string" minOccurs="0" msdata:Ordinal="2" /></xsd:sequence>
+              <xsd:attribute name="name" type="xsd:string" use="required" msdata:Ordinal="1" />
+              <xsd:attribute name="type" type="xsd:string" msdata:Ordinal="3" />
+              <xsd:attribute name="mimetype" type="xsd:string" msdata:Ordinal="4" />
+            </xsd:complexType>
+          </xsd:element>
+          <xsd:element name="resheader">
+            <xsd:complexType>
+              <xsd:sequence><xsd:element name="value" type="xsd:string" minOccurs="0" msdata:Ordinal="1" /></xsd:sequence>
+              <xsd:attribute name="name" type="xsd:string" use="required" />
+            </xsd:complexType>
+          </xsd:element>
+        </xsd:choice>
+      </xsd:complexType>
+    </xsd:element>
+  </xsd:schema>
+  <resheader name="resmimetype"><value>text/microsoft-resx</value></resheader>
+  <resheader name="version"><value>2.0</value></resheader>
+  <resheader name="reader"><value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader>
+  <resheader name="writer"><value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value></resheader>
+
+  <!-- Activity bar (navigation) titles -->
+  <data name="Nav_Environment" xml:space="preserve"><value>环境管理</value></data>
+  <data name="Nav_Explorer" xml:space="preserve"><value>资源管理器</value></data>
+  <data name="Nav_Search" xml:space="preserve"><value>搜索</value></data>
+  <data name="Search_Title" xml:space="preserve"><value>搜索</value></data>
+  <data name="Search_TreeView" xml:space="preserve"><value>树状视图</value></data>
+  <data name="Search_ListView" xml:space="preserve"><value>列表视图</value></data>
+  <data name="Search_Placeholder" xml:space="preserve"><value>在文件中查找</value></data>
+  <data name="Search_Action" xml:space="preserve"><value>搜索</value></data>
+  <data name="Search_CaseSensitive" xml:space="preserve"><value>区分大小写</value></data>
+  <data name="Search_WholeWord" xml:space="preserve"><value>全词匹配</value></data>
+  <data name="Search_Regex" xml:space="preserve"><value>使用正则表达式</value></data>
+  <data name="Search_ToggleDetails" xml:space="preserve"><value>显示或隐藏搜索筛选条件</value></data>
+  <data name="Search_IncludeLabel" xml:space="preserve"><value>包含文件</value></data>
+  <data name="Search_ExcludeLabel" xml:space="preserve"><value>排除文件</value></data>
+  <data name="Search_Include" xml:space="preserve"><value>包含文件，例如 **/*.cs</value></data>
+  <data name="Search_Exclude" xml:space="preserve"><value>排除文件，例如 **/generated/**</value></data>
+  <data name="Search_UseIgnoreFiles" xml:space="preserve"><value>使用忽略文件（.gitignore）</value></data>
+  <data name="Search_Cancel" xml:space="preserve"><value>取消</value></data>
+  <data name="Search_ExpandAll" xml:space="preserve"><value>展开全部</value></data>
+  <data name="Search_CollapseAll" xml:space="preserve"><value>折叠全部</value></data>
+  <data name="Search_Clear" xml:space="preserve"><value>清空搜索</value></data>
+  <data name="Search_Truncated" xml:space="preserve"><value>结果已截断</value></data>
+  <data name="Nav_Git" xml:space="preserve"><value>源代码管理</value></data>
+  <data name="Nav_Projects" xml:space="preserve"><value>项目管理</value></data>
+  <data name="Nav_Settings" xml:space="preserve"><value>设置</value></data>
+
+  <data name="Legacy_Dashboard" xml:space="preserve"><value>任务中心</value></data>
+  <data name="Legacy_Runtime" xml:space="preserve"><value>运行库</value></data>
+  <data name="Legacy_Tools" xml:space="preserve"><value>开发工具</value></data>
+  <data name="Legacy_Packages" xml:space="preserve"><value>软件包</value></data>
+  <data name="Legacy_Projects" xml:space="preserve"><value>项目</value></data>
+
+  <!-- Bottom panel tabs -->
+  <data name="Panel_Output" xml:space="preserve"><value>输出</value></data>
+  <data name="Panel_Terminal" xml:space="preserve"><value>终端</value></data>
+
+  <!-- Status bar -->
+  <data name="Status_Ready" xml:space="preserve"><value>工作台就绪</value></data>
+  <data name="Status_NProblems" xml:space="preserve"><value>{0} 个问题</value></data>
+
+  <!-- Operation status banner -->
+  <data name="Op_ViewLog" xml:space="preserve"><value>查看日志</value></data>
+  <data name="Op_Cancel" xml:space="preserve"><value>取消</value></data>
+  <data name="Op_LogRef" xml:space="preserve"><value>日志 #{0}</value></data>
+
+  <!-- Log / problems panel -->
+  <data name="Search_LogPlaceholder" xml:space="preserve"><value>搜索日志关键字（消息或级别）</value></data>
+  <data name="Level_All" xml:space="preserve"><value>全部</value></data>
+  <data name="Level_Info" xml:space="preserve"><value>信息</value></data>
+  <data name="Level_Warning" xml:space="preserve"><value>警告</value></data>
+  <data name="Level_Error" xml:space="preserve"><value>错误</value></data>
+  <data name="ProblemsTabTitle" xml:space="preserve"><value>问题</value></data>
+  <data name="ClearOutput" xml:space="preserve"><value>清空输出</value></data>
+  <data name="CollapsePanel" xml:space="preserve"><value>收起输出面板</value></data>
+  <data name="Copy" xml:space="preserve"><value>复制</value></data>
+  <data name="CopyMessage" xml:space="preserve"><value>复制消息</value></data>
+  <data name="CopyAll" xml:space="preserve"><value>复制全部</value></data>
+  <data name="ClearMessages" xml:space="preserve"><value>清空消息</value></data>
+
+  <!-- Workbench empty state -->
+  <data name="Empty_NoTabs_Title" xml:space="preserve"><value>没有打开的标签</value></data>
+  <data name="Empty_NoTabs_Description" xml:space="preserve"><value>从左侧活动栏或环境侧栏选择页面，或在资源管理器 / 源代码管理中打开文件与差异。</value></data>
+
+  <!-- Toolbar / action labels -->
+  <data name="CloseTab" xml:space="preserve"><value>关闭标签</value></data>
+  <data name="CloseOtherTabs" xml:space="preserve"><value>关闭其他标签</value></data>
+  <data name="CloseAllTabs" xml:space="preserve"><value>关闭全部</value></data>
+  <data name="ToggleSidebar" xml:space="preserve"><value>显示或隐藏侧栏</value></data>
+  <data name="TogglePanel" xml:space="preserve"><value>显示或隐藏输出面板</value></data>
+  <data name="Settings" xml:space="preserve"><value>设置</value></data>
+
+  <!-- Title-bar command center: back/forward navigation -->
+  <data name="NavBack" xml:space="preserve"><value>后退</value></data>
+  <data name="NavForward" xml:space="preserve"><value>前进</value></data>
+</root>

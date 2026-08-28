@@ -1,0 +1,230 @@
+<UserControl x:Class="Nornia.Desktop.Views.SettingsView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <UserControl.Resources>
+    <Style x:Key="SettingsHintStyle" TargetType="TextBlock" BasedOn="{StaticResource CaptionStyle}">
+      <Setter Property="TextWrapping" Value="Wrap" />
+      <Setter Property="Margin" Value="0,2,16,0" />
+    </Style>
+
+    <!-- Settings cards share these three semantic regions. The wide and compact card templates
+         below only change their placement, so bindings and editor behavior stay identical. -->
+    <DataTemplate x:Key="SettingsBasicInfoTemplate">
+      <StackPanel>
+        <TextBlock Text="{Binding Title}" FontWeight="SemiBold" Foreground="{DynamicResource TextBrush}" />
+        <TextBlock Text="{Binding Description}" Style="{StaticResource SettingsHintStyle}" />
+        <TextBlock FontFamily="{StaticResource MonoFontFamily}" FontSize="{DynamicResource TypeBody}"
+                   Foreground="{DynamicResource SubtleTextBrush}" Margin="0,5,0,0" TextWrapping="Wrap">
+          <Run Text="设置 ID：" /><Run Text="{Binding Id, Mode=OneWay}" />
+        </TextBlock>
+      </StackPanel>
+    </DataTemplate>
+
+    <DataTemplate x:Key="SettingsMetadataTemplate">
+      <Grid>
+        <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+        <TextBlock FontSize="{DynamicResource TypeBody}" Margin="0,0,12,4">
+          <Run Text="当前作用域值：" Foreground="{DynamicResource MutedTextBrush}" /><Run Text="{Binding CurrentScopeValueText}" />
+        </TextBlock>
+        <TextBlock Grid.Column="1" FontSize="{DynamicResource TypeBody}" Margin="0,0,0,4">
+          <Run Text="生效值：" Foreground="{DynamicResource MutedTextBrush}" /><Run Text="{Binding EffectiveValueText}" />
+        </TextBlock>
+        <TextBlock Grid.Row="1" FontSize="{DynamicResource TypeBody}" Foreground="{DynamicResource MutedTextBrush}">
+          <Run Text="内置值：" /><Run Text="{Binding DefaultValueText}" />
+        </TextBlock>
+        <TextBlock Grid.Row="1" Grid.Column="1" FontSize="{DynamicResource TypeBody}"
+                   Foreground="{DynamicResource MutedTextBrush}" TextWrapping="Wrap">
+          <Run Text="来源链：" /><Run Text="{Binding SourceChainText}" />
+        </TextBlock>
+      </Grid>
+    </DataTemplate>
+
+    <DataTemplate x:Key="SettingsEditorTemplate">
+      <StackPanel VerticalAlignment="Center">
+        <CheckBox Content="启用" IsChecked="{Binding BooleanValue}"
+                  Visibility="{Binding IsBoolean, Converter={StaticResource BooleanToVisibilityConverter}}"
+                  AutomationProperties.Name="{Binding Title}" />
+        <ComboBox ItemsSource="{Binding EnumOptions}" SelectedItem="{Binding SelectedEnum}"
+                  Visibility="{Binding IsEnumeration, Converter={StaticResource BooleanToVisibilityConverter}}"
+                  AutomationProperties.Name="{Binding Title}">
+          <!-- 下拉展示中文/可读文本,提交仍写回原始 Value。 -->
+          <ComboBox.ItemTemplate>
+            <DataTemplate>
+              <TextBlock Text="{Binding Text}" FontSize="{DynamicResource TypeBody}" />
+            </DataTemplate>
+          </ComboBox.ItemTemplate>
+        </ComboBox>
+        <!-- 字体编辑器:与枚举一样从候选列表取值,但每项用自己的字体渲染并标注未安装项。 -->
+        <ComboBox ItemsSource="{Binding EnumOptions}" SelectedItem="{Binding SelectedEnum}"
+                  Visibility="{Binding IsFontEditor, Converter={StaticResource BooleanToVisibilityConverter}}"
+                  AutomationProperties.Name="{Binding Title}">
+          <ComboBox.ItemTemplate>
+            <DataTemplate>
+              <StackPanel Orientation="Horizontal">
+                <TextBlock Text="{Binding Text}" FontFamily="{Binding Text}" FontSize="{DynamicResource TypeBody}"
+                           VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                <TextBlock Text="（未安装）" FontSize="{DynamicResource TypeBody}"
+                           Foreground="{DynamicResource MutedTextBrush}" Margin="8,0,0,0"
+                           VerticalAlignment="Center"
+                           Visibility="{Binding Text, Converter={StaticResource FontAvailabilityConverter}}" />
+              </StackPanel>
+            </DataTemplate>
+          </ComboBox.ItemTemplate>
+        </ComboBox>
+        <TextBox Text="{Binding ValueText, UpdateSourceTrigger=PropertyChanged}"
+                 Visibility="{Binding IsTextEditor, Converter={StaticResource BooleanToVisibilityConverter}}"
+                 AutomationProperties.Name="{Binding Title}" />
+        <TextBlock Text="{Binding ErrorText}" Foreground="{DynamicResource ErrorTextBrush}"
+                   TextWrapping="Wrap" Margin="0,4,0,0" />
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,8,0,0">
+          <Button Content="复制 ID"
+                  Command="{Binding DataContext.Editor.CopySettingIdCommand, RelativeSource={RelativeSource AncestorType=UserControl}}"
+                  CommandParameter="{Binding}" />
+          <Button Content="重置当前作用域" Margin="8,0,0,0"
+                  Command="{Binding DataContext.Editor.ResetSettingCommand, RelativeSource={RelativeSource AncestorType=UserControl}}"
+                  CommandParameter="{Binding}" />
+        </StackPanel>
+      </StackPanel>
+    </DataTemplate>
+
+    <!-- Wide layout: basic information / metadata / editor. -->
+    <DataTemplate x:Key="SettingsCardWideTemplate">
+      <Grid Margin="16,12">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*" MinWidth="300" />
+          <ColumnDefinition Width="340" />
+          <ColumnDefinition Width="280" />
+        </Grid.ColumnDefinitions>
+        <ContentControl Content="{Binding}" ContentTemplate="{StaticResource SettingsBasicInfoTemplate}"
+                        Margin="0,0,16,0" HorizontalContentAlignment="Stretch" />
+        <ContentControl Grid.Column="1" Content="{Binding}" ContentTemplate="{StaticResource SettingsMetadataTemplate}"
+                        Margin="0,0,16,0" VerticalAlignment="Center" HorizontalContentAlignment="Stretch" />
+        <ContentControl Grid.Column="2" Content="{Binding}" ContentTemplate="{StaticResource SettingsEditorTemplate}"
+                        HorizontalContentAlignment="Stretch" />
+      </Grid>
+    </DataTemplate>
+
+    <!-- Compact layout: editor stays beside the basic information; metadata gets a full row. -->
+    <DataTemplate x:Key="SettingsCardCompactTemplate">
+      <Grid Margin="16,12">
+        <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="280" /></Grid.ColumnDefinitions>
+        <ContentControl Content="{Binding}" ContentTemplate="{StaticResource SettingsBasicInfoTemplate}"
+                        Margin="0,0,16,0" HorizontalContentAlignment="Stretch" />
+        <ContentControl Grid.Column="1" Content="{Binding}" ContentTemplate="{StaticResource SettingsEditorTemplate}"
+                        HorizontalContentAlignment="Stretch" />
+        <ContentControl Grid.Row="1" Grid.ColumnSpan="2" Content="{Binding}"
+                        ContentTemplate="{StaticResource SettingsMetadataTemplate}" Margin="0,12,0,0"
+                        HorizontalContentAlignment="Stretch" />
+      </Grid>
+    </DataTemplate>
+
+    <Style x:Key="SettingsCardContentStyle" TargetType="ContentControl">
+      <Setter Property="ContentTemplate" Value="{StaticResource SettingsCardWideTemplate}" />
+      <Style.Triggers>
+        <DataTrigger Binding="{Binding IsCompactLayout, RelativeSource={RelativeSource AncestorType=UserControl}}" Value="True">
+          <Setter Property="ContentTemplate" Value="{StaticResource SettingsCardCompactTemplate}" />
+        </DataTrigger>
+      </Style.Triggers>
+    </Style>
+  </UserControl.Resources>
+  <Grid Style="{StaticResource PageRootStyle}">
+    <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+    <Border Padding="{StaticResource InsetPage}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,0,0,1">
+      <DockPanel>
+        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+          <TextBlock Text="{Binding Editor.SaveStatus}" Foreground="{DynamicResource MutedTextBrush}" VerticalAlignment="Center" Margin="{StaticResource GapLeftMd}" />
+          <Button Content="恢复此分类" Command="{Binding Editor.ResetCurrentCategoryCommand}" />
+          <Button Content="恢复布局" Command="{Binding Editor.ResetLayoutStateCommand}" Margin="{StaticResource GapLeftMd}" />
+        </StackPanel>
+        <StackPanel>
+          <TextBlock Text="设置" Style="{StaticResource PageTitleStyle}" />
+          <TextBlock Text="目录驱动；更改按键事务自动保存" Style="{StaticResource SubtitleTextStyle}" Margin="0,4,0,0" />
+        </StackPanel>
+      </DockPanel>
+    </Border>
+    <Border Grid.Row="1" Padding="24,8" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,0,0,1">
+      <Grid>
+        <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition Width="Auto" /><ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+        <Button Content="用户" Command="{Binding Editor.SelectScopeCommand}" CommandParameter="User" AutomationProperties.Name="编辑用户设置" />
+        <Button Grid.Column="1" Content="工作区" Margin="8,0,0,0" Command="{Binding Editor.SelectScopeCommand}"
+                CommandParameter="Workspace" IsEnabled="{Binding Editor.HasWorkspace}" AutomationProperties.Name="编辑工作区设置" />
+        <Button Grid.Column="2" Content="键盘快捷方式" Margin="8,0,0,0" Command="{Binding Editor.ShowKeyboardShortcutsCommand}"
+                AutomationProperties.Name="打开键盘快捷方式编辑器" />
+        <TextBlock Grid.Column="3" Text="{Binding Editor.ScopeDescription}" Style="{StaticResource CaptionStyle}"
+                   Margin="16,0" VerticalAlignment="Center" TextWrapping="Wrap" />
+        <StackPanel Grid.Column="4" Orientation="Horizontal" VerticalAlignment="Center">
+          <TextBlock Text="语言覆盖" Style="{StaticResource CaptionStyle}" VerticalAlignment="Center" Margin="0,0,8,0" />
+          <ComboBox Width="160" ItemsSource="{Binding Editor.Languages}"
+                    SelectedItem="{Binding Editor.SelectedLanguage}" AutomationProperties.Name="设置语言覆盖" />
+        </StackPanel>
+      </Grid>
+    </Border>
+    <Border Grid.Row="2" Margin="24,12" Padding="12" VerticalAlignment="Top" Panel.ZIndex="2"
+            Background="{DynamicResource SideBarBrush}" BorderBrush="{DynamicResource ErrorTextBrush}" BorderThickness="1"
+            Visibility="{Binding Editor.HasConflicts, Converter={StaticResource BooleanToVisibilityConverter}}">
+      <DockPanel>
+        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+          <Button Content="重新加载" Command="{Binding Editor.ReloadConflictsCommand}" />
+          <Button Content="使用磁盘值" Margin="8,0,0,0" Command="{Binding Editor.ReloadConflictsCommand}" />
+          <Button Content="保留本地" Margin="8,0,0,0" Command="{Binding Editor.KeepLocalConflictsCommand}" />
+          <Button Content="复制差异" Margin="8,0,0,0" Command="{Binding Editor.CopyConflictDiffCommand}" />
+        </StackPanel>
+        <TextBlock Text="设置文件存在同键并发修改，请逐项处理后再保存。" VerticalAlignment="Center" />
+      </DockPanel>
+    </Border>
+    <ListBox Grid.Row="2" ItemsSource="{Binding Editor.View}" BorderThickness="0" Background="Transparent"
+             Padding="24,12" ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+             VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
+             Visibility="{Binding Editor.ShowShortcuts, Converter={StaticResource InverseBooleanToVisibilityConverter}}"
+             AutomationProperties.Name="设置结果">
+      <ListBox.ItemsPanel><ItemsPanelTemplate><VirtualizingStackPanel /></ItemsPanelTemplate></ListBox.ItemsPanel>
+      <ListBox.ItemContainerStyle>
+        <Style TargetType="ListBoxItem">
+          <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+          <Setter Property="Padding" Value="0" />
+          <Setter Property="Margin" Value="0,0,0,8" />
+          <Setter Property="Focusable" Value="False" />
+        </Style>
+      </ListBox.ItemContainerStyle>
+      <ListBox.ItemTemplate>
+        <DataTemplate>
+          <Border Style="{StaticResource SettingsCardStyle}" Padding="0">
+            <Grid>
+              <Grid.ColumnDefinitions><ColumnDefinition Width="3" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+              <Border Background="{DynamicResource AccentBrush}" Visibility="{Binding IsModified, Converter={StaticResource BooleanToVisibilityConverter}}" />
+              <ContentControl Grid.Column="1" Content="{Binding}" Style="{StaticResource SettingsCardContentStyle}" />
+            </Grid>
+          </Border>
+        </DataTemplate>
+      </ListBox.ItemTemplate>
+    </ListBox>
+    <Grid Grid.Row="2" Visibility="{Binding Editor.ShowShortcuts, Converter={StaticResource BooleanToVisibilityConverter}}">
+      <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+      <Button Content="返回设置" Command="{Binding Editor.ShowSettingsCommand}" Margin="24,12" HorizontalAlignment="Left" />
+      <ListBox Grid.Row="1" ItemsSource="{Binding Editor.ShortcutView}" BorderThickness="0" Background="Transparent" Padding="24,0,24,12"
+               VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling">
+        <ListBox.ItemsPanel><ItemsPanelTemplate><VirtualizingStackPanel /></ItemsPanelTemplate></ListBox.ItemsPanel>
+        <ListBox.ItemTemplate>
+          <DataTemplate>
+            <Border Style="{StaticResource SettingsCardStyle}" Margin="0,0,0,6">
+              <Grid>
+                <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="190" /><ColumnDefinition Width="220" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                <StackPanel><TextBlock Text="{Binding Title}" FontWeight="SemiBold" /><TextBlock Text="{Binding CommandId}" FontFamily="{StaticResource MonoFontFamily}" FontSize="{DynamicResource TypeBody}" /><TextBlock Text="{Binding Diagnostic}" Foreground="{DynamicResource ErrorTextBrush}" TextWrapping="Wrap" /></StackPanel>
+                <TextBox Grid.Column="1" Text="{Binding Key, UpdateSourceTrigger=PropertyChanged}" Margin="8,0"
+                         VerticalAlignment="Center" VerticalContentAlignment="Center" />
+                <TextBox Grid.Column="2" Text="{Binding When, UpdateSourceTrigger=PropertyChanged}" Margin="8,0"
+                         VerticalAlignment="Center" VerticalContentAlignment="Center" />
+                <StackPanel Grid.Column="3" Orientation="Horizontal">
+                  <Button Content="保存" Command="{Binding DataContext.Editor.SaveShortcutCommand, RelativeSource={RelativeSource AncestorType=UserControl}}" CommandParameter="{Binding}" />
+                  <Button Content="恢复" Margin="6,0,0,0" Command="{Binding DataContext.Editor.ResetShortcutCommand, RelativeSource={RelativeSource AncestorType=UserControl}}" CommandParameter="{Binding}" />
+                </StackPanel>
+              </Grid>
+            </Border>
+          </DataTemplate>
+        </ListBox.ItemTemplate>
+      </ListBox>
+    </Grid>
+  </Grid>
+</UserControl>

@@ -1,0 +1,70 @@
+<UserControl x:Class="Nornia.Desktop.Views.ToolsView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:views="clr-namespace:Nornia.Desktop.Views"
+             xmlns:b="clr-namespace:Nornia.Desktop.Behaviors">
+  <Grid Style="{StaticResource PageRootStyle}">
+    <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="*" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+
+    <!-- Page title row: title left, primary action right -->
+    <DockPanel LastChildFill="False">
+      <StackPanel><TextBlock Text="开发工具" Style="{StaticResource PageTitleStyle}" /></StackPanel>
+      <Button Content="重新扫描" Command="{Binding ScanCommand}" Style="{StaticResource PrimaryButton}" DockPanel.Dock="Right" VerticalAlignment="Center" />
+    </DockPanel>
+
+    <!-- Toolbar: filter left, batch actions right (wrap when the editor column narrows) -->
+    <Grid Grid.Row="1" Style="{StaticResource ToolbarRowStyle}">
+      <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+      <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+        <TextBlock Text="筛选" VerticalAlignment="Center" Margin="{StaticResource GapLeftSm}" />
+        <TextBox Text="{Binding FilterText, UpdateSourceTrigger=PropertyChanged}" ToolTip="按名称或版本筛选" Width="200" />
+      </StackPanel>
+      <WrapPanel Grid.Column="1" Style="{StaticResource ToolbarActionsStyle}">
+        <Button Content="移除所选" Command="{Binding RemoveCommand}" ToolTip="{Binding RemoveButtonTooltip}" Style="{StaticResource DangerButton}" />
+        <Button Content="升级所选" Command="{Binding UpgradeCommand}" ToolTip="{Binding UpgradeButtonTooltip}" />
+      </WrapPanel>
+    </Grid>
+
+    <DataGrid Grid.Row="2" ItemsSource="{Binding FilteredTools}" SelectedItem="{Binding SelectedTool}"
+             CellStyle="{StaticResource EnvironmentDataGridCellStyle}"
+             SelectionMode="Extended" KeyboardNavigation.TabNavigation="None"
+             b:MultiSelectorBinding.SelectedItems="{Binding SelectedTools}"
+             b:ListSelectionBehavior.SelectOnRightClick="True"
+             AlternationCount="2" CanUserSortColumns="True">
+      <DataGrid.Resources>
+        <Style TargetType="TextBlock" BasedOn="{StaticResource EnvironmentDataGridTextStyle}" />
+      </DataGrid.Resources>
+      <DataGrid.ContextMenu>
+        <ContextMenu>
+          <MenuItem Header="复制选中" Command="{Binding CopySelectedToolsCommand}" InputGestureText="Ctrl+C" />
+          <MenuItem Header="复制全部" Command="{Binding CopyAllToolsCommand}" />
+        </ContextMenu>
+      </DataGrid.ContextMenu>
+      <DataGrid.Columns>
+        <DataGridTextColumn Header="名称" Binding="{Binding Name}" ElementStyle="{StaticResource EnvironmentDataGridTextStyle}" Width="130" />
+        <DataGridTextColumn Header="版本" Binding="{Binding Version}" ElementStyle="{StaticResource EnvironmentDataGridTextStyle}" Width="130" />
+        <DataGridTextColumn Header="可用更新" Binding="{Binding AvailableVersion}" ElementStyle="{StaticResource EnvironmentDataGridTextStyle}" Width="120" />
+        <DataGridTextColumn Header="路径" Binding="{Binding InstallPath}" ElementStyle="{StaticResource EnvironmentDataGridTextStyle}" Width="*" />
+        <DataGridTextColumn Header="架构" Binding="{Binding Architecture}" ElementStyle="{StaticResource EnvironmentDataGridTextStyle}" Width="110" />
+        <DataGridTextColumn Header="状态" Binding="{Binding Status}" Width="110">
+          <DataGridTextColumn.ElementStyle>
+            <Style TargetType="TextBlock" BasedOn="{StaticResource EnvironmentDataGridTextStyle}">
+              <Setter Property="Foreground" Value="{Binding Status, Converter={StaticResource StatusToBrushConverter}}" />
+            </Style>
+          </DataGridTextColumn.ElementStyle>
+        </DataGridTextColumn>
+      </DataGrid.Columns>
+    </DataGrid>
+    <Border Background="{DynamicResource EditorBrush}" Grid.Row="2" Visibility="{Binding Tools.Count, Converter={StaticResource CountToVisibilityConverter}}">
+      <views:EmptyStateControl Icon="{StaticResource CodiconSearch}" Title="没有已扫描到的开发工具。" Description="点击“重新扫描”开始。"
+                               ActionText="重新扫描" ActionCommand="{Binding ScanCommand}" />
+    </Border>
+
+    <!-- Bottom selection summary (single line, same strip as the other data pages) -->
+    <TextBlock Grid.Row="3" Margin="0,8,0,0" Text="{Binding SelectedToolSummary}" ToolTip="{Binding SelectedToolSummary}">
+      <TextBlock.Style>
+        <Style TargetType="TextBlock" BasedOn="{StaticResource SelectionSummaryStyle}" />
+      </TextBlock.Style>
+    </TextBlock>
+  </Grid>
+</UserControl>

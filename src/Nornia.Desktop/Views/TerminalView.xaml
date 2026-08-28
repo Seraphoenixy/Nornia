@@ -1,0 +1,125 @@
+<UserControl x:Class="Nornia.Desktop.Views.TerminalView" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:b="clr-namespace:Nornia.Desktop.Behaviors"
+             xmlns:controls="clr-namespace:Nornia.Desktop.Views.Controls">
+  <UserControl.Resources>
+    <b:DataContextBridge x:Key="TerminalVm" Value="{Binding}" />
+    <!-- VS Code 风格会话侧栏行:悬停/选中/按压态与面板列表一致,选中项使用强调选中色。 -->
+    <Style x:Key="SessionItemStyle" TargetType="ListBoxItem">
+      <Setter Property="Foreground" Value="{DynamicResource TextBrush}" />
+      <Setter Property="FocusVisualStyle" Value="{StaticResource AppFocusRing}" />
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ListBoxItem">
+            <Border x:Name="Row" Background="Transparent" Padding="{StaticResource InsetToolbar}">
+              <ContentPresenter VerticalAlignment="Center" />
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="Row" Property="Background" Value="{DynamicResource HoverBrush}" />
+              </Trigger>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter TargetName="Row" Property="Background" Value="{DynamicResource SelectionActiveBrush}" />
+              </Trigger>
+              <Trigger Property="IsMouseCaptured" Value="True">
+                <Setter TargetName="Row" Property="Background" Value="{DynamicResource PressedBrush}" />
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </UserControl.Resources>
+  <Grid Style="{StaticResource PageRootStyle}">
+    <Grid.ColumnDefinitions>
+      <ColumnDefinition Width="*" />
+      <ColumnDefinition Width="Auto" />
+    </Grid.ColumnDefinitions>
+
+    <!-- 终端主体:单一显示区,当前会话的真实交互式终端;输入、回显与输出均在终端内完成。 -->
+    <Grid Grid.Column="0">
+      <controls:TerminalSurfaceControl x:Name="TerminalSurface" Session="{Binding SelectedSession.Session}"
+                                       TerminalFontSize="{Binding FontSize}"
+                                       TerminalFontFamily="{Binding FontFamily}" />
+      <!-- A redirected stream is not a usable terminal. Make ConPTY launch failures explicit and
+           retryable instead of showing an empty surface that appears to accept keystrokes. -->
+      <Border Background="{DynamicResource PanelBrush}" Visibility="Collapsed">
+        <Border.Style>
+          <Style TargetType="Border">
+            <Setter Property="Visibility" Value="Collapsed" />
+            <Style.Triggers>
+              <DataTrigger Binding="{Binding SelectedSession.IsFailed}" Value="True">
+                <Setter Property="Visibility" Value="Visible" />
+              </DataTrigger>
+            </Style.Triggers>
+          </Style>
+        </Border.Style>
+        <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="440">
+          <TextBlock Text="终端不可用" FontSize="{DynamicResource TypeTitle}" HorizontalAlignment="Center" />
+          <TextBlock Text="{Binding SelectedSession.FailureReason}" TextWrapping="Wrap"
+                     Foreground="{DynamicResource MutedTextBrush}" TextAlignment="Center" Margin="{StaticResource GapVerticalSm}" />
+          <Button Content="重试" Command="{Binding RetryCommand}" CommandParameter="{Binding SelectedSession}"
+                  Style="{StaticResource PrimaryButton}" HorizontalAlignment="Center" />
+        </StackPanel>
+      </Border>
+      <!-- 空状态:全部会话关闭后显示“新建终端”引导。 -->
+      <Border Visibility="{Binding HasSessions, Converter={StaticResource InverseBooleanToVisibilityConverter}}">
+        <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+          <TextBlock Text="{StaticResource CodiconTerminal}" FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconEmpty}"
+                     Foreground="{DynamicResource MutedTextBrush}" HorizontalAlignment="Center" />
+          <TextBlock Text="当前没有终端会话" FontSize="{DynamicResource TypeBody}" Foreground="{DynamicResource MutedTextBrush}"
+                     HorizontalAlignment="Center" Margin="{StaticResource GapVerticalSm}" />
+          <Button Content="新建终端" Command="{Binding NewTerminalCommand}" Style="{StaticResource PrimaryButton}"
+                  HorizontalAlignment="Center" />
+        </StackPanel>
+      </Border>
+    </Grid>
+
+    <!-- 会话侧栏:常驻窄列表,列出全部会话的名称与状态;点击即切换。 -->
+    <Border Grid.Column="1" Width="{Binding SessionSidebarWidth}" Background="{DynamicResource SideBarBrush}"
+            BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1,0,0,0">
+      <Border.Style>
+        <Style TargetType="Border">
+          <Setter Property="Visibility" Value="Visible" />
+          <Style.Triggers><DataTrigger Binding="{Binding ShowSessionSidebar}" Value="False"><Setter Property="Visibility" Value="Collapsed" /></DataTrigger></Style.Triggers>
+        </Style>
+      </Border.Style>
+      <ListBox ItemsSource="{Binding Sessions}" SelectedItem="{Binding SelectedSession}"
+               Background="Transparent" BorderThickness="0" Padding="0,4"
+               AutomationProperties.Name="终端会话列表">
+        <ListBox.ItemTemplate>
+          <DataTemplate>
+            <Grid>
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+              </Grid.ColumnDefinitions>
+              <TextBlock Grid.Column="0" Text="{Binding Title}" FontSize="{DynamicResource TypeBody}"
+                         VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+              <StackPanel Grid.Column="1" Orientation="Horizontal" Margin="{StaticResource GapLeftSm}">
+                <TextBlock Text="{Binding StatusGlyph}" FontFamily="{StaticResource IconFontFamily}"
+                           FontSize="{DynamicResource IconInline}" Foreground="{DynamicResource MutedTextBrush}"
+                           VerticalAlignment="Center" Margin="{StaticResource GapRightSm}" ToolTip="{Binding StatusText}" />
+                <TextBlock Text="{Binding StatusText}" FontSize="{DynamicResource TypeBody}"
+                           Foreground="{DynamicResource MutedTextBrush}" VerticalAlignment="Center" />
+              </StackPanel>
+            </Grid>
+          </DataTemplate>
+        </ListBox.ItemTemplate>
+        <ListBox.ItemContainerStyle>
+          <Style TargetType="ListBoxItem" BasedOn="{StaticResource SessionItemStyle}">
+            <Setter Property="ContextMenu">
+              <Setter.Value>
+                <ContextMenu DataContext="{Binding Value, Source={StaticResource TerminalVm}}">
+                  <MenuItem Header="关闭" Command="{Binding CloseCommand}" CommandParameter="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                  <MenuItem Header="清屏" Command="{Binding ClearCommand}" CommandParameter="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                  <Separator />
+                  <MenuItem Header="复制输出" Command="{Binding CopyTabOutputCommand}" CommandParameter="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                </ContextMenu>
+              </Setter.Value>
+            </Setter>
+          </Style>
+        </ListBox.ItemContainerStyle>
+      </ListBox>
+    </Border>
+  </Grid>
+</UserControl>

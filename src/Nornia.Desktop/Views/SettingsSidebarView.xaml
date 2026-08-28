@@ -1,0 +1,41 @@
+<UserControl x:Class="Nornia.Desktop.Views.SettingsSidebarView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <Grid Background="{DynamicResource SideBarBrush}">
+    <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+    <Grid Style="{StaticResource SideBarTitleBarStyle}">
+      <TextBlock Text="设置" Style="{StaticResource SideBarTitleTextStyle}" />
+    </Grid>
+    <TextBox Grid.Row="1" Margin="8,4,8,8" Text="{Binding SearchText, UpdateSourceTrigger=PropertyChanged}"
+             ToolTip="搜索标题、设置 ID、说明或筛选表达式" AutomationProperties.Name="搜索设置" />
+    <ListBox Grid.Row="2" ItemsSource="{Binding Categories}" SelectedItem="{Binding SelectedCategory}"
+             Background="Transparent" BorderThickness="0" Padding="0,4"
+             VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
+             AutomationProperties.Name="设置分类">
+      <ListBox.ItemContainerStyle>
+        <Style TargetType="ListBoxItem">
+          <Setter Property="Foreground" Value="{DynamicResource TextBrush}" />
+          <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+          <Setter Property="FocusVisualStyle" Value="{StaticResource AppFocusRing}" />
+          <Setter Property="Template">
+            <Setter.Value>
+              <ControlTemplate TargetType="ListBoxItem">
+                <Border x:Name="Row" Height="{DynamicResource SizeRowCompact}" Padding="12,0,8,0" Background="Transparent">
+                  <Grid>
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="24" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                    <TextBlock Text="{Binding Glyph}" FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconInline}" VerticalAlignment="Center" />
+                    <TextBlock Grid.Column="1" Text="{Binding Name}" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                  </Grid>
+                </Border>
+                <ControlTemplate.Triggers>
+                  <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Row" Property="Background" Value="{DynamicResource HoverBrush}" /></Trigger>
+                  <Trigger Property="IsSelected" Value="True"><Setter TargetName="Row" Property="Background" Value="{DynamicResource SelectionActiveBrush}" /></Trigger>
+                </ControlTemplate.Triggers>
+              </ControlTemplate>
+            </Setter.Value>
+          </Setter>
+        </Style>
+      </ListBox.ItemContainerStyle>
+    </ListBox>
+  </Grid>
+</UserControl>

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <data name="Nav_Search" xml:space="preserve"><value>Search</value></data>
+  <data name="Search_Title" xml:space="preserve"><value>Search</value></data>
+  <data name="Search_TreeView" xml:space="preserve"><value>Tree View</value></data>
+  <data name="Search_ListView" xml:space="preserve"><value>List View</value></data>
+  <data name="Search_Placeholder" xml:space="preserve"><value>Search in files</value></data>
+  <data name="Search_Action" xml:space="preserve"><value>Search</value></data>
+  <data name="Search_CaseSensitive" xml:space="preserve"><value>Match Case</value></data>
+  <data name="Search_WholeWord" xml:space="preserve"><value>Match Whole Word</value></data>
+  <data name="Search_Regex" xml:space="preserve"><value>Use Regular Expression</value></data>
+  <data name="Search_ToggleDetails" xml:space="preserve"><value>Show or hide search filters</value></data>
+  <data name="Search_IncludeLabel" xml:space="preserve"><value>Files to include</value></data>
+  <data name="Search_ExcludeLabel" xml:space="preserve"><value>Files to exclude</value></data>
+  <data name="Search_Include" xml:space="preserve"><value>Files to include, e.g. **/*.cs</value></data>
+  <data name="Search_Exclude" xml:space="preserve"><value>Files to exclude, e.g. **/generated/**</value></data>
+  <data name="Search_UseIgnoreFiles" xml:space="preserve"><value>Use ignore files (.gitignore)</value></data>
+  <data name="Search_Cancel" xml:space="preserve"><value>Cancel</value></data>
+  <data name="Search_ExpandAll" xml:space="preserve"><value>Expand All</value></data>
+  <data name="Search_CollapseAll" xml:space="preserve"><value>Collapse All</value></data>
+  <data name="Search_Clear" xml:space="preserve"><value>Clear Search</value></data>
+  <data name="Search_Truncated" xml:space="preserve"><value>Results truncated</value></data>
+  <data name="ClearMessages" xml:space="preserve"><value>Clear Messages</value></data>
+</root>

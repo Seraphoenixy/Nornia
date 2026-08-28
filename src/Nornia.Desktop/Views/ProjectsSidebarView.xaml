@@ -1,0 +1,109 @@
+<UserControl x:Class="Nornia.Desktop.Views.ProjectsSidebarView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:views="clr-namespace:Nornia.Desktop.Views"
+             xmlns:controls="clr-namespace:Nornia.Desktop.Views.Controls"
+             xmlns:b="clr-namespace:Nornia.Desktop.Behaviors">
+  <!-- VS Code list item: hover / pressed + selection backgrounds, keyboard-focus ring -->
+  <UserControl.Resources>
+    <Style x:Key="ProjectRowStyle" TargetType="ListBoxItem">
+      <Setter Property="Padding" Value="12,6" />
+      <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+      <Setter Property="FocusVisualStyle" Value="{StaticResource AppFocusRing}" />
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ListBoxItem">
+            <Border x:Name="RowBackground" Background="Transparent" Padding="{TemplateBinding Padding}">
+              <ContentPresenter />
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="RowBackground" Property="Background" Value="{DynamicResource HoverBrush}" /></Trigger>
+              <Trigger Property="IsSelected" Value="True"><Setter TargetName="RowBackground" Property="Background" Value="{DynamicResource SelectionBrush}" /></Trigger>
+              <Trigger Property="IsMouseCaptured" Value="True"><Setter TargetName="RowBackground" Property="Background" Value="{DynamicResource PressedBrush}" /></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </UserControl.Resources>
+  <Border Background="{DynamicResource SideBarBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,0,1,0">
+    <DockPanel>
+      <Grid DockPanel.Dock="Top" Style="{StaticResource SideBarTitleBarStyle}">
+        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+        <TextBlock Text="项目管理" Style="{StaticResource SideBarTitleTextStyle}" />
+        <StackPanel Grid.Column="1" Orientation="Horizontal">
+          <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconRefresh}" FontFamily="{StaticResource IconFontFamily}"
+                  ToolTip="刷新项目列表" Command="{Binding RefreshProjectsCommand}" Margin="0" />
+          <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconNewFolder}" FontFamily="{StaticResource IconFontFamily}"
+                  ToolTip="登记项目（选择目录）" Command="{Binding BrowseCommand}" Margin="0" />
+        </StackPanel>
+      </Grid>
+
+      <Grid>
+        <!-- 已登记项目 section: list + empty-state overlay; the DockPanel fills only the last child,
+             so the grid stays last to stretch across the sidebar. -->
+        <controls:CollapsibleSection IsExpanded="True">
+          <controls:CollapsibleSection.Header>
+            <StackPanel Orientation="Horizontal">
+              <TextBlock Text="已登记项目" Style="{StaticResource SideBarSectionHeaderTextStyle}" />
+              <TextBlock Text="{Binding Projects.Count, StringFormat={}{0} 个项目}" Style="{StaticResource CaptionStyle}" Margin="8,0,0,0" />
+            </StackPanel>
+          </controls:CollapsibleSection.Header>
+          <controls:CollapsibleSection.SectionContent>
+          <Grid Margin="0,0,0,0">
+            <ListBox ItemsSource="{Binding Projects}" SelectedItem="{Binding SelectedProject}"
+                     SelectionMode="Extended" KeyboardNavigation.TabNavigation="None"
+                     b:MultiSelectorBinding.SelectedItems="{Binding SelectedProjects}"
+                     b:ListSelectionBehavior.SelectOnRightClick="True"
+                     ItemContainerStyle="{StaticResource ProjectRowStyle}"
+                     Background="Transparent" BorderThickness="0">
+              <ListBox.ItemTemplate>
+                <DataTemplate>
+                  <Grid>
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                    <StackPanel>
+                      <StackPanel Orientation="Horizontal">
+                        <TextBlock Text="{Binding LastEnvironmentStatus, Converter={StaticResource HealthToGlyphConverter}}" FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconInline}"
+                                   Foreground="{Binding LastEnvironmentStatus, Converter={StaticResource StatusToBrushConverter}}" Margin="0,0,8,0" VerticalAlignment="Center" />
+                        <TextBlock Text="{Binding Name}" FontWeight="SemiBold" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                      </StackPanel>
+                      <TextBlock Text="{Binding Path}" Style="{StaticResource CaptionStyle}" Foreground="{DynamicResource MutedTextBrush}"
+                                 TextTrimming="CharacterEllipsis" Margin="0,2,0,0" ToolTip="{Binding Path}" />
+                      <TextBlock Text="{Binding LastCheckedAt, Converter={StaticResource ProjectAssetDisplayConverter}, StringFormat=上次检查 {0}}"
+                                 Style="{StaticResource CaptionStyle}" Foreground="{DynamicResource SubtleTextBrush}" Margin="0,1,0,0"
+                                 Visibility="{Binding LastCheckedAt, Converter={StaticResource NullToCollapsedConverter}}" />
+                    </StackPanel>
+                    <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                      <Button Content="打开" FontSize="{DynamicResource TypeBody}" Padding="8,4" Margin="8,0,0,0"
+                              Command="{Binding DataContext.OpenInExplorerCommand, RelativeSource={RelativeSource AncestorType=UserControl}}"
+                              CommandParameter="{Binding}" ToolTip="在资源管理器中打开（同步资源管理器与终端）" />
+                      <Button Content="{StaticResource CodiconOpenInWindow}" FontFamily="{StaticResource IconFontFamily}" Style="{StaticResource IconButton}" Padding="4,2" Margin="4,0,0,0"
+                              Command="{Binding DataContext.OpenProjectCommand, RelativeSource={RelativeSource AncestorType=UserControl}}"
+                              CommandParameter="{Binding}" ToolTip="在外部编辑器中打开（编辑器命令见设置）" />
+                      <Button Content="{StaticResource CodiconTrash}" FontFamily="{StaticResource IconFontFamily}" Style="{StaticResource IconButton}" Padding="4,2" Margin="4,0,0,0"
+                              Command="{Binding DataContext.RemoveProjectCommand, RelativeSource={RelativeSource AncestorType=UserControl}}"
+                              CommandParameter="{Binding}" ToolTip="移除项目记录（不删除项目文件）" />
+                    </StackPanel>
+                  </Grid>
+                </DataTemplate>
+              </ListBox.ItemTemplate>
+              <ListBox.ContextMenu>
+                <ContextMenu>
+                  <MenuItem Header="复制选中" Command="{Binding CopySelectedProjectsCommand}" InputGestureText="Ctrl+C" />
+                  <MenuItem Header="复制全部" Command="{Binding CopyAllProjectsCommand}" />
+                </ContextMenu>
+              </ListBox.ContextMenu>
+            </ListBox>
+
+            <Border Background="{DynamicResource SideBarBrush}" IsHitTestVisible="False"
+                    Visibility="{Binding Projects.Count, Converter={StaticResource CountToVisibilityConverter}}">
+              <views:EmptyStateControl Icon="{StaticResource CodiconFolderLibrary}" Title="尚未登记项目" Description="点击右上角图标选择项目目录并登记，或从任务中心登记第一个项目。"
+                                 ActionText="登记项目" ActionCommand="{Binding BrowseCommand}" />
+            </Border>
+          </Grid>
+          </controls:CollapsibleSection.SectionContent>
+        </controls:CollapsibleSection>
+      </Grid>
+    </DockPanel>
+  </Border>
+</UserControl>

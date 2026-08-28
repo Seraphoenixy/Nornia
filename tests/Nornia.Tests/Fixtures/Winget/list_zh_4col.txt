@@ -1,0 +1,190 @@
+
+   - 
+   \ 
+   | 
+   / 
+   - 
+   \ 
+   | 
+                                                                                                                        
+
+  ████████▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒  1024 KB / 3.35 MB
+  █████████████████▒▒▒▒▒▒▒▒▒▒▒▒▒  2.00 MB / 3.35 MB
+  ██████████████████████████▒▒▒▒  3.00 MB / 3.35 MB
+  ██████████████████████████████  3.35 MB / 3.35 MB
+                                                                                                                        
+
+  ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒  0%
+  ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒  0%
+  ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒  1%
+  ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒  2%
+  ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒  3%
+  █▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒  4%
+  █▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒  5%
+  █▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒  6%
+  ██▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒  8%
+  ██▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒  9%
+  ███▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒  10%
+  ███▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒  11%
+  ███▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒  12%
+  ██████▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒  23%
+  ██████████▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒  35%
+  █████████████▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒  46%
+  █████████████████▒▒▒▒▒▒▒▒▒▒▒▒▒  56%
+  █████████████████▒▒▒▒▒▒▒▒▒▒▒▒▒  57%
+  ██████████████████▒▒▒▒▒▒▒▒▒▒▒▒  61%
+  ██████████████████▒▒▒▒▒▒▒▒▒▒▒▒  62%
+  ██████████████████▒▒▒▒▒▒▒▒▒▒▒▒  63%
+  ███████████████████▒▒▒▒▒▒▒▒▒▒▒  64%
+  ███████████████████▒▒▒▒▒▒▒▒▒▒▒  65%
+  ███████████████████▒▒▒▒▒▒▒▒▒▒▒  66%
+  ████████████████████▒▒▒▒▒▒▒▒▒▒  67%
+  ████████████████████▒▒▒▒▒▒▒▒▒▒  68%
+  ████████████████████▒▒▒▒▒▒▒▒▒▒  69%
+  █████████████████████▒▒▒▒▒▒▒▒▒  70%
+  ███████████████████████▒▒▒▒▒▒▒  78%
+  ███████████████████████▒▒▒▒▒▒▒  79%
+  ████████████████████████▒▒▒▒▒▒  83%
+  █████████████████████████▒▒▒▒▒  85%
+  ███████████████████████████▒▒▒  90%
+  █████████████████████████████▒  99%
+  █████████████████████████████▒  99%
+  ██████████████████████████████  100%
+                                                                                                                        
+
+   - 
+                                                                                                                        
+名称                                     ID                                        版本               可用       源
+-----------------------------------------------------------------------------------------------------------------------
+marktext                                 MarkText.MarkText                         0.19.1                        winget
+AntiCheatExpert                          ARP\Machine\X64\AntiCheatExpert           28.0.2604.938                 
+Bandizip                                 Bandisoft.Bandizip                        7.46                          winget
+Clash Verge                              ARP\Machine\X64\Clash Verge               2.5.2                         
+Microsoft Excel 2021 - zh-cn             ARP\Machine\X64\Excel2021Retail - zh-cn   16.0.14334.20848              
+Git                                      Git.Git                                   2.55.0.3                      winget
+火绒安全软件                             ARP\Machine\X64\HuorongSysdiag            6.0.11.2                      
+PawnIO                                   namazso.PawnIO                            2.2.0.0                       winget
+Microsoft PowerPoint 2021 - zh-cn        ARP\Machine\X64\PowerPoint2021Retail - z… 16.0.14334.20848              
+黑神话:悟空                              ARP\Machine\X64\Steam App 2358720         Unknown                       
+Monster Hunter: World                    ARP\Machine\X64\Steam App 582010          Unknown                       
+Microsoft Visio - zh-cn                  ARP\Machine\X64\VisioPro2021Retail - zh-… 16.0.14334.20848              
+腾讯会议                                 Tencent.TencentMeeting                    3.43.21.403        3.45.2.405 winget
+Microsoft Word 2021 - zh-cn              ARP\Machine\X64\Word2021Retail - zh-cn    16.0.14334.20848              
+Microsoft Visual C++ 2010  x64 Redistri… Microsoft.VCRedist.2010.x64               10.0.40219                    winget
+Microsoft Update Health Tools            ARP\Machine\X64\{1FC1A6C2-576E-489A-9B4A… 3.74.0.0                      
+Tobii Experience Software For Windows (… ARP\Machine\X64\{267FC4F8-7110-4AB7-831C… 4.182.0.29391                 
+CC Switch                                farion1231.CC-Switch                      3.20.0                        winget
+Epic Games Launcher                      EpicGames.EpicGamesLauncher               1.3.193.0                     winget
+Microsoft System CLR Types for SQL Serv… Microsoft.CLRTypesSQLServer.2019          15.0.2000.5                   winget
+Node.js                                  ARP\Machine\X64\{6178C0C7-8EA8-458F-8060… 24.18.0                       
+Microsoft Visual Studio Installer        ARP\Machine\X64\{6F320B93-EE3C-4826-85E0… 4.8.60.55523                  
+Blender                                  BlenderFoundation.Blender                 5.2.0                         winget
+PowerShell 7-x64                         Microsoft.PowerShell                      7.6.3.0            7.6.5.0    winget
+Microsoft Build of OpenJDK 25.0.4+7 (x6… ARP\Machine\X64\{9DA4BE12-C58B-3DE4-C047… 25.0.4.7                      
+Flix                                     ARP\Machine\X64\{A3E12D37-2724-426B-9D9C… 1.8.1                         
+NVIDIA 图形驱动程序 580.88               ARP\Machine\X64\{B2FE1952-0186-46C3-BAEC… 580.88                        
+NVIDIA App 11.0.8.299                    ARP\Machine\X64\{B2FE1952-0186-46C3-BAEC… 11.0.8.299                    
+NVIDIA PhysX 系统软件 9.23.1019          Nvidia.PhysX                              9.23.1019                     winget
+NVIDIA FrameView SDK 1.8.12612.38276700  ARP\Machine\X64\{B2FE1952-0186-46C3-BAEC… 1.8.12612.38276700            
+NVIDIA HD 音频驱动程序 1.4.5.0           ARP\Machine\X64\{B2FE1952-0186-46C3-BAEC… 1.4.5.0                       
+NVIDIA USBC Driver 1.52.831.832          ARP\Machine\X64\{B2FE1952-0186-46C3-BAEC… 1.52.831.832                  
+Microsoft .NET SDK 9.0.316 (x64) from V… ARP\Machine\X64\{D0DF2EDA-8B97-4AC5-AE3B… 9.3.1626.32312                
+Update for x64-based Windows Systems (K… ARP\Machine\X64\{DA80A019-4C3B-4DAA-ACA1… 8.94.0.0                      
+Microsoft GameInput                      Microsoft.GameInput                       3.1.26100.6879     3.4.218    winget
+夸克                                     Alibaba.Quark                             6.9.2.881          7.1.0.949  winget
+Visual Studio Community 2022             Microsoft.VisualStudio.2022.Community     < 17.14.37         17.14.39   winget
+Visual Studio Community 2022             Microsoft.VisualStudio.2022.Community     < 17.14.37                    winget
+Cent Browser                             CentStudio.CentBrowser                    5.2.1168.83                   winget
+Google Chrome                            ARP\Machine\X86\Google Chrome             151.0.7922.174                
+鸣潮                                     ARP\Machine\X86\KRInstall Wuthering Waves 2.6.5.0                       
+Legion Zone                              ARP\Machine\X86\LegionZone                2.0.28.8182                   
+QQ                                       Tencent.QQ.NT                             9.9.33.52230                  winget
+Razer Synapse                            ARP\Machine\X86\Razer Synapse             4.0.503                       
+Steam                                    Valve.Steam                               2.10.91.91                    winget
+微信                                     Tencent.WeChat                            3.9.12.51          3.9.12.57  winget
+迅雷                                     ARP\Machine\X86\thunder_is1               12.1.2.2672                   
+Python Launcher                          Python.Launcher                           > 3.13.5                      winget
+Microsoft Visual C++ v14 Redistributabl… Microsoft.VCRedist.2015+.x64              14.51.36247.0                 winget
+vs_CoreEditorFonts                       ARP\Machine\X86\{1851460E-0E63-4117-B5BA… 17.7.40001                    
+Windows SDK AddOn                        ARP\Machine\X86\{2F9ED11E-3FA4-4DED-848D… 10.1.0.0                      
+Epic Online Services                     EpicGames.EpicOnlineServices              5.4.0                         winget
+Microsoft .NET SDK 10.0.302 (x64)        Microsoft.DotNet.SDK.10                   10.0.302           10.0.400   winget
+X-Rite Color Assistant 2.21.0            ARP\Machine\X86\{6DCFB107-4604-4AA8-BEA6… 2.21.0                        
+Microsoft Visual C++ v14 Redistributabl… Microsoft.VCRedist.2015+.x86              14.51.36247.0                 winget
+Microsoft Visual C++ 2010  x86 Redistri… Microsoft.VCRedist.2010.x86               10.0.40219                    winget
+Windows Software Development Kit - Wind… ARP\Machine\X86\{b72d4013-dd88-405a-9f9d… 10.1.22621.5040               
+图吧工具箱                               ARP\Machine\X86\图吧工具箱 2024.08        2024.08                       
+Antigravity 2.9.1                        Google.Antigravity                        2.9.1                         winget
+Ygdria 0.1.0                             ARP\User\X64\5237f0a6-742e-5ebb-a0f7-359… 0.1.0                         
+DSH Desktop 2.0.2                        AnywhereLabs.DSHDesktop                   2.0.2                         winget
+ok-ww                                    ARP\User\X64\ok-ww                        1.1.2                         
+Trilium Notes                            TriliumNext.Notes                         0.104.0            0.105.0    winget
+Telegram Desktop                         Telegram.TelegramDesktop                  7.0.9              7.1.1      winget
+Qoder CN IDE (User)                      ARP\User\X64\{5D8EA147-6C69-472E-B958-C3… 1.106.3                       
+Microsoft Visual Studio Code (User)      Microsoft.VisualStudioCode                1.134.0                       winget
+TraeWork CN (User)                       ByteDance.TraeWork.CN                     0.1.51                        winget
+Python 3.13.15 (64-bit)                  Python.Python.3.13                        3.13.15                       winget
+Legion Lighting Controller               MSIX\LegionLightingController_1.0.0.0_x6… 1.0.0.0                       
+LegionZoneExt                            MSIX\LegionZoneExt_1.0.0.0_x64__81edz0a2… 1.0.0.0                       
+Microsoft 必应                           MSIX\Microsoft.BingSearch_1.1.34.0_x64__… 1.1.34.0                      
+应用安装程序                             Microsoft.AppInstaller                    1.25.340.0         1.29.280.0 winget
+HEIF Image Extensions                    MSIX\Microsoft.HEIFImageExtension_1.2.3.… 1.2.3.0                       
+English (United States) Local Experienc… MSIX\Microsoft.LanguageExperiencePacken-… 19041.3.3.0                   
+中文(简体)本地体验包                     MSIX\Microsoft.LanguageExperiencePackzh-… 19041.81.277.0                
+3D 查看器                                MSIX\Microsoft.Microsoft3DViewer_7.2502.… 7.2502.5012.0                 
+Microsoft Edge                           MSIX\Microsoft.MicrosoftEdge.Stable_142.… 142.0.3595.53                 
+Microsoft .Net Native Framework Package… MSIX\Microsoft.NET.Native.Framework.1.7_… 1.7.27413.0                   
+Microsoft .Net Native Framework Package… MSIX\Microsoft.NET.Native.Framework.1.7_… 1.7.27413.0                   
+Microsoft .Net Native Framework Package… MSIX\Microsoft.NET.Native.Framework.2.2_… 2.2.29512.0                   
+Microsoft .Net Native Framework Package… MSIX\Microsoft.NET.Native.Framework.2.2_… 2.2.29512.0                   
+Microsoft .Net Native Runtime Package 1… MSIX\Microsoft.NET.Native.Runtime.1.7_1.… 1.7.27422.0                   
+Microsoft .Net Native Runtime Package 1… MSIX\Microsoft.NET.Native.Runtime.1.7_1.… 1.7.27422.0                   
+Microsoft .Net Native Runtime Package 2… Microsoft.DotNet.Native.Runtime           2.2.28604.0                   winget
+Microsoft .Net Native Runtime Package 2… Microsoft.DotNet.Native.Runtime           2.2.28604.0                   winget
+截图和草图                               MSIX\Microsoft.ScreenSketch_10.2008.3001… 10.2008.3001.0                
+Microsoft Engagement Framework           MSIX\Microsoft.Services.Store.Engagement… 10.0.23012.0                  
+Microsoft Engagement Framework           MSIX\Microsoft.Services.Store.Engagement… 10.0.23012.0                  
+Microsoft.UI.Xaml.2.3                    MSIX\Microsoft.UI.Xaml.2.3_2.32002.13001… 2.32002.13001.0               
+Microsoft.UI.Xaml.2.3                    MSIX\Microsoft.UI.Xaml.2.3_2.32002.13001… 2.32002.13001.0               
+Microsoft.UI.Xaml.2.4                    MSIX\Microsoft.UI.Xaml.2.4_2.42007.9001.… 2.42007.9001.0                
+Microsoft.UI.Xaml.2.4                    MSIX\Microsoft.UI.Xaml.2.4_2.42007.9001.… 2.42007.9001.0                
+Microsoft.UI.Xaml.2.7                    Microsoft.UI.Xaml.2.7                     7.2409.9001.0                 winget
+Microsoft.UI.Xaml.2.7                    Microsoft.UI.Xaml.2.7                     7.2409.9001.0                 winget
+Microsoft.UI.Xaml.2.7                    Microsoft.UI.Xaml.2.7                     7.2208.15002.0                winget
+Microsoft.UI.Xaml.2.8                    Microsoft.UI.Xaml.2.8                     8.2501.31001.0                winget
+Microsoft.UI.Xaml.2.8                    Microsoft.UI.Xaml.2.8                     8.2501.31001.0                winget
+Microsoft Visual C++ 2015 UWP Desktop R… Microsoft.VCLibs.Desktop.14               14.0.33728.0                  winget
+Microsoft Visual C++ 2015 UWP Desktop R… Microsoft.VCLibs.Desktop.14               14.0.33728.0                  winget
+Microsoft Visual C++ 2015 UWP Runtime P… Microsoft.VCLibs.14                       14.0.33519.0                  winget
+Microsoft Visual C++ 2015 UWP Runtime P… Microsoft.VCLibs.14                       14.0.33519.0                  winget
+VP9 Video Extensions                     MSIX\Microsoft.VP9VideoExtensions_1.2.2.… 1.2.2.0                       
+Web 媒体扩展                             MSIX\Microsoft.WebMediaExtensions_1.1.12… 1.1.1295.0                    
+Webp Image Extensions                    MSIX\Microsoft.WebpImageExtension_1.1.17… 1.1.1711.0                    
+开发人员主页                             MSIX\Microsoft.Windows.DevHome_0.2000.75… 0.2000.758.0                  
+Microsoft 照片                           MSIX\Microsoft.Windows.Photos_2025.11040… 2025.11040.23001.0            
+WindowsAppRuntime.1.4                    Microsoft.WindowsAppRuntime.1.4           4000.1309.2056.0              winget
+WindowsAppRuntime.1.4                    Microsoft.WindowsAppRuntime.1.4           4000.1309.2056.0              winget
+WindowsAppRuntime.1.5                    Microsoft.WindowsAppRuntime.1.5           5001.373.1736.0               winget
+WindowsAppRuntime.1.5                    Microsoft.WindowsAppRuntime.1.5           5001.373.1736.0               winget
+WindowsAppRuntime.1.5                    Microsoft.WindowsAppRuntime.1.5           5001.311.2039.0               winget
+WindowsAppRuntime.1.6                    Microsoft.WindowsAppRuntime.1.6           6000.457.2140.0               winget
+WindowsAppRuntime.1.6                    Microsoft.WindowsAppRuntime.1.6           6000.457.2140.0               winget
+WindowsAppRuntime.1.6                    Microsoft.WindowsAppRuntime.1.6           6000.424.1611.0               winget
+WindowsAppRuntime.1.6                    Microsoft.WindowsAppRuntime.1.6           6000.401.2352.0               winget
+WindowsAppRuntime.1.6                    Microsoft.WindowsAppRuntime.1.6           6000.373.1641.0               winget
+WindowsAppRuntime.1.6                    Microsoft.WindowsAppRuntime.1.6           6000.318.2304.0               winget
+Windows 计算器                           MSIX\Microsoft.WindowsCalculator_11.2502… 11.2502.2.0                   
+Windows 相机                             MSIX\Microsoft.WindowsCamera_2025.2501.1… 2025.2501.1.0                 
+Windows 录音机                           MSIX\Microsoft.WindowsSoundRecorder_10.2… 10.2103.28.0                  
+Microsoft Store                          MSIX\Microsoft.WindowsStore_22502.1401.1… 22502.1401.11.0               
+Windows Package Manager Source (winget)… MSIX\Microsoft.Winget.Source_2026.822.19… 2026.822.1936.51              
+Xbox TCUI                                MSIX\Microsoft.Xbox.TCUI_1.24.10001.0_x6… 1.24.10001.0                  
+Xbox 主机小帮手                          MSIX\Microsoft.XboxApp_48.104.4001.0_x64… 48.104.4001.0                 
+Xbox Game Bar Plugin                     MSIX\Microsoft.XboxGameOverlay_1.54.4001… 1.54.4001.0                   
+Game Bar                                 MSIX\Microsoft.XboxGamingOverlay_7.326.5… 7.326.5041.0                  
+Xbox Identity Provider                   MSIX\Microsoft.XboxIdentityProvider_12.1… 12.115.1001.0                 
+Xbox Game Speech Window                  MSIX\Microsoft.XboxSpeechToTextOverlay_1… 1.21.13002.0                  
+手机连接                                 MSIX\Microsoft.YourPhone_1.25031.60.0_x6… 1.25031.60.0                  
+跨设备体验主机                           MSIX\MicrosoftWindows.CrossDevice_0.2502… 0.25022.57.0                  
+NVIDIA Control Panel                     MSIX\NVIDIACorp.NVIDIAControlPanel_8.1.9… 8.1.968.0                     
+ChatGPT                                  MSIX\OpenAI.Codex_26.818.2441.0_x64__2p2… 26.818.2441.0                 

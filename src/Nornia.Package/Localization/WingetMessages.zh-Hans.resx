@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <resheader name="resmimetype">
+    <value>text/microsoft-resx</value>
+  </resheader>
+  <resheader name="version">
+    <value>2.0</value>
+  </resheader>
+  <resheader name="reader">
+    <value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <resheader name="writer">
+    <value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <data name="Winget_RetryAfterFailure" xml:space="preserve"><value>Winget 操作失败，正在进行一次重试。</value></data>
+  <data name="Winget_RetryAfterTimeout" xml:space="preserve"><value>Winget 操作超时，正在进行一次重试。</value></data>
+  <data name="Winget_ReadOnlyTimeout" xml:space="preserve"><value>Winget 命令超时，未能完成。</value></data>
+  <data name="Winget_BackfillFailed" xml:space="preserve"><value>无法解析包 {0} 的完整名称，保留截断名称。</value></data>
+  <data name="Winget_UninstallNoMatchHint" xml:space="preserve"><value>winget 未匹配到已安装的程序包：它可能已被卸载，或其来源（如 msstore）当前不可用。刷新已安装列表后重试。</value></data>
+  <data name="Winget_UninstallByNameFallback" xml:space="preserve"><value>按 Id 未匹配到已安装项，改用显示名称重试卸载（本机安装的应用不在 winget 目录中）。</value></data>
+  <data name="Winget_UninstallMultipleFallback" xml:space="preserve"><value>检测到该包安装了多个版本，将按已安装版本逐个卸载。</value></data>
+  <data name="Winget_UninstallByVersion" xml:space="preserve"><value>卸载 {0}（版本 {1}）。</value></data>
+  <data name="Winget_InstallerCancelledHint" xml:space="preserve"><value>安装程序请求管理员权限时被取消。请在出现的 UAC 提示中选择“是”后重试；若未显示提示，请重启后以管理员身份运行终端并执行相同的 winget upgrade 命令。</value></data>
+  <data name="Package_NoProviderAvailable" xml:space="preserve"><value>没有可用的受支持包管理器。请安装 Winget、Scoop 或 Chocolatey 后重试。</value></data>
+  <data name="Package_WingetFailed" xml:space="preserve"><value>winget {0} 失败（退出码 {1}）：{2}</value></data>
+  <data name="Repair_UsingProvider" xml:space="preserve"><value>使用 {1} 修复 {0}。</value></data>
+  <data name="Repair_StepProgress" xml:space="preserve"><value>[{0}/{1}] 修复 {2}：{3} → {4}</value></data>
+  <data name="Repair_Failed" xml:space="preserve"><value>  修复失败：{0}</value></data>
+  <data name="Repair_FailureHeader" xml:space="preserve"><value>环境修复失败 [{0}/{1}]：{2}</value></data>
+  <data name="Repair_FailureCurrent" xml:space="preserve"><value>  当前版本：{0}</value></data>
+  <data name="Repair_FailureTarget" xml:space="preserve"><value>  目标版本：{0}</value></data>
+  <data name="Repair_FailureProvider" xml:space="preserve"><value>  Provider：{0}</value></data>
+  <data name="Repair_FailurePackage" xml:space="preserve"><value>  包：{0}</value></data>
+  <data name="Repair_FailureException" xml:space="preserve"><value>  异常：{0}</value></data>
+  <data name="Repair_FailureReason" xml:space="preserve"><value>  原因：{0}</value></data>
+  <data name="Repair_FailureExitCode" xml:space="preserve"><value>  退出码：{0} ({1})</value></data>
+  <data name="Repair_FailureOutput" xml:space="preserve"><value>  包管理器输出：{0}</value></data>
+  <data name="Repair_FailureRollback" xml:space="preserve"><value>  回滚策略：{0}</value></data>
+  <data name="Repair_FailureHint" xml:space="preserve"><value>  建议：{0}</value></data>
+  <data name="Repair_ManualRollbackHint" xml:space="preserve"><value>包管理器通常不支持直接降级；请卸载后手动安装旧版或使用厂商安装程序。</value></data>
+  <data name="Repair_RefreshSnapshots" xml:space="preserve"><value>刷新包清单与 Runtime 快照...</value></data>
+  <data name="Rollback_Starting" xml:space="preserve"><value>准备回滚修复批次 {0}，共 {1} 个动作。</value></data>
+  <data name="Rollback_Step" xml:space="preserve"><value>[{0}/{1}] {2}: {3} → {4} (策略: {5})</value></data>
+  <data name="Rollback_Skipped" xml:space="preserve"><value>  跳过自动回滚：{0}</value></data>
+  <data name="Package_UninstallUsing" xml:space="preserve"><value>  使用 {1} 卸载 {0}。</value></data>
+  <data name="Package_InstallUsing" xml:space="preserve"><value>  使用 {2} 安装 {0} {1}。</value></data>
+  <data name="Provider_ScoopFailed" xml:space="preserve"><value>Scoop 操作失败（退出码 {1}）：{2}</value></data>
+  <data name="Provider_ChocolateyFailed" xml:space="preserve"><value>Chocolatey 操作失败（退出码 {1}）：{2}</value></data>
+  <data name="Rollback_InstallFailed" xml:space="preserve"><value>  自动安装失败（Winget 可能不支持降级）：{0}。请按提示手动操作：{1}</value></data>
+  <data name="Package_InstallNoVersion" xml:space="preserve"><value>  使用 {1} 安装 {0}。</value></data>
+</root>

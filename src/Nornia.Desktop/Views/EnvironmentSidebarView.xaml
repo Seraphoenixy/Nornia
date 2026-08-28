@@ -1,0 +1,62 @@
+<UserControl x:Class="Nornia.Desktop.Views.EnvironmentSidebarView" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:controls="clr-namespace:Nornia.Desktop.Views.Controls"
+             xmlns:b="clr-namespace:Nornia.Desktop.Behaviors">
+  <UserControl.Resources>
+    <!-- VS Code list item: icon + label with hover, pressed and active-selection backgrounds -->
+    <Style TargetType="ListBoxItem">
+      <Setter Property="Foreground" Value="{DynamicResource TextBrush}" />
+      <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+      <Setter Property="FocusVisualStyle" Value="{StaticResource AppFocusRing}" />
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="ListBoxItem">
+            <Border x:Name="Row" Background="Transparent" Padding="0,7">
+              <ContentPresenter />
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Row" Property="Background" Value="{DynamicResource HoverBrush}" /></Trigger>
+              <Trigger Property="IsSelected" Value="True"><Setter TargetName="Row" Property="Background" Value="{DynamicResource SelectionBrush}" /></Trigger>
+              <Trigger Property="IsMouseCaptured" Value="True"><Setter TargetName="Row" Property="Background" Value="{DynamicResource PressedBrush}" /></Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+  </UserControl.Resources>
+  <Border Background="{DynamicResource SideBarBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,0,1,0">
+    <DockPanel>
+      <Grid DockPanel.Dock="Top" Style="{StaticResource SideBarTitleBarStyle}">
+        <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+        <TextBlock Text="环境管理" Style="{StaticResource SideBarTitleTextStyle}" />
+      </Grid>
+      <controls:CollapsibleSection IsExpanded="True">
+        <controls:CollapsibleSection.Header>
+          <TextBlock Text="环境" Style="{StaticResource SideBarSectionHeaderTextStyle}" />
+        </controls:CollapsibleSection.Header>
+        <controls:CollapsibleSection.SectionContent>
+        <ListBox ItemsSource="{Binding Items}" SelectedItem="{Binding SelectedItem}"
+                 SelectionMode="Extended" KeyboardNavigation.TabNavigation="None"
+                 b:MultiSelectorBinding.SelectedItems="{Binding SelectedSections}"
+                 b:ListSelectionBehavior.SelectOnRightClick="True"
+                 Background="Transparent" BorderThickness="0">
+          <ListBox.ItemTemplate>
+            <DataTemplate>
+              <Grid Margin="12,0">
+                <Grid.ColumnDefinitions><ColumnDefinition Width="28"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                <TextBlock Text="{Binding Glyph}" FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconNav}" VerticalAlignment="Center" Foreground="{DynamicResource NavGlyphBrush}" />
+                <TextBlock Grid.Column="1" Text="{Binding Title}" FontSize="{DynamicResource TypeBody}" VerticalAlignment="Center" />
+              </Grid>
+            </DataTemplate>
+          </ListBox.ItemTemplate>
+          <ListBox.ContextMenu>
+            <ContextMenu>
+              <MenuItem Header="复制选中" Command="{Binding CopySelectedSectionsCommand}" InputGestureText="Ctrl+C" />
+              <MenuItem Header="复制全部" Command="{Binding CopyAllSectionsCommand}" />
+            </ContextMenu>
+          </ListBox.ContextMenu>
+        </ListBox>
+        </controls:CollapsibleSection.SectionContent>
+      </controls:CollapsibleSection>
+    </DockPanel>
+  </Border>
+</UserControl>

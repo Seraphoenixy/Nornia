@@ -1,0 +1,26 @@
+<UserControl x:Class="Nornia.Desktop.Views.EditorAreaView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="clr-namespace:Nornia.Desktop.ViewModels"
+             xmlns:views="clr-namespace:Nornia.Desktop.Views">
+  <UserControl.Resources>
+    <!-- Read-only file previews render through the code workbench (breadcrumb + AvalonEdit viewer);
+         diff tabs render through the editor-based inline / side-by-side diff viewer. -->
+    <DataTemplate DataType="{x:Type vm:FilePreviewTab}">
+      <views:FilePreviewView />
+    </DataTemplate>
+    <DataTemplate DataType="{x:Type vm:DiffTab}">
+      <views:DiffDocumentView />
+    </DataTemplate>
+  </UserControl.Resources>
+
+  <Grid Background="{DynamicResource EditorBrush}">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="*" />
+    </Grid.RowDefinitions>
+
+    <!-- Content: the workbench-selected tab (rendered by the FilePreviewTab/DiffTab templates above;
+         每个文档视图自带头部工具条,这里不再单独画面包屑行,避免叠加重复横条)。 -->
+    <ContentControl Grid.Row="0" Content="{Binding SelectedTab}" />
+  </Grid>
+</UserControl>

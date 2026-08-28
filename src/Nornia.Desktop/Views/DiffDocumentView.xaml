@@ -1,0 +1,312 @@
+<UserControl x:Class="Nornia.Desktop.Views.DiffDocumentView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:av="http://icsharpcode.net/sharpdevelop/avalonedit"
+             xmlns:views="clr-namespace:Nornia.Desktop.Views">
+  <UserControl.Resources>
+    <!-- VS Code 的 hunk review actions:悬浮时只显示紧凑图标,动作位于变更块右上角,
+         不改变编辑器行高,也不使用外围描边。文字说明由 Tooltip / AutomationProperties 提供。 -->
+    <Style x:Key="DiffHunkActionButtonStyle" TargetType="Button" BasedOn="{StaticResource IconButton}">
+      <Setter Property="FontSize" Value="{DynamicResource IconInline}" />
+      <Setter Property="Padding" Value="3,1" />
+      <Setter Property="MinWidth" Value="22" />
+      <Setter Property="MinHeight" Value="20" />
+      <Setter Property="Margin" Value="0" />
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderBrush" Value="Transparent" />
+      <Setter Property="BorderThickness" Value="0" />
+    </Style>
+  </UserControl.Resources>
+  <Grid Background="{DynamicResource EditorBrush}">
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto" />
+      <RowDefinition Height="*" />
+    </Grid.RowDefinitions>
+
+    <!-- Diff top bar: path + source + change stats + navigation + mode + copy — 4px scale continuous panel -->
+    <Border Grid.Row="0" Background="{DynamicResource EditorGroupHeaderTabsBackgroundBrush}"
+            BorderBrush="{DynamicResource TabBorderBrush}" BorderThickness="0,0,0,1"
+            MinHeight="{DynamicResource SizeRowMd}" Padding="8,0" SnapsToDevicePixels="True">
+      <DockPanel LastChildFill="False">
+        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+          <TextBlock Text="{Binding ChangeCounter}" FontSize="{DynamicResource TypeBody}" Foreground="{DynamicResource MutedTextBrush}"
+                     VerticalAlignment="Center" MinWidth="52" TextAlignment="Right" />
+          <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconArrowUp}" FontFamily="{StaticResource IconFontFamily}" Padding="4,2" Margin="4,0,0,0"
+                  Command="{Binding GoToPreviousChangeCommand}" ToolTip="上一个更改" AutomationProperties.Name="上一个更改" />
+          <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconArrowDown}" FontFamily="{StaticResource IconFontFamily}" Padding="4,2" Margin="4,0,0,0"
+                  Command="{Binding GoToNextChangeCommand}" ToolTip="下一个更改" AutomationProperties.Name="下一个更改" />
+          <Button Content="{StaticResource CodiconSearch}" FontFamily="{StaticResource IconFontFamily}" Padding="4,2" Margin="4,0,0,0"
+                  Click="ToggleFindBar_Click" ToolTip="在 Diff 中查找（内联统一文本）" AutomationProperties.Name="在 Diff 中查找">
+            <Button.Style>
+              <Style TargetType="Button" BasedOn="{StaticResource IconButton}">
+                <Style.Triggers>
+                  <DataTrigger Binding="{Binding IsFindBarOpen}" Value="True"><Setter Property="Foreground" Value="{DynamicResource AccentBrush}" /></DataTrigger>
+                </Style.Triggers>
+              </Style>
+            </Button.Style>
+          </Button>
+          <Border Width="1" Height="16" Background="{DynamicResource DiffToolbarSeparatorBrush}" Margin="8,0,4,0" VerticalAlignment="Center" />
+          <Button FontFamily="{StaticResource IconFontFamily}" Padding="6,0" Margin="0"
+                  Command="{Binding ToggleDiffModeCommand}" ToolTip="切换内联 / 并排" AutomationProperties.Name="切换 Diff 布局">
+            <Button.Style>
+              <Style TargetType="Button" BasedOn="{StaticResource IconButton}">
+                <Setter Property="Content" Value="{StaticResource CodiconDiff}" />
+                <Style.Triggers>
+                  <DataTrigger Binding="{Binding IsInlineDiff}" Value="True"><Setter Property="Content" Value="{StaticResource CodiconSplitHorizontal}" /></DataTrigger>
+                </Style.Triggers>
+              </Style>
+            </Button.Style>
+          </Button>
+          <Button Content="{StaticResource CodiconUnfold}" FontFamily="{StaticResource IconFontFamily}" Padding="6,0" Margin="0"
+                  Command="{Binding ToggleContextCollapseCommand}" ToolTip="折叠 / 展开未更改上下文" AutomationProperties.Name="折叠未更改上下文">
+            <Button.Style>
+              <Style TargetType="Button" BasedOn="{StaticResource IconButton}">
+                <Style.Triggers>
+                  <DataTrigger Binding="{Binding IsContextCollapsed}" Value="True"><Setter Property="Foreground" Value="{DynamicResource AccentBrush}" /></DataTrigger>
+                </Style.Triggers>
+              </Style>
+            </Button.Style>
+          </Button>
+          <Border Width="1" Height="16" Background="{DynamicResource DiffToolbarSeparatorBrush}" Margin="4,0" VerticalAlignment="Center" />
+          <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconCopy}" FontFamily="{StaticResource IconFontFamily}" Padding="6,0" Margin="0"
+                  Command="{Binding CopyAllDiffLinesCommand}" ToolTip="整份复制（统一 Diff 格式）" AutomationProperties.Name="复制全部 Diff" />
+        </StackPanel>
+        <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+          <TextBlock Text="{StaticResource CodiconSourceControl}" FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconInline}"
+                     Foreground="{DynamicResource NavGlyphBrush}" VerticalAlignment="Center" Margin="0,0,8,0" />
+          <!-- 面包屑分段链(与代码阅读标签同款;diff 标签无符号段) -->
+          <ItemsControl ItemsSource="{Binding BreadcrumbSegments}" VerticalAlignment="Center">
+            <ItemsControl.ItemsPanel>
+              <ItemsPanelTemplate><StackPanel Orientation="Horizontal" /></ItemsPanelTemplate>
+            </ItemsControl.ItemsPanel>
+            <ItemsControl.ItemTemplate>
+              <DataTemplate>
+                <StackPanel Orientation="Horizontal">
+                  <TextBlock Text="›" FontSize="{DynamicResource TypeBody}" Foreground="{DynamicResource SubtleTextBrush}"
+                             VerticalAlignment="Center" Margin="6,0"
+                             Visibility="{Binding ShowChevron, Converter={StaticResource BooleanToVisibilityConverter}}" />
+                  <Button Style="{StaticResource LinkButton}" Padding="0,0" Content="{Binding Display}"
+                          ToolTip="{Binding FullPath}"
+                          Command="{Binding DataContext.RevealBreadcrumbCommand, RelativeSource={RelativeSource AncestorType=views:EditorAreaView}}"
+                          CommandParameter="{Binding}">
+                    <Button.ContentTemplate>
+                      <DataTemplate><TextBlock Text="{Binding}" TextWrapping="NoWrap"
+                                                TextTrimming="CharacterEllipsis" MaxWidth="140" /></DataTemplate>
+                    </Button.ContentTemplate>
+                  </Button>
+                </StackPanel>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+          <Border Background="{DynamicResource InfoBrush}" BorderBrush="{DynamicResource AccentBrush}" BorderThickness="1"
+                  CornerRadius="{StaticResource RadiusMd}" Padding="8,2" Margin="8,0,0,0" VerticalAlignment="Center">
+            <TextBlock Text="{Binding SourceLabel}" FontSize="{DynamicResource TypeBody}" Foreground="{DynamicResource InfoAccentBrush}" />
+          </Border>
+          <!-- Change stats (VS Code: 新增 +N 绿色、删除 −M 红色,不再整体一个颜色) -->
+          <TextBlock FontSize="{DynamicResource TypeBody}" VerticalAlignment="Center" Margin="8,0,0,0" ToolTip="新增 / 删除行统计">
+            <Run Foreground="{DynamicResource DiffAddedTextBrush}" Text="+" /><Run Foreground="{DynamicResource DiffAddedTextBrush}" Text="{Binding AddedCount, Mode=OneWay}" />
+            <Run Foreground="{DynamicResource MutedTextBrush}" Text=" −" />
+            <Run Foreground="{DynamicResource DiffRemovedTextBrush}" Text="{Binding RemovedCount, Mode=OneWay}" />
+          </TextBlock>
+        </StackPanel>
+      </DockPanel>
+    </Border>
+
+    <!-- Diff 内查找浮层:对齐 VS Code FindWidget,不再占用整个编辑区宽度。 -->
+    <Border Grid.Row="1" Panel.ZIndex="30" HorizontalAlignment="Right" VerticalAlignment="Top"
+            Margin="12" Padding="8" MinWidth="320" MaxWidth="460"
+            Background="{DynamicResource ToolTipBackgroundBrush}"
+            BorderBrush="{DynamicResource StrongBorderBrush}" BorderThickness="1"
+            CornerRadius="{StaticResource RadiusMd}" Effect="{StaticResource ShadowPopupEffect}"
+            Visibility="{Binding IsFindBarOpen, Converter={StaticResource BooleanToVisibilityConverter}}">
+      <DockPanel LastChildFill="False">
+        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+          <TextBlock Text="{Binding CurrentMatchDisplay}" FontSize="{DynamicResource TypeBody}" Foreground="{DynamicResource MutedTextBrush}"
+                     VerticalAlignment="Center" MinWidth="44" TextAlignment="Right" Margin="0,0,8,0" />
+          <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconArrowUp}" FontFamily="{StaticResource IconFontFamily}" Padding="5,0" Margin="0"
+                  Click="DiffFindPrevious_Click" ToolTip="上一个匹配（Shift+F3）" />
+          <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconArrowDown}" FontFamily="{StaticResource IconFontFamily}" Padding="5,0" Margin="2,0,0,0"
+                  Click="DiffFindNext_Click" ToolTip="下一个匹配（F3 / Enter）" />
+          <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconClose}" FontFamily="{StaticResource IconFontFamily}" Padding="5,0" Margin="2,0,0,0"
+                  Click="ToggleFindBar_Click" ToolTip="关闭查找（Esc）" />
+        </StackPanel>
+        <TextBox x:Name="DiffFindBox" Text="{Binding FindText, UpdateSourceTrigger=PropertyChanged}"
+                 ToolTip="在统一 Diff 文本中查找（Enter 下一个 · Esc 关闭）" MinWidth="220"
+                 KeyDown="DiffFindBox_KeyDown" />
+      </DockPanel>
+    </Border>
+
+    <!-- Inline diff: one read-only editor with old|new numbers, per-kind backgrounds + overview ruler
+         (窄窗自动内联:窗口过窄时即使请求并排也以内联显示;可见性最终由代码 UpdateLayoutMode 决定)。 -->
+    <Grid x:Name="InlinePane" Grid.Row="1"
+          Visibility="{Binding IsInlineDiff, Converter={StaticResource BooleanToVisibilityConverter}}">
+      <!-- 右缘留出 16px(12px 概览轨道 + 4px 间距):垂直滚动条必须完整落在轨道左侧,
+           否则轨道会盖住滚动条滑块导致无法拖动。轨道隐藏时该间距与面板同色不可见。 -->
+      <av:TextEditor x:Name="InlineEditor" IsReadOnly="True" FontFamily="{Binding FontFamily}"
+                     FontSize="{Binding EditorFontSize}"
+                     Background="{DynamicResource EditorBrush}" Foreground="{DynamicResource TextBrush}"
+                     Padding="0" Margin="0,0,16,0" ShowLineNumbers="False" WordWrap="False"
+                     HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto"
+                     TextOptions.TextFormattingMode="Display" TextOptions.TextRenderingMode="ClearType"
+                     UseLayoutRounding="True">
+        <av:TextEditor.Options>
+          <av:TextEditorOptions HighlightCurrentLine="True"
+                                EnableHyperlinks="False" EnableEmailHyperlinks="False"
+                                ConvertTabsToSpaces="False" IndentationSize="4" />
+        </av:TextEditor.Options>
+        <av:TextEditor.ContextMenu>
+          <ContextMenu DataContext="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource Self}}">
+            <MenuItem Header="复制" Command="ApplicationCommands.Copy" />
+            <MenuItem Header="全选" Command="ApplicationCommands.SelectAll" />
+            <Separator />
+            <MenuItem Header="复制全部（统一 Diff）" Command="{Binding CopyAllDiffLinesCommand}" />
+            <MenuItem Header="在代码标签页打开文件" Command="{Binding OpenInCodeCommand}" />
+          </ContextMenu>
+        </av:TextEditor.ContextMenu>
+      </av:TextEditor>
+      <Canvas x:Name="InlineHunkActionCanvas" Panel.ZIndex="25" IsHitTestVisible="True">
+        <Border x:Name="InlineHunkActionBar" Visibility="Collapsed" HorizontalAlignment="Right"
+                Background="{DynamicResource ToolTipBackgroundBrush}"
+                BorderBrush="Transparent" BorderThickness="0"
+                CornerRadius="{StaticResource RadiusSm}" Padding="2" IsHitTestVisible="True">
+          <StackPanel Orientation="Vertical">
+            <Button x:Name="InlineRestoreHunkButton" Style="{StaticResource DiffHunkActionButtonStyle}"
+                    Content="{StaticResource CodiconDiscard}" FontFamily="{StaticResource IconFontFamily}"
+                    Click="InlineRestoreHunk_Click" ToolTip="还原当前 Diff 块" AutomationProperties.Name="还原当前 Diff 块"
+                    Foreground="{DynamicResource DangerBrush}" />
+            <Button x:Name="InlineStageHunkButton" Style="{StaticResource DiffHunkActionButtonStyle}"
+                    Content="{StaticResource CodiconAdd}" FontFamily="{StaticResource IconFontFamily}"
+                    Click="InlineStageHunk_Click" ToolTip="暂存当前 Diff 块" AutomationProperties.Name="暂存当前 Diff 块"
+                    Foreground="{DynamicResource DiffAddedTextBrush}" />
+            <Button x:Name="InlineUnstageHunkButton" Style="{StaticResource DiffHunkActionButtonStyle}"
+                    Content="{StaticResource CodiconRemove}" FontFamily="{StaticResource IconFontFamily}"
+                    Click="InlineUnstageHunk_Click" ToolTip="取消暂存当前 Diff 块" AutomationProperties.Name="取消暂存当前 Diff 块"
+                    Foreground="{DynamicResource DiffRemovedTextBrush}" />
+          </StackPanel>
+        </Border>
+      </Canvas>
+      <!-- Full-document overview ruler: bucketed by document coordinates and clickable for navigation. -->
+      <Canvas x:Name="OverviewCanvas" Width="12" Margin="0,0,4,0" HorizontalAlignment="Right"
+              VerticalAlignment="Stretch" Background="{DynamicResource DiffOverviewRailBrush}" Cursor="Hand" ToolTip="变更概览：单击定位"
+              Visibility="{Binding ShowOverviewRuler, Converter={StaticResource BooleanToVisibilityConverter}}" />
+      <!-- @@ hunk 头吸顶(VS Code diff sticky scroll):滚动经过 hunk 头后把其钉在顶部,点击跳转。 -->
+      <Border x:Name="DiffStickyHost" VerticalAlignment="Top" Panel.ZIndex="20"
+              Background="{DynamicResource DiffUnchangedRegionBrush}" BorderBrush="{DynamicResource DiffEditorBorderBrush}" BorderThickness="0,0,0,1"
+              Visibility="Collapsed">
+        <StackPanel x:Name="DiffStickyRows" />
+      </Border>
+      <Border Background="{DynamicResource EditorBrush}" IsHitTestVisible="False"
+              Visibility="{Binding IsEmptyDiff, Converter={StaticResource BooleanToVisibilityConverter}}">
+        <views:EmptyStateControl Icon="{StaticResource CodiconSourceControl}" Title="{Binding EmptyStateTitle}" />
+      </Border>
+    </Grid>
+
+    <!-- Side-by-side diff: two synced read-only editors split by a draggable divider
+         (窄窗自动内联时由代码 UpdateLayoutMode 隐藏)。 -->
+    <Grid x:Name="SideBySidePane" Grid.Row="1"
+          Visibility="{Binding IsSideBySideDiff, Converter={StaticResource BooleanToVisibilityConverter}}">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="*" />
+        <ColumnDefinition Width="5" />
+        <ColumnDefinition Width="*" />
+      </Grid.ColumnDefinitions>
+      <!-- 右缘 16px 让位给 OldOverviewCanvas,理由同 InlineEditor。 -->
+      <av:TextEditor x:Name="OldEditor" Grid.Column="0" IsReadOnly="True" FontFamily="{Binding FontFamily}"
+                     FontSize="{Binding EditorFontSize}"
+                     Background="{DynamicResource EditorBrush}" Foreground="{DynamicResource TextBrush}"
+                     Padding="0" Margin="0,0,16,0" ShowLineNumbers="False" WordWrap="False"
+                     HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto"
+                     TextOptions.TextFormattingMode="Display" TextOptions.TextRenderingMode="ClearType"
+                     UseLayoutRounding="True">
+        <av:TextEditor.Options>
+          <av:TextEditorOptions HighlightCurrentLine="True"
+                                EnableHyperlinks="False" EnableEmailHyperlinks="False"
+                                ConvertTabsToSpaces="False" IndentationSize="4" />
+        </av:TextEditor.Options>
+        <av:TextEditor.ContextMenu>
+          <ContextMenu DataContext="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource Self}}">
+            <MenuItem Header="复制" Command="ApplicationCommands.Copy" />
+            <MenuItem Header="全选" Command="ApplicationCommands.SelectAll" />
+            <Separator />
+            <MenuItem Header="复制全部（统一 Diff）" Command="{Binding CopyAllDiffLinesCommand}" />
+            <MenuItem Header="在代码标签页打开文件" Command="{Binding OpenInCodeCommand}" />
+          </ContextMenu>
+        </av:TextEditor.ContextMenu>
+      </av:TextEditor>
+      <Canvas x:Name="OldOverviewCanvas" Grid.Column="0" Width="12" Margin="0,0,4,0" HorizontalAlignment="Right"
+              VerticalAlignment="Stretch" Background="{DynamicResource DiffOverviewRailBrush}" Cursor="Hand" ToolTip="变更概览：单击定位"
+              Visibility="{Binding ShowOverviewRuler, Converter={StaticResource BooleanToVisibilityConverter}}" />
+      <!-- VS Code 的 sash 保持细可见线,但保留 5px 的可拖拽命中区。 -->
+      <Border Grid.Column="1" Background="{DynamicResource DiffEditorSashBrush}" HorizontalAlignment="Stretch">
+        <GridSplitter Width="5" HorizontalAlignment="Stretch" Background="Transparent"
+                      ResizeDirection="Columns" ResizeBehavior="PreviousAndNext">
+          <GridSplitter.Style>
+            <Style TargetType="GridSplitter">
+              <Setter Property="Opacity" Value="0.01" />
+              <Style.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                  <Setter Property="Background" Value="{DynamicResource AccentBrush}" />
+                  <Setter Property="Opacity" Value="0.35" />
+                </Trigger>
+              </Style.Triggers>
+            </Style>
+          </GridSplitter.Style>
+        </GridSplitter>
+      </Border>
+      <!-- 右缘 16px 让位给 NewOverviewCanvas,理由同 InlineEditor。 -->
+      <av:TextEditor x:Name="NewEditor" Grid.Column="2" IsReadOnly="True" FontFamily="{Binding FontFamily}"
+                     FontSize="{Binding EditorFontSize}"
+                     Background="{DynamicResource EditorBrush}" Foreground="{DynamicResource TextBrush}"
+                     Padding="0" Margin="0,0,16,0" ShowLineNumbers="False" WordWrap="False"
+                     HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Auto"
+                     TextOptions.TextFormattingMode="Display" TextOptions.TextRenderingMode="ClearType"
+                     UseLayoutRounding="True">
+        <av:TextEditor.Options>
+          <av:TextEditorOptions HighlightCurrentLine="True"
+                                EnableHyperlinks="False" EnableEmailHyperlinks="False"
+                                ConvertTabsToSpaces="False" IndentationSize="4" />
+        </av:TextEditor.Options>
+        <av:TextEditor.ContextMenu>
+          <ContextMenu DataContext="{Binding PlacementTarget.DataContext, RelativeSource={RelativeSource Self}}">
+            <MenuItem Header="复制" Command="ApplicationCommands.Copy" />
+            <MenuItem Header="全选" Command="ApplicationCommands.SelectAll" />
+            <Separator />
+            <MenuItem Header="复制全部（统一 Diff）" Command="{Binding CopyAllDiffLinesCommand}" />
+            <MenuItem Header="在代码标签页打开文件" Command="{Binding OpenInCodeCommand}" />
+          </ContextMenu>
+        </av:TextEditor.ContextMenu>
+      </av:TextEditor>
+      <Canvas x:Name="NewOverviewCanvas" Grid.Column="2" Width="12" Margin="0,0,4,0" HorizontalAlignment="Right"
+              VerticalAlignment="Stretch" Background="{DynamicResource DiffOverviewRailBrush}" Cursor="Hand" ToolTip="变更概览：单击定位"
+              Visibility="{Binding ShowOverviewRuler, Converter={StaticResource BooleanToVisibilityConverter}}" />
+      <Canvas x:Name="SideHunkActionCanvas" Grid.ColumnSpan="3" Panel.ZIndex="25" IsHitTestVisible="True">
+        <Border x:Name="SideHunkActionBar" Visibility="Collapsed" HorizontalAlignment="Right"
+                Background="{DynamicResource ToolTipBackgroundBrush}"
+                BorderBrush="Transparent" BorderThickness="0"
+                CornerRadius="{StaticResource RadiusSm}" Padding="2" IsHitTestVisible="True">
+          <StackPanel Orientation="Vertical">
+            <Button x:Name="SideRestoreHunkButton" Style="{StaticResource DiffHunkActionButtonStyle}"
+                    Content="{StaticResource CodiconDiscard}" FontFamily="{StaticResource IconFontFamily}"
+                    Click="SideRestoreHunk_Click" ToolTip="还原当前 Diff 块" AutomationProperties.Name="还原当前 Diff 块"
+                    Foreground="{DynamicResource DangerBrush}" />
+            <Button x:Name="SideStageHunkButton" Style="{StaticResource DiffHunkActionButtonStyle}"
+                    Content="{StaticResource CodiconAdd}" FontFamily="{StaticResource IconFontFamily}"
+                    Click="SideStageHunk_Click" ToolTip="暂存当前 Diff 块" AutomationProperties.Name="暂存当前 Diff 块"
+                    Foreground="{DynamicResource DiffAddedTextBrush}" />
+            <Button x:Name="SideUnstageHunkButton" Style="{StaticResource DiffHunkActionButtonStyle}"
+                    Content="{StaticResource CodiconRemove}" FontFamily="{StaticResource IconFontFamily}"
+                    Click="SideUnstageHunk_Click" ToolTip="取消暂存当前 Diff 块" AutomationProperties.Name="取消暂存当前 Diff 块"
+                    Foreground="{DynamicResource DiffRemovedTextBrush}" />
+          </StackPanel>
+        </Border>
+      </Canvas>
+      <Border Grid.ColumnSpan="3" Background="{DynamicResource EditorBrush}" IsHitTestVisible="False"
+              Visibility="{Binding IsEmptyDiff, Converter={StaticResource BooleanToVisibilityConverter}}">
+        <views:EmptyStateControl Icon="{StaticResource CodiconSourceControl}" Title="{Binding EmptyStateTitle}" />
+      </Border>
+    </Grid>
+
+    <!-- 只读状态(位置/Diff 模式/diff 行数)已并入窗口主状态栏(MainWindow 底部 StatusBar 的
+         "当前文档状态"段),视图内不再保留独立底栏。 -->
+  </Grid>
+</UserControl>

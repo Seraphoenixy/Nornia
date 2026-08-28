@@ -1,0 +1,7 @@
+Codicon font attribution
+
+The codicon.ttf asset is generated from:
+https://github.com/microsoft/vscode-codicons
+
+Codicons are licensed under the Creative Commons Attribution 4.0 International license.
+License: https://creativecommons.org/licenses/by/4.0/

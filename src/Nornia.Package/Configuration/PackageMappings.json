@@ -1,0 +1,53 @@
+{
+  "mappings": [
+    {
+      "runtimeId": "dotnet",
+      "packages": [
+        { "idTemplate": "Microsoft.DotNet.SDK.{major}", "versionTemplate": null }
+      ]
+    },
+    {
+      "runtimeId": "python",
+      "packages": [
+        { "idTemplate": "Python.Python.{major}.{minor}", "versionTemplate": null }
+      ]
+    },
+    {
+      "runtimeId": "node",
+      "packages": [
+        { "idTemplate": "OpenJS.NodeJS", "versionTemplate": "{version}" }
+      ]
+    },
+    {
+      "runtimeId": "java",
+      "packages": [
+        { "idTemplate": "Microsoft.OpenJDK.{major}", "versionTemplate": null }
+      ]
+    },
+    {
+      "runtimeId": "git",
+      "packages": [
+        { "idTemplate": "Git.Git", "versionTemplate": "{version}" }
+      ]
+    },
+    {
+      "runtimeId": "dotnet-desktop-runtime",
+      "packages": [
+        { "idTemplate": "Microsoft.DotNet.DesktopRuntime.{major}", "versionTemplate": null }
+      ]
+    },
+    {
+      "runtimeId": "windows-app-runtime",
+      "packages": [
+        { "idTemplate": "Microsoft.WindowsAppRuntime.1.8", "versionTemplate": null }
+      ]
+    },
+    {
+      "runtimeId": "visual-cpp-redistributable",
+      "packages": [
+        { "idTemplate": "Microsoft.VCRedist.2015+.x86", "versionTemplate": null },
+        { "idTemplate": "Microsoft.VCRedist.2015+.{arch}", "versionTemplate": null, "includeForArchitecture": "Current" }
+      ]
+    }
+  ]
+}

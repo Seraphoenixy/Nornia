@@ -1,0 +1,37 @@
+<UserControl x:Class="Nornia.Desktop.Views.Controls.SidebarShell"
+             x:Name="Root"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <Border Background="{DynamicResource SideBarBrush}"
+          BorderBrush="{DynamicResource BorderBrush}"
+          BorderThickness="0,0,1,0">
+    <Grid>
+      <Grid.RowDefinitions>
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="Auto" />
+        <RowDefinition Height="*" />
+      </Grid.RowDefinitions>
+
+      <Grid Grid.Row="0" Style="{StaticResource SideBarTitleBarStyle}">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*" />
+          <ColumnDefinition Width="Auto" />
+        </Grid.ColumnDefinitions>
+        <TextBlock Text="{Binding Title, ElementName=Root}"
+                   Style="{StaticResource SideBarTitleTextStyle}"
+                   TextTrimming="CharacterEllipsis" />
+        <ContentPresenter Grid.Column="1"
+                          Content="{Binding HeaderActions, ElementName=Root}"
+                          VerticalAlignment="Center" />
+      </Grid>
+
+      <ContentPresenter Grid.Row="1"
+                        Content="{Binding TopContent, ElementName=Root}"
+                        HorizontalAlignment="Stretch" />
+      <ContentPresenter Grid.Row="2"
+                        Content="{Binding BodyContent, ElementName=Root}"
+                        HorizontalAlignment="Stretch"
+                        VerticalAlignment="Stretch" />
+    </Grid>
+  </Border>
+</UserControl>

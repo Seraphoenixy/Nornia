@@ -1,0 +1,56 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+[Tt]est[Rr]esult*/
+[Bb]uild/
+[Aa]rtifacts/
+
+# Visual Studio / Rider / VS Code
+.vs/
+.vscode/
+.zcode/
+.workbuddy/
+.idea/
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.rsuser
+
+# NuGet
+*.nupkg
+*.snupkg
+packages/
+!packages/build/
+project.lock.json
+project.fragment.lock.json
+
+# Local application data and SQLite databases
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Runtime and diagnostic files
+*.log
+*.tmp
+*.temp
+*.cache
+*.pidb
+*.svclog
+
+# Publish and packaging output
+[Pp]ublish/
+[Pp]ublishOutput/
+AppPackages/
+BundleArtifacts/
+.build-cache-roots/
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store

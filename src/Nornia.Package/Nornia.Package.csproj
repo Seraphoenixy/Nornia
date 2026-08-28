@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup><ProjectReference Include="..\\Nornia.Core\\Nornia.Core.csproj" /></ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="Configuration\PackageMappings.json" />
+  </ItemGroup>
+</Project>

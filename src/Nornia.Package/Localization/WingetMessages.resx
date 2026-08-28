@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <resheader name="resmimetype">
+    <value>text/microsoft-resx</value>
+  </resheader>
+  <resheader name="version">
+    <value>2.0</value>
+  </resheader>
+  <resheader name="reader">
+    <value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <resheader name="writer">
+    <value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+  </resheader>
+  <data name="Winget_RetryAfterFailure" xml:space="preserve"><value>Winget operation failed; retrying once.</value></data>
+  <data name="Winget_RetryAfterTimeout" xml:space="preserve"><value>Winget operation timed out; retrying once.</value></data>
+  <data name="Winget_ReadOnlyTimeout" xml:space="preserve"><value>Winget command timed out before finishing.</value></data>
+  <data name="Winget_BackfillFailed" xml:space="preserve"><value>Could not resolve the full name of package {0}; the truncated name is kept.</value></data>
+  <data name="Winget_UninstallNoMatchHint" xml:space="preserve"><value>winget found no installed package matching the criteria: it may have been uninstalled already, or its source (e.g. msstore) is currently unreachable. Refresh the installed list and retry.</value></data>
+  <data name="Winget_UninstallByNameFallback" xml:space="preserve"><value>No installed package matched the Id; retrying by display name (locally installed apps are not in the winget catalog).</value></data>
+  <data name="Winget_UninstallMultipleFallback" xml:space="preserve"><value>Multiple installed versions match this package; uninstalling each installed version individually.</value></data>
+  <data name="Winget_UninstallByVersion" xml:space="preserve"><value>Uninstalling {0} (version {1}).</value></data>
+  <data name="Winget_InstallerCancelledHint" xml:space="preserve"><value>The installer elevation request was cancelled. Retry and choose Yes in the UAC prompt; if no prompt appears, restart and run the same winget upgrade command from an elevated terminal.</value></data>
+  <data name="Package_NoProviderAvailable" xml:space="preserve"><value>No supported package manager is available. Install Winget, Scoop, or Chocolatey and try again.</value></data>
+  <data name="Package_WingetFailed" xml:space="preserve"><value>winget {0} failed (exit {1}): {2}</value></data>
+  <data name="Repair_UsingProvider" xml:space="preserve"><value>Repairing {0} with {1}.</value></data>
+  <data name="Repair_StepProgress" xml:space="preserve"><value>[{0}/{1}] Repairing {2}: {3} → {4}</value></data>
+  <data name="Repair_Failed" xml:space="preserve"><value>  Repair failed: {0}</value></data>
+  <data name="Repair_FailureHeader" xml:space="preserve"><value>Environment repair failed [{0}/{1}]: {2}</value></data>
+  <data name="Repair_FailureCurrent" xml:space="preserve"><value>  Current version: {0}</value></data>
+  <data name="Repair_FailureTarget" xml:space="preserve"><value>  Target version: {0}</value></data>
+  <data name="Repair_FailureProvider" xml:space="preserve"><value>  Provider: {0}</value></data>
+  <data name="Repair_FailurePackage" xml:space="preserve"><value>  Package: {0}</value></data>
+  <data name="Repair_FailureException" xml:space="preserve"><value>  Exception: {0}</value></data>
+  <data name="Repair_FailureReason" xml:space="preserve"><value>  Reason: {0}</value></data>
+  <data name="Repair_FailureExitCode" xml:space="preserve"><value>  Exit code: {0} ({1})</value></data>
+  <data name="Repair_FailureOutput" xml:space="preserve"><value>  Package-manager output: {0}</value></data>
+  <data name="Repair_FailureRollback" xml:space="preserve"><value>  Rollback strategy: {0}</value></data>
+  <data name="Repair_FailureHint" xml:space="preserve"><value>  Recommendation: {0}</value></data>
+  <data name="Repair_ManualRollbackHint" xml:space="preserve"><value>The package manager usually cannot downgrade directly; uninstall the package and install the previous version manually.</value></data>
+  <data name="Repair_RefreshSnapshots" xml:space="preserve"><value>Refreshing package list and runtime snapshots...</value></data>
+  <data name="Rollback_Starting" xml:space="preserve"><value>Preparing to roll back repair batch {0} with {1} action(s).</value></data>
+  <data name="Rollback_Step" xml:space="preserve"><value>[{0}/{1}] {2}: {3} → {4} (strategy: {5})</value></data>
+  <data name="Rollback_Skipped" xml:space="preserve"><value>  Skipping automatic rollback: {0}</value></data>
+  <data name="Package_UninstallUsing" xml:space="preserve"><value>  Uninstalling {0} with {1}.</value></data>
+  <data name="Package_InstallUsing" xml:space="preserve"><value>  Installing {0} {1} with {2}.</value></data>
+  <data name="Provider_ScoopFailed" xml:space="preserve"><value>Scoop failed to {0} (exit {1}): {2}</value></data>
+  <data name="Provider_ChocolateyFailed" xml:space="preserve"><value>Chocolatey failed to {0} (exit {1}): {2}</value></data>
+  <data name="Rollback_InstallFailed" xml:space="preserve"><value>  Automatic install failed (Winget may not support downgrades): {0}. Follow the manual steps: {1}</value></data>
+  <data name="Package_InstallNoVersion" xml:space="preserve"><value>  Installing {0} with {1}.</value></data>
+</root>

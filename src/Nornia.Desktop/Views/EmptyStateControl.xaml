@@ -1,0 +1,24 @@
+<UserControl x:Class="Nornia.Desktop.Views.EmptyStateControl"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:local="clr-namespace:Nornia.Desktop.Views"
+             x:Name="Root">
+  <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Margin="{StaticResource SpaceXxl}" MaxWidth="420">
+    <TextBlock Text="{Binding Icon, ElementName=Root}"
+               FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconEmpty}"
+               Foreground="{DynamicResource MutedTextBrush}" HorizontalAlignment="Center" />
+    <TextBlock Text="{Binding Title, ElementName=Root}"
+               Style="{StaticResource SectionTitleStyle}"
+               HorizontalAlignment="Center" TextWrapping="Wrap" TextAlignment="Center" Margin="{StaticResource GapSm}" />
+    <TextBlock Text="{Binding Description, ElementName=Root}"
+               Foreground="{DynamicResource MutedTextBrush}" HorizontalAlignment="Center" TextWrapping="Wrap" TextAlignment="Center" Margin="{StaticResource GapXs}"
+               Visibility="{Binding Description, ElementName=Root, Converter={StaticResource StringEmptyToCollapsedConverter}}" />
+    <!-- Optional context action: gives the blank area a next step (U5). Visibility is driven by the
+         code-behind so the button only shows when both ActionText and ActionCommand are provided. -->
+    <Button x:Name="ActionButton"
+            Content="{Binding ActionText, ElementName=Root}"
+            Command="{Binding ActionCommand, ElementName=Root}"
+            Style="{StaticResource PrimaryButton}"
+            HorizontalAlignment="Center" Margin="{StaticResource GapMd}" />
+  </StackPanel>
+</UserControl>

@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Standalone brand-icon generator, intentionally not part of Nornia.sln.
+       Invoke from the repo root with the dotnet run project flag to write
+       src/Nornia.Desktop/Assets/app.ico. Uses WPF imaging only (no System.Drawing package). -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>GenerateAppIcon</AssemblyName>
+    <RootNamespace>GenerateAppIcon</RootNamespace>
+  </PropertyGroup>
+</Project>

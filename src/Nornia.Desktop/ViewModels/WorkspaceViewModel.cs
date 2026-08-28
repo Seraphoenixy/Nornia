@@ -1,0 +1,1540 @@
+using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.Input;
+using Nornia.Core.Collections;
+using Nornia.Core.Models;
+using Nornia.Desktop.Services;
+using Nornia.Desktop.Configuration;
+using System.Diagnostics;
+using System.IO;
+using System.Collections.ObjectModel;
+using System.Windows;
+
+namespace Nornia.Desktop.ViewModels;
+
+/// <summary>Lazy read-only project explorer. Directories are enumerated only on expansion and files
+/// open in the shared editor area (VS Code-style), so opening a large repository never fills the
+/// managed heap. Also carries VS Code-style git decorations (M/A/D/? letters + changed-folder dots)
+/// synced from the source-control view.</summary>
+public partial class WorkspaceViewModel : PageViewModel
+{
+    private readonly IFolderPickerService _folderPicker;
+    private readonly IClipboardService _clipboard;
+    private readonly ISettingsService _scopedSettings;
+    private readonly IProjectWorkspaceService _workspaceService;
+    private ISettingsSession? _settingsSession;
+    private readonly WorkspaceStatusSource _statusSource = new();
+    private bool _suppressSelectionOpen;
+    private bool _suppressTreeSelectionOpen;
+    private bool _compactFoldersEnabled;
+    private readonly RevisionGate _settingsRevisionGate = new();
+
+    /// <summary>行对象复用池:每节点至多一个存活行(身份即节点引用,对照 VS Code RowCache 的
+    /// templateId 复用)。增量投影只发受影响区间的 CollectionChanged,未变行不重建容器;
+    /// 同时保证节点上的 PropertyChanged 订阅始终只有一份(旧整表重建会累积死行)。</summary>
+    private readonly Dictionary<WorkspaceNode, WorkspaceTreeRow> _rowCache = new(ReferenceEqualityComparer.Instance);
+
+    /// <summary>V7 防抖:单击选中即开文件在键盘/鼠标快速遍历下会每次跳行都新建一个预览标签
+    /// (反闲聊)。选中→打开用 100ms 尾部去抖(与搜索进度合并同族的 RunOnceScheduler):
+    /// 只有静默期后仍为最新的选中文件会被打开;双击常驻打开与 RevealNodeAsync
+    /// (reveal 走 _suppressSelectionOpen,不经过此路径)保持即时。</summary>
+    private readonly Nornia.Core.Coalescing.RunOnceScheduler _selectionOpenScheduler = new(100);
+    private readonly object _pendingSelectionOpenGate = new();
+    private WorkspaceFileRow? _pendingSelectionOpenRow;
+
+    /// <summary>当前紧凑文件夹投影开关(设置驱动;内部供测试断言实际接线)。</summary>
+    internal bool CompactFoldersEnabled => _compactFoldersEnabled;
+
+    public ObservableCollection<WorkspaceNode> RootNodes { get; } = [];
+    /// <summary>Flattened, virtualizable projection of the currently visible workspace nodes.
+    /// WorkspaceNode remains the disk-backed source of truth; rows only describe layout.</summary>
+    public ObservableCollection<WorkspaceTreeRow> WorkspaceTreeRows { get; } = [];
+
+    /// <summary>Raised when a workspace root changes (the project workbench syncs terminal + git).</summary>
+    public event EventHandler<string>? WorkspaceOpened;
+
+    /// <summary>Raised by the folder picker. The page-level workbench turns this into a shared
+    /// project-context activation instead of letting the tree own a separate workspace.</summary>
+    public event EventHandler<string>? WorkspaceSelectionRequested;
+
+    /// <summary>Raised when a file is opened from the tree; the workbench forwards it to the shared editor.</summary>
+    public event EventHandler<string>? FileOpenRequested;
+
+    /// <summary>Raised when a file row is double-clicked (VS Code: 单击开预览,双击开常驻);
+    /// the workbench opens it as a regular tab in the shared editor.</summary>
+    public event EventHandler<string>? FileOpenPermanentRequested;
+
+    /// <summary>Raised when "查看更改" is clicked on a changed file; the workbench opens its diff.</summary>
+    public event EventHandler<WorkspaceNode>? DiffOpenRequested;
+
+    /// <summary>行投影发生增量变更后触发(展开/折叠/刷新/reveal);视图据此保持滚动锚点
+    /// (可视首行),避免整表 Reset 造成的滚动位置丢失与闪烁。</summary>
+    public event EventHandler? TreeRowsChanged;
+
+    /// <summary>reveal 定位完成后触发;视图把目标行滚入视野(VS Code 资源管理器 reveal 行为)。</summary>
+    public event Action<WorkspaceTreeRow>? RevealRowRequested;
+
+    [ObservableProperty]
+    private string workspacePath = string.Empty;
+
+    [ObservableProperty]
+    private WorkspaceTreeRow? selectedTreeRow;
+
+    [ObservableProperty]
+    private bool areTreeGuidesVisible;
+
+    public WorkspaceViewModel(IFolderPickerService folderPicker, ISettingsService settings,
+        IProjectWorkspaceService workspaceService, IUiLogService logService, IClipboardService clipboard) : base("资源管理器", logService)
+    {
+        _folderPicker = folderPicker;
+        _scopedSettings = settings;
+        _workspaceService = workspaceService;
+        _clipboard = clipboard;
+        _workspaceService.ContextChanged += OnWorkspaceSettingsChangedAsync;
+        _selectionOpenScheduler.Action = RunPendingSelectionOpen;
+        _selectionOpenScheduler.OnError = ex => LogService.Write("ERROR", $"树选中打开文件失败：{ex.Message}");
+    }
+
+    protected override async Task OnFirstActivatedAsync()
+    {
+        await BindSettingsAsync();
+    }
+
+    private async Task BindSettingsAsync()
+    {
+        if (_settingsSession is not null) await _settingsSession.DisposeAsync();
+        _settingsSession = await _scopedSettings.OpenSessionAsync(new(_workspaceService.Current?.ProjectPath),
+            [BuiltInSettingsCatalog.ExplorerTreeGuides.Id, BuiltInSettingsCatalog.FilesExclude.Id,
+                BuiltInSettingsCatalog.ExplorerCompactFolders.Id]);
+        _settingsSession.Changed += (_, _) => ApplyScopedSettings(_settingsSession.Current!);
+        ApplyScopedSettings(_settingsSession.Current!);
+    }
+
+    private void ApplyScopedSettings(SettingsSnapshot snapshot)
+    {
+        if (!_settingsRevisionGate.TryAccept(snapshot)) return;
+        void Apply()
+        {
+            AreTreeGuidesVisible = snapshot.Effective(BuiltInSettingsCatalog.ExplorerTreeGuides);
+            var compactChanged = _compactFoldersEnabled != snapshot.Effective(BuiltInSettingsCatalog.ExplorerCompactFolders);
+            _compactFoldersEnabled = snapshot.Effective(BuiltInSettingsCatalog.ExplorerCompactFolders);
+            _statusSource.SetExcludes(snapshot.Effective(BuiltInSettingsCatalog.FilesExclude));
+            // 重载树:排除规则作用于磁盘枚举;紧凑文件夹投影在重建行时读取 _compactFoldersEnabled。
+            _ = RefreshAsync();
+            if (compactChanged)
+            {
+                // 紧凑模式翻转:既有节点(刷新前后缀保活的)的计数缓存必须同步换规则,
+                // 否则计数(链合并)与渲染(普通展开)不一致。
+                foreach (var root in RootNodes)
+                {
+                    SetCompactFoldersRecursive(root, _compactFoldersEnabled);
+                }
+
+                SyncTreeRows();
+            }
+        }
+        var dispatcher = Application.Current?.Dispatcher;
+        if (dispatcher is null || dispatcher.CheckAccess()) Apply(); else _ = dispatcher.BeginInvoke(Apply);
+    }
+
+    private Task OnWorkspaceSettingsChangedAsync(ProjectWorkspaceContext? context) => BindSettingsAsync();
+
+    [RelayCommand]
+    private async Task ChooseWorkspaceAsync()
+    {
+        var selected = _folderPicker.PickFolder(WorkspacePath);
+        if (selected is not null)
+        {
+            WorkspaceSelectionRequested?.Invoke(this, selected);
+        }
+    }
+
+    public async Task OpenWorkspaceAsync(string path)
+    {
+        WorkspacePath = path;
+        RootNodes.Clear();
+        _statusSource.Clear();
+        // 状态源已清空、树被整体重建:diff 基线必须同时作废,否则下一次 ApplyGitStatus 若与
+        // 旧工作区的状态 map 恰好相等会被等值跳过,新树节点将永远缺少 git 装饰(后续增量
+        // 刷新只覆盖变化路径,未变化文件依然不上色)。
+        _lastStatusMap = null;
+        var root = new WorkspaceNode(path, true, path, _statusSource);
+        root.CompactFolders = _compactFoldersEnabled;
+        RootNodes.Add(root);
+        // V4 诊断计数器随工作区重置。
+        IncrementalSpliceCount = 0;
+        FullSyncCount = 0;
+        // VS Code opens a workspace with the root folder expanded so the tree is visible at once.
+        root.IsExpanded = true;
+        await root.LoadChildrenAsync();
+        SyncTreeRows();
+        WorkspaceOpened?.Invoke(this, path);
+    }
+
+    /// <summary>Selection-driven open: folders are expanded/collapsed by the row click or the chevron
+    /// (see <c>WorkspaceView</c>), never by selection itself; files open a preview tab in the shared
+    /// editor area, exactly like a VS Code explorer single click.</summary>
+    [RelayCommand]
+    private Task OpenNodeAsync(WorkspaceNode? node)
+    {
+        if (node is null || _suppressSelectionOpen || node.IsDirectory)
+        {
+            return Task.CompletedTask;
+        }
+
+        FileOpenRequested?.Invoke(this, node.Path);
+        return Task.CompletedTask;
+    }
+
+    /// <summary>Expands or collapses one flattened folder row. Loading stays lazy: an expanded
+    /// directory is enumerated only once, then rebuilding only changes the visible row projection.
+    /// V4 快路径:展开/折叠只拼接受影响子树的区间(O(Δ),行对象按节点复用),不再整表重投影;
+    /// 缓存计数/行序不可用时(紧凑链形态变化、行不在投影中)回退全量 <see cref="SyncTreeRows"/>。</summary>
+    [RelayCommand]
+    private async Task ToggleTreeFolderAsync(WorkspaceFolderRow? row)
+    {
+        if (row is null) return;
+
+        var node = row.Node;
+        var previousCount = node.VisibleRowCount;
+        node.IsExpanded = !node.IsExpanded;
+        if (node.IsExpanded)
+        {
+            await node.LoadChildrenAsync();
+        }
+
+        var delta = node.VisibleRowCount - previousCount;
+        var start = -1;
+        var fastPath = node.Parent is not null
+            && node.SingleDirectoryChild is null // 该行仍代表节点自身(加载后若新增单目录子节点,紧凑链
+            // 的合并行改属子节点 → 行身份变化,必须全量重建)
+            && TryGetRowSpan(node, out start, out _);
+
+        if (delta == 0)
+        {
+            if (fastPath)
+            {
+                // 行数不变(如空目录切换):行序列不动,保持"每次切换通知一次"的旧契约
+                // (视图据此维持滚动锚点)。
+                TreeRowsChanged?.Invoke(this, EventArgs.Empty);
+            }
+            else
+            {
+                SyncTreeRows();
+            }
+            return;
+        }
+
+        if (fastPath && delta > 0)
+        {
+            IncrementalSpliceCount++;
+            var inserted = new List<WorkspaceTreeRow>(delta);
+            foreach (var child in node.Children)
+            {
+                if (!child.IsPlaceholder)
+                {
+                    CollectVisibleRows(child, row.Depth + 1, inserted);
+                }
+            }
+
+            if (inserted.Count == delta)
+            {
+                for (var i = 0; i < delta; i++)
+                {
+                    WorkspaceTreeRows.Insert(start + 1 + i, inserted[i]);
+                }
+
+                TreeRowsChanged?.Invoke(this, EventArgs.Empty);
+                return;
+            }
+        }
+        else if (fastPath && delta < 0)
+        {
+            IncrementalSpliceCount++;
+            var removeCount = -delta;
+            if (start + 1 + removeCount <= WorkspaceTreeRows.Count)
+            {
+                // 自尾向头移除(与 CollectionDiffer.Apply 同序):下标不漂移;被移除行解除订阅
+                // 并移出复用池(与全量同步的行生命周期一致:折叠子树的行不保留)。
+                for (var i = start + 1 + removeCount - 1; i >= start + 1; i--)
+                {
+                    var removed = WorkspaceTreeRows[i];
+                    WorkspaceTreeRows.RemoveAt(i);
+                    if (_rowCache.Remove(removed.Node, out var cached) && ReferenceEquals(cached, removed))
+                    {
+                        removed.Detach();
+                    }
+                }
+
+                TreeRowsChanged?.Invoke(this, EventArgs.Empty);
+                return;
+            }
+        }
+
+        SyncTreeRows();
+    }
+
+    /// <summary>V4:取节点在当前扁平投影中的行区间 [start, start+count):start 为节点自身行的
+    /// 扁平下标(紧凑链中为链顶合并行的下标——那正是链末端节点的行),count 取节点子树可见行数
+    /// 缓存。start 由父链 + 每节点 O(1) 计数缓存惰性导出(O(深度×兄弟数)),每次拼接后无需全表
+    /// 重新打戳;节点在投影中无行(紧凑链中间成员/占位符)时返回 false。</summary>
+    internal bool TryGetRowSpan(WorkspaceNode node, out int start, out int count)
+    {
+        start = 0;
+        count = 0;
+        if (node.IsPlaceholder)
+        {
+            return false;
+        }
+
+        var top = node;
+        while (top.Parent is not null)
+        {
+            top = top.Parent;
+        }
+
+        var index = 0;
+        foreach (var root in RootNodes)
+        {
+            if (ReferenceEquals(root, top))
+            {
+                break;
+            }
+
+            index += root.VisibleRowCount;
+        }
+
+        var current = top;
+        var rowPos = index;
+        while (!ReferenceEquals(current, node))
+        {
+            var child = FindChildAncestorOf(current, node);
+            if (child is null)
+            {
+                return false;
+            }
+
+            var chainPassesThrough = _compactFoldersEnabled
+                && current.SingleDirectoryChild is not null
+                && ReferenceEquals(current.SingleDirectoryChild, child);
+
+            if (ReferenceEquals(child, node))
+            {
+                if (chainPassesThrough)
+                {
+                    // 节点在 current 的紧凑链内:合并行位于链顶位置。链末端成员的行正是该合并行;
+                    // 中间成员没有自己的行。
+                    if (node.SingleDirectoryChild is not null)
+                    {
+                        return false;
+                    }
+
+                    start = rowPos;
+                    count = node.VisibleRowCount;
+                    return true;
+                }
+
+                // 非紧凑链分支:节点自身行只有在 current 展开时才投影。
+                if (current.IsDirectory && !current.IsExpanded)
+                {
+                    return false;
+                }
+
+                start = rowPos + 1 + SiblingRowsBefore(current, child);
+                count = child.VisibleRowCount;
+                return true;
+            }
+
+            if (!chainPassesThrough)
+            {
+                // 非紧凑链:child 子树只有在 current 展开时才投影(折叠分支无行)。
+                if (current.IsDirectory && !current.IsExpanded)
+                {
+                    return false;
+                }
+
+                // child 渲染自身行:current 自身行 + 其前序兄弟行都在 child 之前。
+                rowPos = rowPos + 1 + SiblingRowsBefore(current, child);
+            }
+            // 紧凑链情形:child 子树的行从同一位置开始(合并行共享,只计一次)。
+            current = child;
+        }
+
+        start = rowPos;
+        count = node.VisibleRowCount;
+        return true;
+    }
+
+    private static WorkspaceNode? FindChildAncestorOf(WorkspaceNode parent, WorkspaceNode node)
+    {
+        var candidate = node;
+        while (candidate.Parent is not null && !ReferenceEquals(candidate.Parent, parent))
+        {
+            candidate = candidate.Parent;
+        }
+
+        return ReferenceEquals(candidate.Parent, parent) ? candidate : null;
+    }
+
+    private static int SiblingRowsBefore(WorkspaceNode parent, WorkspaceNode node)
+    {
+        var sum = 0;
+        foreach (var child in parent.Children)
+        {
+            if (ReferenceEquals(child, node))
+            {
+                break;
+            }
+
+            if (!child.IsPlaceholder)
+            {
+                sum += child.VisibleRowCount;
+            }
+        }
+
+        return sum;
+    }
+
+    [RelayCommand]
+    private Task OpenTreeFileAsync(WorkspaceFileRow? row) => OpenNodeAsync(row?.Node);
+
+    /// <summary>双击文件行:打开常驻标签(单击开预览,见 <see cref="OpenNodeAsync"/>;已打开的
+    /// 预览由 EditorAreaViewModel 就地转正)。</summary>
+    [RelayCommand]
+    private Task OpenTreeFilePermanentAsync(WorkspaceFileRow? row)
+    {
+        var node = row?.Node;
+        if (node is null || node.IsDirectory)
+        {
+            return Task.CompletedTask;
+        }
+
+        FileOpenPermanentRequested?.Invoke(this, node.Path);
+        return Task.CompletedTask;
+    }
+
+    /// <summary>"查看更改" on a decorated changed file: hands the node to the workbench, which builds
+    /// a diff request from the current status map and opens it in the shared editor.</summary>
+    [RelayCommand(CanExecute = nameof(CanRequestDiff))]
+    private void RequestDiff(WorkspaceNode? node)
+    {
+        if (node is null || node.IsDirectory || _statusSource.Lookup(node.RelativePath) is null)
+        {
+            return;
+        }
+
+        DiffOpenRequested?.Invoke(this, node);
+    }
+
+    private bool CanRequestDiff(WorkspaceNode? node) =>
+        node is not null && !node.IsDirectory && _statusSource.Lookup(node.RelativePath) is not null;
+
+    /// <summary>Copies the node's absolute path to the clipboard.</summary>
+    [RelayCommand]
+    private void CopyPath(WorkspaceNode? node)
+    {
+        if (node is not null)
+        {
+            _clipboard.SetText(node.Path);
+        }
+    }
+
+    /// <summary>Copies the repository-relative path (VS Code "Copy Relative Path").</summary>
+    [RelayCommand]
+    private void CopyRelativePath(WorkspaceNode? node)
+    {
+        if (node is not null)
+        {
+            _clipboard.SetText(node.RelativePath);
+        }
+    }
+
+    /// <summary>Opens the node in the system file explorer with the item selected. Best effort:
+    /// shell launches fail silently on unusual environments.</summary>
+    [RelayCommand]
+    private void RevealInSystemExplorer(WorkspaceNode? node)
+    {
+        if (node is null || (!File.Exists(node.Path) && !Directory.Exists(node.Path)))
+        {
+            return;
+        }
+
+        try
+        {
+            Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{node.Path}\"") { UseShellExecute = false });
+        }
+        catch (Exception)
+        {
+            // Best-effort only (e.g. stripped shell environments).
+        }
+    }
+
+    [RelayCommand]
+    private async Task ExpandAllAsync(WorkspaceNode? node)
+    {
+        if (node is not null)
+        {
+            await ExpandRecursiveAsync(node);
+            SyncTreeRows();
+        }
+    }
+
+    [RelayCommand]
+    private void CollapseAll(WorkspaceNode? node)
+    {
+        if (node is not null)
+        {
+            CollapseRecursive(node);
+            SyncTreeRows();
+        }
+    }
+
+    /// <summary>Reloads the tree from disk (VS Code Explorer refresh). Expansion state resets for
+    /// the refreshed subtree; git decorations re-apply from the current status map on load.</summary>
+    [RelayCommand]
+    private async Task RefreshAsync()
+    {
+        if (RootNodes.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var root in RootNodes.ToArray())
+        {
+            DropTreeRecursive(root);
+        }
+
+        await RootNodes[0].LoadChildrenAsync();
+        SyncTreeRows();
+    }
+
+    /// <summary>并行展开目录树(旧实现是 DFS 串行 await,大仓库"展开全部"逐目录等待磁盘 I/O)。
+    /// BFS + 有界并发(最多 8 个在途枚举);LoadChildrenAsync 对同一节点并发安全(合并进行中加载)。</summary>
+    private static async Task ExpandRecursiveAsync(WorkspaceNode root)
+    {
+        if (!root.IsDirectory)
+        {
+            return;
+        }
+
+        const int maxParallel = 8;
+        var pending = new System.Collections.Concurrent.ConcurrentQueue<WorkspaceNode>();
+        var inFlight = new List<Task>();
+
+        root.IsExpanded = true;
+        await root.LoadChildrenAsync();
+        pending.Enqueue(root);
+
+        while (pending.Count > 0 || inFlight.Count > 0)
+        {
+            while (inFlight.Count < maxParallel && pending.TryDequeue(out var dir))
+            {
+                inFlight.Add(ExpandOneLevelAsync(dir, pending));
+            }
+
+            var finished = await Task.WhenAny(inFlight);
+            inFlight.Remove(finished);
+            await finished; // 传播异常
+        }
+    }
+
+    private static async Task ExpandOneLevelAsync(WorkspaceNode dir, System.Collections.Concurrent.ConcurrentQueue<WorkspaceNode> pending)
+    {
+        var next = new List<WorkspaceNode>();
+        foreach (var child in dir.Children)
+        {
+            if (!child.IsDirectory || child.IsPlaceholder)
+            {
+                continue;
+            }
+
+            child.IsExpanded = true;
+            await child.LoadChildrenAsync();
+            next.Add(child);
+        }
+
+        foreach (var child in next)
+        {
+            pending.Enqueue(child);
+        }
+    }
+
+    private static void CollapseRecursive(WorkspaceNode node)
+    {
+        if (!node.IsDirectory)
+        {
+            return;
+        }
+
+        foreach (var child in node.Children)
+        {
+            CollapseRecursive(child);
+        }
+
+        node.IsExpanded = false;
+    }
+
+    private static void DropTreeRecursive(WorkspaceNode node)
+    {
+        foreach (var child in node.Children.ToArray())
+        {
+            DropTreeRecursive(child);
+        }
+
+        node.DropChildren();
+    }
+
+    /// <summary>紧凑模式翻转时把标志写进已加载节点并重算计数(沿父链传播)。</summary>
+    private static void SetCompactFoldersRecursive(WorkspaceNode node, bool compact)
+    {
+        node.CompactFolders = compact;
+        node.RecomputeVisibleRowCountChain();
+        foreach (var child in node.Children)
+        {
+            SetCompactFoldersRecursive(child, compact);
+        }
+    }
+
+    /// <summary>Decorations (letter + staged/untracked flags) for a repository-relative path, used to
+    /// build a diff request from the explorer.</summary>
+    public WorkspaceGitInfo? GetGitInfo(string relativePath) => _statusSource.Lookup(relativePath);
+
+    /// <summary>Applies the latest repository status as decorations on the loaded tree. Safe to call
+    /// repeatedly after each source-control refresh; lazily loaded nodes pick up the current map
+    /// automatically via <see cref="WorkspaceStatusSource"/>.</summary>
+    public void ApplyGitStatus(GitRepositoryStatus? status)
+    {
+        var map = new Dictionary<string, WorkspaceGitInfo>(StringComparer.OrdinalIgnoreCase);
+        if (status is { IsRepository: true })
+        {
+            foreach (var change in status.StagedChanges)
+            {
+                map[change.Path] = new WorkspaceGitInfo(change.IndexStatus.ToStatusLetter(), IsStaged: true, IsUntracked: false);
+            }
+
+            foreach (var change in status.UnstagedChanges)
+            {
+                // 未跟踪文件与更改树(GitView)徽章一致:用绿色 "A" 表达"待添加",不再使用 '?'。
+                map[change.Path] = change.IsUntracked
+                    ? new WorkspaceGitInfo('A', IsStaged: false, IsUntracked: true)
+                    : new WorkspaceGitInfo(change.WorkTreeStatus.ToStatusLetter(), IsStaged: false, IsUntracked: false);
+            }
+        }
+
+        // V6/G9: 状态 map 无变化 → 整轮跳过(静默刷新的装饰刷新从"全树递归"变成零开销);
+        // 有变化 → 只刷新受影响路径 + 其祖先链的节点,不再遍历全部已加载节点做 decoration。
+        // 跳过的前提是"已加载节点的装饰仍与 _lastStatusMap 一致",即状态源仍持有它;
+        // 状态源被外部重置(清空/换 map)时,即使 map 无变化也必须全量重刷。
+        var changedPaths = ComputeChangedPaths(_lastStatusMap, map);
+        if (changedPaths.Count == 0 && ReferenceEquals(_statusSource.CurrentMap, _lastStatusMap))
+        {
+            return;
+        }
+
+        _lastStatusMap = map;
+        _statusSource.Set(map);
+        RefreshDecorations(changedPaths);
+        RequestDiffCommand.NotifyCanExecuteChanged();
+    }
+
+    /// <summary>上次应用的状态 map(用于等值跳过与差集计算)。</summary>
+    private IReadOnlyDictionary<string, WorkspaceGitInfo>? _lastStatusMap;
+
+    /// <summary>V4 模型诊断计数器:展开/折叠走 O(Δ) 区间拼接的次数(快速路径)。</summary>
+    internal int IncrementalSpliceCount { get; private set; }
+
+    /// <summary>V4 模型诊断计数器:整表重建(CollectVisibleRows + CollectionDiffer)的次数。</summary>
+    internal int FullSyncCount { get; private set; }
+
+    /// <summary>测试/诊断:强制整表同步一次(与真实路径同一实现)。</summary>
+    internal void SyncTreeRowsForTest() => SyncTreeRows();
+
+    /// <summary>测试/诊断:当前扁平行序列的快照(行对象按节点复用,引用同一)。</summary>
+    internal WorkspaceTreeRow[] TreeRowsSnapshot() => WorkspaceTreeRows.ToArray();
+
+    /// <summary>返回旧/新 map 之间发生变化的路径集合(新增、移除或字母/暂存标志变化)。</summary>
+    private static HashSet<string> ComputeChangedPaths(
+        IReadOnlyDictionary<string, WorkspaceGitInfo>? previous,
+        IReadOnlyDictionary<string, WorkspaceGitInfo> current)
+    {
+        var changed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (previous is null)
+        {
+            changed.UnionWith(current.Keys);
+            return changed;
+        }
+
+        foreach (var (path, info) in current)
+        {
+            if (!previous.TryGetValue(path, out var old) || old != info)
+            {
+                changed.Add(path);
+            }
+        }
+
+        foreach (var path in previous.Keys)
+        {
+            if (!current.ContainsKey(path))
+            {
+                changed.Add(path);
+            }
+        }
+
+        return changed;
+    }
+
+    /// <summary>Locates a file by its repository-relative path: expands ancestor folders and selects
+    /// the node so the user can see where the change lives. Called from source-control reveal.</summary>
+    public async Task<bool> RevealNodeAsync(string relativePath)
+    {
+        if (string.IsNullOrWhiteSpace(relativePath) || RootNodes.Count == 0)
+        {
+            return false;
+        }
+
+        var segments = relativePath.Split(['\\', '/'], StringSplitOptions.RemoveEmptyEntries);
+        if (segments.Length == 0)
+        {
+            return false;
+        }
+
+        var current = RootNodes[0];
+        for (var index = 0; index < segments.Length; index++)
+        {
+            await current.LoadChildrenAsync();
+            var match = current.Children.FirstOrDefault(child =>
+                !child.IsPlaceholder && string.Equals(child.Name, segments[index], StringComparison.OrdinalIgnoreCase));
+            if (match is null)
+            {
+                return false;
+            }
+
+            if (index < segments.Length - 1)
+            {
+                match.IsExpanded = true;
+                current = match;
+            }
+            else
+            {
+                _suppressSelectionOpen = true;
+                try
+                {
+                    match.IsSelected = true;
+                }
+                finally
+                {
+                    _suppressSelectionOpen = false;
+                }
+
+                SyncTreeRows(match);
+
+                // 增量同步不再重置列表滚动;显式通知视图把目标行滚入视野(旧整表重建靠选区
+                // 变化隐式滚动,增量更新下选中项可能已可见,需显式 reveal)。
+                if (_rowCache.TryGetValue(match, out var row))
+                {
+                    RevealRowRequested?.Invoke(row);
+                }
+
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private void RefreshDecorations(IReadOnlySet<string> changedPaths)
+    {
+        if (changedPaths.Count == 0)
+        {
+            return;
+        }
+
+        // 受影响集合 = 每个变化路径本身 + 其全部祖先目录(VS Code 装饰按需计算只刷新
+        // 命中节点 + 祖先链;目录点/字母由 WorkspaceStatusSource 的 O(1) 索引驱动)。
+        var affected = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var path in changedPaths)
+        {
+            var rest = path.Replace('\\', '/');
+            affected.Add(rest);
+            while (true)
+            {
+                var slash = rest.LastIndexOf('/');
+                if (slash < 0)
+                {
+                    affected.Add(string.Empty); // 仓库根目录节点
+                    break;
+                }
+
+                rest = rest[..slash];
+                affected.Add(rest);
+            }
+        }
+
+        foreach (var node in RootNodes)
+        {
+            ApplyDecorationIfAffected(node, affected);
+        }
+    }
+
+    private static void ApplyDecorationIfAffected(WorkspaceNode node, HashSet<string> affected)
+    {
+        // 遍历仍然覆盖全部已加载节点(树本身是懒加载的),但 RefreshDecoration 只对受影响者
+        // 执行(避免逐节点字典查找 + 属性变更通知)。
+        if (affected.Contains(node.RelativePath.Replace('\\', '/')))
+        {
+            node.RefreshDecoration();
+        }
+
+        foreach (var child in node.Children)
+        {
+            ApplyDecorationIfAffected(child, affected);
+        }
+    }
+
+    partial void OnSelectedTreeRowChanged(WorkspaceTreeRow? value)
+    {
+        if (_suppressTreeSelectionOpen) return;
+
+        if (value is null)
+        {
+            // 选区被程序化清空(行被移除/外部置空):撤销尚未落地的打开。
+            CancelPendingSelectionOpen();
+            return;
+        }
+
+        if (value is WorkspaceFolderRow)
+        {
+            _suppressTreeSelectionOpen = true;
+            SelectedTreeRow = null;
+            _suppressTreeSelectionOpen = false;
+            // 最新的选区是文件夹(不打开文件):撤销之前排队中的文件打开,只有最后一次选中打开。
+            CancelPendingSelectionOpen();
+            return;
+        }
+
+        value.Node.IsSelected = true;
+        if (value is WorkspaceFileRow fileRow)
+        {
+            // V7: 只排队、不立即打开;100ms 静默后仅打开最后一次选中的文件。
+            lock (_pendingSelectionOpenGate)
+            {
+                _pendingSelectionOpenRow = fileRow;
+            }
+
+            _selectionOpenScheduler.Schedule();
+        }
+    }
+
+    private void CancelPendingSelectionOpen()
+    {
+        _selectionOpenScheduler.Cancel();
+        lock (_pendingSelectionOpenGate)
+        {
+            _pendingSelectionOpenRow = null;
+        }
+    }
+
+    private void RunPendingSelectionOpen()
+    {
+        WorkspaceFileRow? row;
+        lock (_pendingSelectionOpenGate)
+        {
+            row = _pendingSelectionOpenRow;
+            _pendingSelectionOpenRow = null;
+        }
+
+        if (row is null || _suppressTreeSelectionOpen)
+        {
+            return;
+        }
+
+        void Run() => OpenTreeFileCommand.Execute(row);
+
+        // 定时器在线程池线程触发:不在 UI 线程时切回再建标签(与 SearchViewModel 的合并回调同约定)。
+        var dispatcher = Application.Current?.Dispatcher;
+        if (dispatcher is null || dispatcher.CheckAccess())
+        {
+            Run();
+        }
+        else
+        {
+            dispatcher.BeginInvoke(Run);
+        }
+    }
+
+    /// <summary>
+    /// 增量同步扁平行投影(VS Code listView splice 的 .NET 对应物):
+    /// 计算目标行序列 → 与当前序列做引用级前后缀 diff → 只对中间区间发 Remove/Insert。
+    /// 未受影响的行与 ListBox 容器保持不动;行对象按节点复用,因此 Git 装饰等行内
+    /// 状态在展开/折叠/刷新中不丢失。选区按节点身份保持。
+    /// </summary>
+    private void SyncTreeRows(WorkspaceNode? preferredNode = null)
+    {
+        FullSyncCount++;
+        preferredNode ??= SelectedTreeRow?.Node;
+
+        var desired = new List<WorkspaceTreeRow>(Math.Max(4, WorkspaceTreeRows.Count));
+        foreach (var root in RootNodes)
+        {
+            CollectVisibleRows(root, depth: 0, sink: desired);
+        }
+
+        // 仍在目标序列中的行(含中间区间内被移动、删后重插的行)不得解除订阅。
+        var kept = new HashSet<WorkspaceTreeRow>(desired.Count, ReferenceEqualityComparer.Instance);
+        foreach (var row in desired) kept.Add(row);
+
+        _suppressTreeSelectionOpen = true;
+        try
+        {
+            // 前后缀 diff + 中间区间先删后插:未受影响行与容器保持不动。
+            var removed = CollectionDiffer.Apply(WorkspaceTreeRows, desired, ReferenceEqualityComparer.Instance);
+            foreach (var row in removed)
+            {
+                if (!kept.Contains(row) && _rowCache.Remove(row.Node, out var cached) && ReferenceEquals(cached, row))
+                {
+                    row.Detach();
+                }
+            }
+        }
+        finally
+        {
+            _suppressTreeSelectionOpen = false;
+        }
+
+        // 选区:被移除的选中项会清空 ListBox 选区,按节点身份重新指回同一行对象。
+        if (preferredNode is not null)
+        {
+            WorkspaceTreeRow? selectedRow = null;
+            foreach (var row in desired)
+            {
+                if (ReferenceEquals(row.Node, preferredNode))
+                {
+                    selectedRow = row;
+                    break;
+                }
+            }
+
+            if (selectedRow is not null && !ReferenceEquals(SelectedTreeRow, selectedRow))
+            {
+                _suppressTreeSelectionOpen = true;
+                SelectedTreeRow = selectedRow;
+                _suppressTreeSelectionOpen = false;
+            }
+        }
+
+        TreeRowsChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    /// <summary>把可见节点序列写入 sink(不触碰集合)。行对象来自复用池,紧凑文件夹合并行
+    /// 的显示名就地更新。与旧 AddVisibleRows 的投影规则完全一致。</summary>
+    private void CollectVisibleRows(WorkspaceNode node, int depth, List<WorkspaceTreeRow> sink)
+    {
+        if (node.IsPlaceholder) return;
+
+        // VS Code compact folders:目录链上每个目录都恰好只有一个子目录时,合并为 "父 / 子" 单行
+        // (叶子目录的展开/折叠作用于链最深层)。占位节点不参与合并。
+        if (_compactFoldersEnabled && node.IsDirectory)
+        {
+            var segments = new List<string> { node.Name };
+            var current = node;
+            while (current.Children.Count == 1 && current.Children[0] is { IsDirectory: true, IsPlaceholder: false } child)
+            {
+                segments.Add(child.Name);
+                current = child;
+            }
+
+            if (segments.Count > 1)
+            {
+                // 合并行代表链最深层目录:展开/折叠、Git 装饰与定位都以它为对象。
+                var merged = GetOrCreateRow(current, depth);
+                if (merged is WorkspaceFolderRow folder)
+                {
+                    folder.SetDisplayNameOverride(string.Join(" / ", segments));
+                }
+
+                sink.Add(merged);
+                if (current.IsExpanded)
+                {
+                    foreach (var child in current.Children)
+                    {
+                        CollectVisibleRows(child, depth + 1, sink);
+                    }
+                }
+
+                return;
+            }
+        }
+
+        var row = GetOrCreateRow(node, depth);
+        if (row is WorkspaceFolderRow plainFolder)
+        {
+            plainFolder.SetDisplayNameOverride(null);
+        }
+
+        sink.Add(row);
+        if (!node.IsDirectory || !node.IsExpanded) return;
+
+        foreach (var child in node.Children)
+        {
+            CollectVisibleRows(child, depth + 1, sink);
+        }
+    }
+
+    /// <summary>取(或创建)节点的行;同节点复用同一行对象(类型变化时替换并解除旧订阅)。</summary>
+    private WorkspaceTreeRow GetOrCreateRow(WorkspaceNode node, int depth)
+    {
+        if (_rowCache.TryGetValue(node, out var existing) && KindMatches(existing, node))
+        {
+            existing.SetDepth(depth);
+            return existing;
+        }
+
+        DetachCachedRow(node);
+        var row = node.IsDirectory
+            ? (WorkspaceTreeRow)new WorkspaceFolderRow(node, depth)
+            : new WorkspaceFileRow(node, depth);
+        _rowCache[node] = row;
+        return row;
+    }
+
+    private static bool KindMatches(WorkspaceTreeRow row, WorkspaceNode node) =>
+        (row is WorkspaceFolderRow) == node.IsDirectory;
+
+    private void DetachCachedRow(WorkspaceNode node)
+    {
+        if (_rowCache.Remove(node, out var row))
+        {
+            row.Detach();
+        }
+    }
+}
+
+/// <summary>Common visual projection for a flat workspace tree row. Values are deliberately
+/// derived from WorkspaceNode so disk loading and Git decorations never have two sources of truth.
+/// Rows forward the node's decoration changes (<see cref="WorkspaceNode.StatusLetter"/> and
+/// <see cref="WorkspaceNode.HasChange"/>) as their own property changes, so a git status refresh
+/// updates the visible rows in place instead of rebuilding the whole flattened projection.</summary>
+public abstract class WorkspaceTreeRow : System.ComponentModel.INotifyPropertyChanged
+{
+    private readonly WorkspaceNode _node;
+    private double[]? _ancestorGuideLefts;
+    private bool _detached;
+
+    protected WorkspaceTreeRow(WorkspaceNode node, int depth)
+    {
+        _node = node;
+        Depth = depth;
+        _node.PropertyChanged += OnNodePropertyChanged;
+    }
+
+    public event System.ComponentModel.PropertyChangedEventHandler? PropertyChanged;
+
+    public WorkspaceNode Node => _node;
+
+    /// <summary>行在扁平列表中的缩进深度。行对象被增量同步复用,深度可能随紧凑文件夹链
+    /// 重排而变化;变化时通知 IndentMargin / AncestorGuideLefts。</summary>
+    public int Depth { get; private set; }
+
+    public string Name => _node.Name;
+
+    /// <summary>行显示名:默认即节点名;紧凑文件夹合并行覆盖为 "父 / 子" 组合名。</summary>
+    public virtual string DisplayName => Name;
+
+    public string Path => _node.Path;
+    public string RelativePath => _node.RelativePath;
+    public bool IsFolder => _node.IsDirectory;
+    public string StatusLetter => _node.StatusLetter;
+    public bool HasChange => _node.HasChange;
+    public Thickness IndentMargin => new(12 * Depth, 0, 0, 0);
+
+    /// <summary>各级引导线 X 坐标。按深度缓存(VS Code 的 guide 位置是纯算术,
+    /// 旧实现每次绑定求值都新分配数组)。</summary>
+    public double[] AncestorGuideLefts => _ancestorGuideLefts ??=
+        Depth switch
+        {
+            0 => [],
+            _ => Enumerable.Range(0, Depth).Select(level => 12.0 * level + 8.5).ToArray()
+        };
+
+    /// <summary>设置深度(增量同步复用时);仅在变化时通知。</summary>
+    internal void SetDepth(int depth)
+    {
+        if (Depth == depth) return;
+        Depth = depth;
+        _ancestorGuideLefts = null;
+        OnPropertyChanged(nameof(IndentMargin));
+        OnPropertyChanged(nameof(AncestorGuideLefts));
+    }
+
+    protected void OnPropertyChanged(string propertyName) =>
+        PropertyChanged?.Invoke(this, new System.ComponentModel.PropertyChangedEventArgs(propertyName));
+
+    /// <summary>解除与节点的订阅。行被增量同步移除(或工作区整体替换)时调用;
+    /// 旧实现整表重建时不解除,节点事件表会累积死行引用(泄漏)。</summary>
+    internal void Detach()
+    {
+        if (_detached) return;
+        _detached = true;
+        _node.PropertyChanged -= OnNodePropertyChanged;
+    }
+
+    private void OnNodePropertyChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName is nameof(WorkspaceNode.StatusLetter)
+            or nameof(WorkspaceNode.HasChange)
+            or nameof(WorkspaceNode.IsExpanded))
+        {
+            PropertyChanged?.Invoke(this, e);
+        }
+    }
+}
+
+public sealed class WorkspaceFolderRow(WorkspaceNode node, int depth) : WorkspaceTreeRow(node, depth)
+{
+    public bool IsCollapsed => !Node.IsExpanded;
+    public bool IsExpanded => Node.IsExpanded;
+
+    /// <summary>紧凑文件夹合并行显示组合名(默认 null = 使用节点名)。
+    /// 增量同步复用行对象时由 <see cref="SetDisplayNameOverride"/> 更新。</summary>
+    public string? DisplayNameOverride { get; private set; }
+
+    public override string DisplayName => DisplayNameOverride ?? base.DisplayName;
+
+    internal void SetDisplayNameOverride(string? value)
+    {
+        if (string.Equals(DisplayNameOverride, value, StringComparison.Ordinal)) return;
+        DisplayNameOverride = value;
+        OnPropertyChanged(nameof(DisplayName));
+    }
+}
+
+public sealed class WorkspaceFileRow(WorkspaceNode node, int depth) : WorkspaceTreeRow(node, depth);
+
+/// <summary>Git decoration info for a workspace file: the status letter to render (untracked files
+/// are shown as "A", matching the source-control badge) plus enough context to build a diff request
+/// (staged vs untracked).</summary>
+public readonly record struct WorkspaceGitInfo(char Letter, bool IsStaged, bool IsUntracked);
+
+/// <summary>Shared, mutable status map referenced by all <see cref="WorkspaceNode"/> instances so a
+/// refresh updates already-loaded nodes and lazily-loaded nodes pick up the same current map.</summary>
+public sealed class WorkspaceStatusSource
+{
+    private IReadOnlyDictionary<string, WorkspaceGitInfo>? _map;
+
+    /// <summary>Precomputed folder-index: directory prefix (normalized, no trailing slash; empty
+    /// string = repository root) → highest-priority descendant status letter. Rebuilt once per
+    /// status refresh so per-folder lookups stay O(1) — scanning the whole change map per folder
+    /// made explorer decoration refresh O(loaded-folders × changes) on the UI thread.</summary>
+    private Dictionary<string, char>? _folderBest;
+
+    private List<string> _excludePatterns = [];
+
+    /// <summary>当前持有的状态 map 引用(调用方据此判断"装饰与上次 map 一致"的跳过前提
+    /// 是否仍然成立;Clear/换 map 之后引用必然不等)。</summary>
+    public IReadOnlyDictionary<string, WorkspaceGitInfo>? CurrentMap => _map;
+
+    public void Set(IReadOnlyDictionary<string, WorkspaceGitInfo>? map)
+    {
+        _map = map;
+        _folderBest = BuildFolderIndex(map);
+    }
+
+    public void Clear()
+    {
+        _map = null;
+        _folderBest = null;
+    }
+
+    public void SetExcludes(IReadOnlyDictionary<string, bool> excludes)
+    {
+        // Normalize once per rule, not once per file (enumeration calls IsExcluded for every entry).
+        var patterns = new List<string>(excludes.Count);
+        foreach (var (pattern, enabled) in excludes)
+        {
+            if (!enabled) continue;
+            patterns.Add(pattern.Replace("**", "*", StringComparison.Ordinal));
+        }
+        _excludePatterns = patterns;
+    }
+
+    public bool IsExcluded(string relativePath)
+    {
+        if (_excludePatterns.Count == 0)
+        {
+            return false;
+        }
+
+        var normalized = relativePath.Replace('\\', '/');
+        var fileName = System.IO.Path.GetFileName(normalized);
+        foreach (var pattern in _excludePatterns)
+        {
+            if (System.IO.Enumeration.FileSystemName.MatchesSimpleExpression(pattern, normalized, true) ||
+                System.IO.Enumeration.FileSystemName.MatchesSimpleExpression(pattern, fileName, true))
+                return true;
+        }
+        return false;
+    }
+
+    public WorkspaceGitInfo? Lookup(string relativePath) =>
+        _map is not null && relativePath.Length > 0 && _map.TryGetValue(relativePath, out var info) ? info : null;
+
+    /// <summary>True when any changed path lives under a folder's relative path (the VS Code-style
+    /// changed-folder dot). The workspace root (empty path) is dirty whenever anything changed.</summary>
+    public bool HasChangeUnder(string directoryRelativePath)
+    {
+        return HighestStatusUnder(directoryRelativePath) is not null;
+    }
+
+    /// <summary>Returns the most important descendant status for a folder. Modified content wins
+    /// over every other status so a folder containing both M and A/D files is rendered as modified.
+    /// O(1) dictionary lookup into the precomputed folder index.</summary>
+    public char? HighestStatusUnder(string directoryRelativePath)
+    {
+        if (_map is null || _map.Count == 0 || _folderBest is null)
+        {
+            return null;
+        }
+
+        var normalizedDirectory = directoryRelativePath.Replace('\\', '/').Trim('/');
+        return _folderBest.TryGetValue(normalizedDirectory, out var letter) ? letter : null;
+    }
+
+    private static Dictionary<string, char>? BuildFolderIndex(IReadOnlyDictionary<string, WorkspaceGitInfo>? map)
+    {
+        if (map is null || map.Count == 0)
+        {
+            return null;
+        }
+
+        var index = new Dictionary<string, char>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (path, info) in map)
+        {
+            var priority = StatusPriority(info.Letter);
+            var rest = path.Replace('\\', '/');
+            // Walk every ancestor directory (including the repository root, stored under "").
+            // Keep walking even when a deeper ancestor already holds a better letter: a shallower
+            // directory may still need this one.
+            while (true)
+            {
+                var slash = rest.LastIndexOf('/');
+                if (slash < 0)
+                {
+                    TryImprove(index, string.Empty, info.Letter, priority);
+                    break;
+                }
+
+                var directory = rest[..slash];
+                TryImprove(index, directory, info.Letter, priority);
+                rest = directory;
+            }
+        }
+
+        return index;
+    }
+
+    private static void TryImprove(Dictionary<string, char> index, string directory, char letter, int priority)
+    {
+        if (!index.TryGetValue(directory, out var current) || StatusPriority(current) < priority)
+        {
+            index[directory] = letter;
+        }
+    }
+
+    private static int StatusPriority(char status) => status switch
+    {
+        'M' => 100, // explicit requirement: modified has the highest folder priority
+        'C' or 'T' => 80,
+        'D' or 'U' => 70,
+        'A' => 60, // 未跟踪文件渲染为 "A",与已暂存 Added 同级
+        'R' => 50,
+        _ => 0,
+    };
+}
+
+public sealed partial class WorkspaceNode : ObservableObject
+{
+    private static readonly HashSet<string> Ignored = new(StringComparer.OrdinalIgnoreCase) { ".git", "node_modules", "bin", "obj", ".vs" };
+
+    private readonly string _rootPath;
+    private readonly WorkspaceStatusSource _statusSource;
+
+    public WorkspaceNode(string path, bool isDirectory, string rootPath, WorkspaceStatusSource statusSource)
+    {
+        Path = path;
+        IsDirectory = isDirectory;
+        _rootPath = rootPath;
+        _statusSource = statusSource;
+        Name = System.IO.Path.GetFileName(path);
+        if (string.IsNullOrEmpty(Name))
+        {
+            Name = path;
+        }
+
+        RelativePath = ComputeRelativePath();
+        if (isDirectory)
+        {
+            Children.Add(new WorkspaceNode(string.Empty, false, rootPath, statusSource) { IsPlaceholder = true, Parent = this });
+        }
+
+        RefreshDecoration();
+        VisibleRowCount = ComputeVisibleRowCount();
+    }
+
+    public string Path { get; }
+    public string Name { get; }
+    public string RelativePath { get; }
+    public bool IsDirectory { get; }
+    public bool IsPlaceholder { get; private set; }
+    public string Glyph => IsDirectory ? Codicons.Folder : Codicons.File;
+    public ObservableCollection<WorkspaceNode> Children { get; } = [];
+
+    /// <summary>父节点(V4 增量投影:可见行数变化沿父链向上传播;根节点为 null)。</summary>
+    internal WorkspaceNode? Parent { get; set; }
+
+    /// <summary>紧凑文件夹是否生效(VM 绑定设置后写入;计数/链判定必须与 CollectVisibleRows
+    /// 的投影规则同源——否则"目录只有一个目录子节点"时计数与渲染行数会不一致)。</summary>
+    internal bool CompactFolders { get; set; }
+
+    /// <summary>V4 缓存的可见行数:当前投影下本子树渲染的行数(目录渲染一行、文件渲染自身
+    /// 一行;占位符为 0;紧凑文件夹链中链顶/中间成员不另计行,合并行计入链末端)。
+    /// 只在展开/折叠与子节点加载/丢弃时增量维护(沿父链传播,O(深度×兄弟数)),
+    /// SyncTreeRows 的快路径据此做 O(Δ) 区间拼接而非全表重建。</summary>
+    internal int VisibleRowCount { get; private set; }
+
+    /// <summary>紧凑文件夹判定:恰有一个非占位目录子节点时返回它(该节点会被并入链),否则 null。</summary>
+    internal WorkspaceNode? SingleDirectoryChild
+    {
+        get
+        {
+            if (!IsDirectory || Children.Count != 1)
+            {
+                return null;
+            }
+
+            var only = Children[0];
+            return only.IsDirectory && !only.IsPlaceholder ? only : null;
+        }
+    }
+
+    private int ComputeVisibleRowCount()
+    {
+        if (IsPlaceholder)
+        {
+            return 0;
+        }
+
+        if (!IsDirectory)
+        {
+            return 1;
+        }
+
+        // 与 CollectVisibleRows 的投影规则同构(紧凑链的合并行属于链末端子树的行,链上各
+        // 节点不重复计数;折叠目录只有自身一行,子树行尚未投影)。紧凑模式关闭时单目录子节点
+        // 照常渲染自身一行 + 子树,不合并。
+        var single = CompactFolders ? SingleDirectoryChild : null;
+        if (single is not null)
+        {
+            return single.VisibleRowCount;
+        }
+
+        var sum = 0;
+        if (IsExpanded)
+        {
+            foreach (var child in Children)
+            {
+                if (!child.IsPlaceholder)
+                {
+                    sum += child.VisibleRowCount;
+                }
+            }
+        }
+
+        return 1 + sum;
+    }
+
+    /// <summary>重算自身可见行数并沿父链传播,直到某个祖先计数不变(其祖先输入未变,可停)。</summary>
+    internal void RecomputeVisibleRowCountChain()
+    {
+        var node = this;
+        while (true)
+        {
+            var before = node.VisibleRowCount;
+            node.VisibleRowCount = node.ComputeVisibleRowCount();
+            if (node.VisibleRowCount == before || node.Parent is null)
+            {
+                return;
+            }
+
+            node = node.Parent;
+        }
+    }
+
+    [ObservableProperty]
+    private bool isLoaded;
+
+    [ObservableProperty]
+    private string statusLetter = string.Empty;
+
+    [ObservableProperty]
+    private bool hasChange;
+
+    [ObservableProperty]
+    private bool isExpanded;
+
+    [ObservableProperty]
+    private bool isSelected;
+
+    partial void OnIsExpandedChanged(bool value)
+    {
+        // V4: 展开/折叠立即更新可见行数缓存(此刻子树尚未加载变化,计数按当前子节点
+        // 重算;随后的加载完成会再次重算并向父链传播)。
+        RecomputeVisibleRowCountChain();
+        if (value)
+        {
+            _ = LoadChildrenAsync();
+        }
+    }
+
+    private Task? _pendingLoad;
+
+    /// <summary>枚举目录内容(枚举在 ThreadPool 执行:.NET 无异步目录枚举 API,超大目录的
+    /// 枚举不再阻塞 UI 线程——展开/打开卡顿的修复点之一)。并发调用加入进行中的同一次加载
+    /// (展开触发是 fire-and-forget,RevealNode / 测试 await 同一任务)。</summary>
+    public Task LoadChildrenAsync()
+    {
+        if (!IsDirectory)
+        {
+            return Task.CompletedTask;
+        }
+
+        // 进行中的加载优先:CoreAsync 在首个 await 前就置 IsLoaded=true,
+        // 若先判 IsLoaded,并发调用者会误以为已加载而拿到空 Children。
+        if (_pendingLoad is not null)
+        {
+            return _pendingLoad;
+        }
+
+        if (IsLoaded)
+        {
+            return Task.CompletedTask;
+        }
+
+        return _pendingLoad ??= LoadChildrenCoreAsync();
+    }
+
+    private async Task LoadChildrenCoreAsync()
+    {
+        IsLoaded = true;
+        Children.Clear();
+        try
+        {
+            // .NET 没有异步目录枚举:把同步枚举放到线程池,超大目录(构建产物/依赖)的枚举
+            // 不再阻塞 UI 线程——展开/打开卡顿的修复点之一。
+            var (directories, files) = await Task.Run(() =>
+            {
+                var dirs = Directory.EnumerateDirectories(Path)
+                    .Where(path => !Ignored.Contains(System.IO.Path.GetFileName(path)) &&
+                                  !_statusSource.IsExcluded(System.IO.Path.GetRelativePath(_rootPath, path)))
+                    .OrderBy(System.IO.Path.GetFileName)
+                    .ToList();
+                var fs = Directory.EnumerateFiles(Path)
+                    .Where(path => !_statusSource.IsExcluded(System.IO.Path.GetRelativePath(_rootPath, path)))
+                    .OrderBy(System.IO.Path.GetFileName)
+                    .ToList();
+                return (dirs, fs);
+            });
+
+            // Children 的变更回到 UI 线程(续延捕获自 UI 上下文);顺序与旧同步版一致:
+            // 排序后的目录在前,排序后的文件在后。
+            foreach (var directory in directories)
+            {
+                var node = new WorkspaceNode(directory, true, _rootPath, _statusSource)
+                {
+                    Parent = this,
+                    // 子节点继承本节点的紧凑标志(根节点由 VM 按设置写入)。
+                    CompactFolders = CompactFolders,
+                };
+                Children.Add(node);
+            }
+
+            foreach (var file in files)
+            {
+                var node = new WorkspaceNode(file, false, _rootPath, _statusSource)
+                {
+                    Parent = this,
+                    CompactFolders = CompactFolders,
+                };
+                Children.Add(node);
+            }
+        }
+        catch (Exception)
+        {
+            // 与旧行为一致:枚举失败时节点保持空/占位状态。
+        }
+        finally
+        {
+            _pendingLoad = null;
+            // V4: 子节点集合变化(占位符 → 真实子树)可能改变紧凑链形态与可见行数,
+            // 重算自身并向父链传播(未展开/枚举失败时计数不变,传播即刻停止)。
+            RecomputeVisibleRowCountChain();
+        }
+    }
+
+    /// <summary>Resets a directory node to its unloaded placeholder state (explorer refresh).</summary>
+    public void DropChildren()
+    {
+        if (!IsDirectory)
+        {
+            return;
+        }
+
+        IsLoaded = false;
+        Children.Clear();
+        Children.Add(new WorkspaceNode(string.Empty, false, _rootPath, _statusSource) { IsPlaceholder = true, Parent = this });
+        // V4: 子树被丢弃 → 可见行数回到占位形态(目录自身一行),向父链传播。
+        RecomputeVisibleRowCountChain();
+    }
+
+    /// <summary>Recomputes the git decoration from the current status source: files show a status
+    /// letter, folders show the "changed" dot when any descendant changed.</summary>
+    public void RefreshDecoration()
+    {
+        if (IsDirectory)
+        {
+            var status = _statusSource.HighestStatusUnder(RelativePath);
+            HasChange = status is not null;
+            StatusLetter = status?.ToString() ?? string.Empty;
+        }
+        else
+        {
+            var info = _statusSource.Lookup(RelativePath);
+            StatusLetter = info?.Letter.ToString() ?? string.Empty;
+            HasChange = false;
+        }
+    }
+
+    private string ComputeRelativePath()
+    {
+        if (string.IsNullOrEmpty(_rootPath) || string.IsNullOrEmpty(Path))
+        {
+            return string.Empty;
+        }
+
+        var root = _rootPath.TrimEnd('\\', '/');
+        var full = Path.TrimEnd('\\', '/');
+        if (string.Equals(root, full, StringComparison.OrdinalIgnoreCase))
+        {
+            return string.Empty;
+        }
+
+        // Git reports repository-relative paths with '/' separators on every platform; normalize so
+        // tree decorations (keyed by git status paths) and diff requests match.
+        if (full.StartsWith(root + "\\", StringComparison.OrdinalIgnoreCase))
+        {
+            return full[(root.Length + 1)..].Replace('\\', '/');
+        }
+
+        return full.StartsWith(root + "/", StringComparison.OrdinalIgnoreCase)
+            ? full[(root.Length + 1)..]
+            : full;
+    }
+}
