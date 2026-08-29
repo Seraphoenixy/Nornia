@@ -229,11 +229,8 @@
         <Grid Margin="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=IndentMargin}">
           <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
           <Grid.InputBindings>
-            <!-- 历史文件行:单击以该提交的 diff 打开(原模板行为);对更改行不可执行(参数类型
-                 不匹配,CanExecute 为 false)。更改行:双击打开常驻文件标签(单击仍走选中开预览)。 -->
-            <MouseBinding Gesture="LeftClick"
-                          Command="{Binding DataContext.OpenLogFileDiffCommand, RelativeSource={RelativeSource AncestorType=UserControl}}"
-                          CommandParameter="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=LogFileTarget}" />
+            <!-- 平铺更改行双击打开常驻文件标签；单击由选择变化打开预览，重复点击已选中行
+                 则由 FlatChangeList_PreviewMouseLeftButton* 补发一次，避免无响应。 -->
             <MouseBinding Gesture="LeftDoubleClick"
                           Command="{Binding DataContext.OpenChangeFilePermanentCommand, RelativeSource={RelativeSource AncestorType=views:GitView}}"
                           CommandParameter="{Binding}" />
@@ -258,10 +255,43 @@
                 </Style>
               </controls:SidebarFileTypeBadge.Style>
             </controls:SidebarFileTypeBadge>
-            <!-- 名称/重命名后缀/目录段不再定长 200px:主名称恒占 2 star,后缀与目录段可见时各占
-                 1 star(隐藏时列宽 0),显示长度随行的可显示范围(侧栏宽度/缩进深度)动态伸缩,
-                 空间不足时按段省略号截断。 -->
             <Grid MinWidth="0">
+            <!-- 平铺行仿 VS Code SCM：路径作为次要文字紧跟文件名，不用 star 列把二者拉开；
+                 整行共用一个省略范围，右侧操作按钮仍保留固定空间。 -->
+            <TextBlock x:Name="FlatNameAndPath" MinWidth="0"
+                       ToolTip="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=ToolTip}">
+              <TextBlock.Style>
+                <Style TargetType="TextBlock" BasedOn="{StaticResource ScmFileNameTextStyle}">
+                  <Setter Property="Visibility" Value="Collapsed" />
+                  <Style.Triggers>
+                    <DataTrigger Binding="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=IsFlatRow}" Value="True">
+                      <Setter Property="Visibility" Value="Visible" />
+                    </DataTrigger>
+                  </Style.Triggers>
+                </Style>
+              </TextBlock.Style>
+              <Run Text="{Binding Mode=OneWay, Converter={StaticResource ScmFileRow}, ConverterParameter=Name}" />
+              <Run Text="  " />
+              <Run Text="{Binding Mode=OneWay, Converter={StaticResource ScmFileRow}, ConverterParameter=Directory}"
+                   Foreground="{DynamicResource MutedTextBrush}" />
+              <Run Text="  " />
+              <Run Text="{Binding Mode=OneWay, Converter={StaticResource ScmFileRow}, ConverterParameter=RenameSuffixGlyph}"
+                   FontFamily="{StaticResource IconFontFamily}" Foreground="{DynamicResource MutedTextBrush}" />
+              <Run Text="{Binding Mode=OneWay, Converter={StaticResource ScmFileRow}, ConverterParameter=RenameSuffix}"
+                   Foreground="{DynamicResource MutedTextBrush}" />
+            </TextBlock>
+            <!-- 树状/历史行继续使用分段弹性列，保留长文件名、重命名后缀的独立截断策略。 -->
+            <Grid MinWidth="0">
+              <Grid.Style>
+                <Style TargetType="Grid">
+                  <Setter Property="Visibility" Value="Visible" />
+                  <Style.Triggers>
+                    <DataTrigger Binding="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=IsFlatRow}" Value="True">
+                      <Setter Property="Visibility" Value="Collapsed" />
+                    </DataTrigger>
+                  </Style.Triggers>
+                </Style>
+              </Grid.Style>
               <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="2*" />
                 <ColumnDefinition Width="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=RenameSuffixColumnWidth}" />
@@ -288,6 +318,7 @@
                          Style="{StaticResource ScmDirectoryTextStyle}"
                          Visibility="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=DirectoryVisibility}"
                          ToolTip="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=ToolTip}" />
+            </Grid>
             </Grid>
           </DockPanel>
         <!-- Hover / selected rows reveal the per-row actions (VS Code):更改行按 ListBoxItem
@@ -659,7 +690,8 @@
                 MouseLeftButtonUp="CommitBar_MouseLeftButtonUp">
           <Border.ToolTip>
             <ToolTip Style="{StaticResource ScmCommitToolTipStyle}">
-              <StackPanel MaxWidth="440" MinWidth="260">
+              <!-- 按内容自然测量宽度，最多扩展到 550px；显式 Left 防止 ToolTip 内容拉伸。 -->
+              <StackPanel MaxWidth="550" HorizontalAlignment="Left">
                 <!-- 作者 + 时间行(VS Code: $(git-commit) 作者名 + 邮箱, $(history) 提交时间) -->
                 <StackPanel>
                   <StackPanel Orientation="Horizontal">
@@ -681,7 +713,7 @@
                 <!-- 提交信息全文(主题 + 正文):markdown 渲染,规则对齐 VS Code 历史项悬浮窗
                      (每条消息行独立成段;支持标题/列表/代码块/加粗/行内代码/链接等) -->
                 <controls:MarkdownMessageView Markdown="{Binding FullMessage}"
-                                              MaxWidth="440" MaxHeight="260" Margin="0,2,0,0" />
+                                              MaxWidth="550" HorizontalAlignment="Left" Margin="0,2,0,0" />
                 <!-- 变更统计(VS Code shortStats 段):文件数 + 新增/删除行;无统计时整段收起 -->
                 <StackPanel>
                   <StackPanel.Style>
@@ -954,6 +986,8 @@
                 <!-- 平铺布局 -->
                 <ListBox Tag="staged" ItemsSource="{Binding StagedChangesView}" SelectedItem="{Binding SelectedStagedChange}"
                          MaxHeight="{Binding ViewportHeight, RelativeSource={RelativeSource AncestorType=ScrollViewer}}"
+                         PreviewMouseLeftButtonDown="FlatChangeList_PreviewMouseLeftButtonDown"
+                         PreviewMouseLeftButtonUp="FlatChangeList_PreviewMouseLeftButtonUp"
                          PreviewMouseMove="ChangeList_PreviewMouseMove"
                          SelectionMode="Extended" KeyboardNavigation.TabNavigation="None" Padding="0,2,0,2"
                          b:MultiSelectorBinding.SelectedItems="{Binding SelectedStagedChanges}"
@@ -1041,6 +1075,8 @@
                 <!-- 平铺布局 -->
                 <ListBox Tag="unstaged" ItemsSource="{Binding UnstagedChangesView}" SelectedItem="{Binding SelectedUnstagedChange}"
                          MaxHeight="{Binding ViewportHeight, RelativeSource={RelativeSource AncestorType=ScrollViewer}}"
+                         PreviewMouseLeftButtonDown="FlatChangeList_PreviewMouseLeftButtonDown"
+                         PreviewMouseLeftButtonUp="FlatChangeList_PreviewMouseLeftButtonUp"
                          PreviewMouseMove="ChangeList_PreviewMouseMove"
                          SelectionMode="Extended" KeyboardNavigation.TabNavigation="None" Padding="0,2,0,2"
                          b:MultiSelectorBinding.SelectedItems="{Binding SelectedUnstagedChanges}"

@@ -1,9 +1,12 @@
 using Nornia.Desktop.Views.Controls;
 using Nornia.Desktop.Converters;
 using Nornia.Desktop.Views;
+using Nornia.Desktop.ViewModels;
+using Nornia.Core.Models;
 using System.Globalization;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Documents;
 using System.Windows.Media;
 
 namespace Nornia.Tests;
@@ -45,6 +48,36 @@ public sealed class SidebarConsistencyTests
             _ = new ExplorerSidebarView();
             _ = new SearchSidebarView();
             _ = new GitView();
+        });
+    }
+
+    [Fact]
+    public void GitFlatChangeRowTemplate_LoadsConverterBindingsAtRuntime()
+    {
+        WpfStaContext.Run(() =>
+        {
+            var view = new GitView();
+            var template = Assert.IsType<DataTemplate>(view.Resources["ScmFileRowTemplate"]);
+            var row = Assert.IsAssignableFrom<FrameworkElement>(template.LoadContent());
+            row.DataContext = new GitChangeItem(new GitFileChange(
+                "src/features/Example.cs", GitChangeStatus.Unmodified, GitChangeStatus.Modified));
+
+            row.Measure(new Size(420, 40));
+
+            Assert.True(row.DesiredSize.Width > 0);
+        });
+    }
+
+    [Fact]
+    public void GitRowAncestorLookup_AcceptsInlineRunEventSources()
+    {
+        WpfStaContext.Run(() =>
+        {
+            var text = new TextBlock();
+            var run = new Run("Example.cs");
+            text.Inlines.Add(run);
+
+            Assert.Same(text, GitView.FindAncestor<TextBlock>(run));
         });
     }
 

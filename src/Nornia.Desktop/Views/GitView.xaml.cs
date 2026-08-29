@@ -40,6 +40,11 @@ public partial class GitView : UserControl
     private GridLength _changesExpandedHeight = new(1, GridUnitType.Star);
     private GridLength _graphExpandedHeight = new(1, GridUnitType.Star);
     private GitViewModel? _layoutViewModel;
+    private GitChangeItem? _flatChangeReopenCandidate;
+    private ListBox? _flatChangeReopenList;
+    // ContextMenu 在点击其 PlacementTarget 时会先自动关闭、随后才触发 Button.Click。
+    // 记录这种关闭，避免 Click 处理器立即把同一个菜单重新打开。
+    private readonly HashSet<Button> _suppressMenuOpenButtons = [];
 
     public GitView()
     {
@@ -210,9 +215,7 @@ public partial class GitView : UserControl
     {
         if (sender is Button { ContextMenu: { } menu } button)
         {
-            menu.PlacementTarget = button;
-            menu.Placement = PlacementMode.Bottom;
-            menu.IsOpen = true;
+            ToggleButtonContextMenu(button, menu);
         }
     }
 
@@ -221,10 +224,38 @@ public partial class GitView : UserControl
     {
         if (sender is Button { ContextMenu: { } menu } button)
         {
-            menu.PlacementTarget = button;
-            menu.Placement = PlacementMode.Bottom;
-            menu.IsOpen = true;
+            ToggleButtonContextMenu(button, menu);
             e.Handled = true;
+        }
+    }
+
+    private void ToggleButtonContextMenu(Button button, ContextMenu menu)
+    {
+        if (_suppressMenuOpenButtons.Remove(button))
+        {
+            return;
+        }
+
+        if (menu.IsOpen)
+        {
+            menu.IsOpen = false;
+            return;
+        }
+
+        menu.PlacementTarget = button;
+        menu.Placement = PlacementMode.Bottom;
+        menu.Closed -= ButtonContextMenu_Closed;
+        menu.Closed += ButtonContextMenu_Closed;
+        menu.IsOpen = true;
+    }
+
+    private void ButtonContextMenu_Closed(object sender, RoutedEventArgs e)
+    {
+        if (sender is ContextMenu { PlacementTarget: Button button }
+            && button.IsMouseOver
+            && Mouse.LeftButton == MouseButtonState.Pressed)
+        {
+            _suppressMenuOpenButtons.Add(button);
         }
     }
 
@@ -246,17 +277,7 @@ public partial class GitView : UserControl
     }
 
     private static bool IsInsideButton(DependencyObject source)
-    {
-        for (var current = source; current is not null; current = VisualTreeHelper.GetParent(current))
-        {
-            if (current is Button)
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
+        => FindAncestor<Button>(source) is not null;
     /// <summary>Commit-row expansion is handled on mouse-up instead of a <see cref="MouseBinding"/>.
     /// ListBoxItem handles the first left-button-down to establish selection; MouseBinding can then
     /// miss that first gesture after the row is retemplated by an expand/collapse. The full-width
@@ -269,6 +290,49 @@ public partial class GitView : UserControl
             ViewModel.ToggleLogRowCommand.Execute(row);
             e.Handled = true;
         }
+    }
+
+    /// <summary>
+    /// ListBox 的 SelectedItem 只在选择发生变化时通知 VM；已选中平铺行再次单击不会重开
+    /// 已被其他预览替换/关闭的 diff。按下时记录“原本已选中”的行，释放仍命中同一行时补发。
+    /// </summary>
+    private void FlatChangeList_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        _flatChangeReopenCandidate = null;
+        _flatChangeReopenList = null;
+        if (sender is not ListBox list
+            || Keyboard.Modifiers != ModifierKeys.None
+            || e.OriginalSource is not DependencyObject source
+            || IsInsideButton(source)
+            || FindAncestor<ListBoxItem>(source) is not { IsSelected: true, DataContext: GitChangeItem item } container
+            || ItemsControl.ItemsControlFromItemContainer(container) != list
+            || !ReferenceEquals(list.SelectedItem, item))
+        {
+            return;
+        }
+
+        _flatChangeReopenCandidate = item;
+        _flatChangeReopenList = list;
+    }
+
+    private void FlatChangeList_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+    {
+        var candidate = _flatChangeReopenCandidate;
+        var candidateList = _flatChangeReopenList;
+        _flatChangeReopenCandidate = null;
+        _flatChangeReopenList = null;
+        if (candidate is null
+            || sender is not ListBox list
+            || list != candidateList
+            || e.OriginalSource is not DependencyObject source
+            || FindAncestor<ListBoxItem>(source)?.DataContext is not GitChangeItem releasedItem
+            || !ReferenceEquals(candidate, releasedItem)
+            || ViewModel?.OpenChangeDiffCommand.CanExecute(candidate) != true)
+        {
+            return;
+        }
+
+        ViewModel.OpenChangeDiffCommand.Execute(candidate);
     }
 
     // ===== 拖放暂存:未暂存 ↔ 已暂存分区之间拖动文件行(VS Code SCM) =====
@@ -363,7 +427,7 @@ public partial class GitView : UserControl
             return;
         }
 
-        if (FindVisualAncestor<ListBox>(source) is not { } list
+        if (FindAncestor<ListBox>(source) is not { } list
             || FindVisualChild<ScrollViewer>(list, _ => true) is not { } inner)
         {
             return;
@@ -380,8 +444,11 @@ public partial class GitView : UserControl
         e.Handled = true;
     }
 
-    /// <summary>视觉树祖先查找:对任意已连接元素安全,找不到返回 null。</summary>
-    private static T? FindVisualAncestor<T>(DependencyObject node) where T : DependencyObject
+    /// <summary>
+    /// 祖先查找同时支持 Visual 与 FrameworkContentElement。TextBlock 使用内联 Run 后，
+    /// 鼠标事件的 OriginalSource 可能是 Run；它不是 Visual，不能直接传给 VisualTreeHelper。
+    /// </summary>
+    internal static T? FindAncestor<T>(DependencyObject node) where T : DependencyObject
     {
         while (node is not null)
         {
@@ -390,7 +457,14 @@ public partial class GitView : UserControl
                 return match;
             }
 
-            node = VisualTreeHelper.GetParent(node);
+            node = node switch
+            {
+                FrameworkContentElement content => content.Parent ?? ContentOperations.GetParent(content),
+                ContentElement content => ContentOperations.GetParent(content),
+                Visual or System.Windows.Media.Media3D.Visual3D =>
+                    VisualTreeHelper.GetParent(node) ?? LogicalTreeHelper.GetParent(node),
+                _ => LogicalTreeHelper.GetParent(node),
+            };
         }
 
         return null;

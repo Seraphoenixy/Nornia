@@ -1,5 +1,7 @@
+using System.Globalization;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Documents;
 using System.Windows.Media;
 using Nornia.Desktop.Markdown;
 using Nornia.Desktop.Services;
@@ -30,7 +32,8 @@ public sealed class MarkdownMessageView : FlowDocumentScrollViewer
     {
         Background = Brushes.Transparent;
         HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
-        VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+        // 提交悬浮窗随正文自然增高；正文内部不再形成第二个滚动区域。
+        VerticalScrollBarVisibility = ScrollBarVisibility.Disabled;
         Loaded += (_, _) =>
         {
             ThemeEvents.ThemeChanged += OnThemeChanged;
@@ -54,5 +57,33 @@ public sealed class MarkdownMessageView : FlowDocumentScrollViewer
         Rebuild();
     }
 
-    private void Rebuild() => Document = CommitMessageRenderer.Render(Markdown);
+    private void Rebuild()
+    {
+        var document = CommitMessageRenderer.Render(Markdown);
+        Document = document;
+
+        // FlowDocumentScrollViewer 即使 HorizontalAlignment=Left，也会因分页布局把 DesiredSize
+        // 撑到可用上限。显式使用文本的自然宽度，MaxWidth 再负责长内容的 550px 上限。
+        Width = MeasureNaturalContentWidth(Markdown, document);
+    }
+
+    private static double MeasureNaturalContentWidth(string? markdown, FlowDocument document)
+    {
+        var typeface = new Typeface(document.FontFamily, document.FontStyle,
+            document.FontWeight, document.FontStretch);
+        var pixelsPerDip = Application.Current?.MainWindow is { } window
+            ? VisualTreeHelper.GetDpi(window).PixelsPerDip
+            : 1d;
+        var widest = 0d;
+        foreach (var line in (markdown ?? string.Empty).Replace("\r\n", "\n").Replace('\r', '\n').Split('\n'))
+        {
+            var formatted = new FormattedText(line, CultureInfo.CurrentUICulture,
+                FlowDirection.LeftToRight, typeface, document.FontSize,
+                document.Foreground, pixelsPerDip);
+            widest = Math.Max(widest, formatted.WidthIncludingTrailingWhitespace);
+        }
+
+        // 列表缩进、项目符号和代码块内边距的统一余量；ToolTip 外层 Padding 不计入此处。
+        return Math.Max(1d, Math.Ceiling(widest + 20d));
+    }
 }

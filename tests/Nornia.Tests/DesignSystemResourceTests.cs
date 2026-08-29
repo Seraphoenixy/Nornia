@@ -277,6 +277,18 @@ public sealed class DesignSystemResourceTests
     }
 
     [Fact]
+    public void ButtonOpenedContextMenus_ToggleClosedOnSecondClick()
+    {
+        var code = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml.cs"));
+
+        Assert.Equal(2, Regex.Matches(code, "ToggleButtonContextMenu\\(button, menu\\);").Count);
+        Assert.Contains("_suppressMenuOpenButtons.Remove(button)", code);
+        Assert.Contains("button.IsMouseOver", code);
+        Assert.Contains("Mouse.LeftButton == MouseButtonState.Pressed", code);
+        Assert.Contains("menu.IsOpen = false", code);
+    }
+
+    [Fact]
     public void DiffHighlighting_ContrastOnTintedBackground()
     {
         // Diff 行背景(DiffAddedBrush/DiffRemovedBrush)叠加在语法高亮文本之下:最弱的
@@ -1113,6 +1125,20 @@ public sealed class DesignSystemResourceTests
     }
 
     [Fact]
+    public void CommitHover_UsesContentWidthUpToFiveHundredFiftyWithoutHeightCap()
+    {
+        var git = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
+        var start = git.IndexOf("<ToolTip Style=\"{StaticResource ScmCommitToolTipStyle}\">", StringComparison.Ordinal);
+        var end = git.IndexOf("<!-- 变更统计", start, StringComparison.Ordinal);
+        var hover = git[start..end];
+
+        Assert.Contains("<StackPanel MaxWidth=\"550\" HorizontalAlignment=\"Left\">", hover);
+        Assert.Contains("MaxWidth=\"550\" HorizontalAlignment=\"Left\"", hover);
+        Assert.DoesNotContain("MinWidth=", hover);
+        Assert.DoesNotContain("MaxHeight=", hover);
+    }
+
+    [Fact]
     public void GitGraph_UsesTopBranchSelectorInsteadOfBranchCollapsibleSection()
     {
         var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
@@ -1136,6 +1162,39 @@ public sealed class DesignSystemResourceTests
         Assert.Equal(2, CountOccurrences(view,
             "Command=\"{Binding DataContext.OpenFilePreviewCommand, RelativeSource={RelativeSource AncestorType=views:GitView}}\""));
         Assert.DoesNotContain("ToolTip=\"在资源管理器中显示\"", view);
+    }
+
+    [Fact]
+    public void GitFlatChangeRows_PlaceDirectoryImmediatelyAfterFileName()
+    {
+        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
+        var start = view.IndexOf("<TextBlock x:Name=\"FlatNameAndPath\"", StringComparison.Ordinal);
+        var end = view.IndexOf("</TextBlock>", start, StringComparison.Ordinal);
+        var flatText = view[start..end];
+
+        var name = flatText.IndexOf("ConverterParameter=Name", StringComparison.Ordinal);
+        var directory = flatText.IndexOf("ConverterParameter=Directory", StringComparison.Ordinal);
+        Assert.True(name >= 0 && directory > name);
+        Assert.Contains("BasedOn=\"{StaticResource ScmFileNameTextStyle}\"", flatText);
+        Assert.Contains("Foreground=\"{DynamicResource MutedTextBrush}\"", flatText);
+        Assert.Equal(4, Regex.Matches(flatText, "<Run Text=\"\\{Binding Mode=OneWay,").Count);
+    }
+
+    [Fact]
+    public void GitFlatChangeRows_ReopenDiffWhenTheSelectedRowIsClickedAgain()
+    {
+        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
+        var code = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml.cs"));
+
+        Assert.Equal(2, CountOccurrences(view, "PreviewMouseLeftButtonDown=\"FlatChangeList_PreviewMouseLeftButtonDown\""));
+        Assert.Equal(2, CountOccurrences(view, "PreviewMouseLeftButtonUp=\"FlatChangeList_PreviewMouseLeftButtonUp\""));
+        Assert.Contains("_flatChangeReopenCandidate", code);
+        Assert.Contains("OpenChangeDiffCommand.Execute(candidate)", code);
+
+        var templateStart = view.IndexOf("<DataTemplate x:Key=\"ScmFileRowTemplate\">", StringComparison.Ordinal);
+        var bindingsStart = view.IndexOf("<Grid.InputBindings>", templateStart, StringComparison.Ordinal);
+        var bindingsEnd = view.IndexOf("</Grid.InputBindings>", bindingsStart, StringComparison.Ordinal);
+        Assert.DoesNotContain("OpenLogFileDiffCommand", view[bindingsStart..bindingsEnd]);
     }
 
     [Fact]

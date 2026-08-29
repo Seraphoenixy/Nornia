@@ -31,6 +31,10 @@ public static class CommitMessageRenderer
             FontFamily = fontFamily,
             FontSize = fontSize,
             Foreground = Resolve("TextBrush"),
+            // Mixed CJK / long identifiers must keep VS Code hover's flush-left layout. WPF's
+            // paragraph formatter otherwise stretches the short fragments preceding an
+            // unbreakable Latin word, producing visibly sparse lines.
+            TextAlignment = TextAlignment.Left,
             // VS Code workbench hover: 13px 字体 / 19px 行高。
             LineHeight = fontSize * 19d / 13d,
         };
@@ -197,7 +201,7 @@ public static class CommitMessageRenderer
         void Flush()
         {
             if (plain.Length == 0) return;
-            result.Add(new Run(plain.ToString()));
+            result.Add(new Run(AddLongWordBreakOpportunities(plain.ToString())));
             plain.Clear();
         }
 
@@ -360,10 +364,66 @@ public static class CommitMessageRenderer
     private static bool IsEscapable(char c) =>
         c is '\\' or '`' or '*' or '_' or '[' or ']' or '(' or ')' or '~' or '#' or '>' or '-' or '+' or '.' or '!' or '|';
 
+    /// <summary>
+    /// WPF 不会像 VS Code 的 <c>overflow-wrap: break-word</c> 一样拆分超长英文标识符。
+    /// 对超过一行安全片段长度的 ASCII 单词加入不可见软换行点：优先使用下划线和
+    /// camelCase/PascalCase 边界，并以固定上限兜底。字符本身及视觉内容保持不变。
+    /// </summary>
+    private static string AddLongWordBreakOpportunities(string text)
+    {
+        const int maxSegmentLength = 24;
+        const char zeroWidthSpace = '\u200B';
+        var result = new StringBuilder(text.Length + 8);
+        var insertedBreak = false;
+        var cursor = 0;
+        while (cursor < text.Length)
+        {
+            if (!IsAsciiWordCharacter(text[cursor]))
+            {
+                result.Append(text[cursor]);
+                cursor++;
+                continue;
+            }
+
+            var wordStart = cursor;
+            var wordEnd = wordStart + 1;
+            while (wordEnd < text.Length && IsAsciiWordCharacter(text[wordEnd])) wordEnd++;
+            if (wordEnd - wordStart <= maxSegmentLength)
+            {
+                result.Append(text, wordStart, wordEnd - wordStart);
+                cursor = wordEnd;
+                continue;
+            }
+
+            var lastBreak = wordStart;
+            for (var i = wordStart; i < wordEnd; i++)
+            {
+                var naturalBoundary = i > wordStart
+                    && (text[i - 1] == '_'
+                        || (char.IsLower(text[i - 1]) && char.IsUpper(text[i])));
+                if (i > wordStart && (naturalBoundary || i - lastBreak >= maxSegmentLength))
+                {
+                    result.Append(zeroWidthSpace);
+                    insertedBreak = true;
+                    lastBreak = i;
+                }
+                result.Append(text[i]);
+            }
+
+            cursor = wordEnd;
+        }
+
+        return insertedBreak ? result.ToString() : text;
+    }
+
+    private static bool IsAsciiWordCharacter(char c) =>
+        c is >= 'a' and <= 'z' or >= 'A' and <= 'Z' or >= '0' and <= '9' or '_';
+
     private static Paragraph NewParagraph() => new()
     {
         // VS Code 历史项悬浮窗:段落间距 4px(首段上缘 4px、末段下缘 2px 由整体 Margin 承担)。
         Margin = new Thickness(0, 2, 0, 2),
+        TextAlignment = TextAlignment.Left,
     };
 
     private static Paragraph EmptyParagraph() => NewParagraph();
