@@ -4,11 +4,9 @@
              xmlns:vm="clr-namespace:Nornia.Desktop.ViewModels"
              xmlns:views="clr-namespace:Nornia.Desktop.Views">
   <UserControl.Resources>
-    <!-- Read-only file previews render through the code workbench (breadcrumb + AvalonEdit viewer);
-         diff tabs render through the editor-based inline / side-by-side diff viewer. -->
-    <DataTemplate DataType="{x:Type vm:FilePreviewTab}">
-      <views:FilePreviewView />
-    </DataTemplate>
+    <!-- Diff tabs retain their dedicated editor-based inline / side-by-side viewer. File previews
+         deliberately do not use a DataTemplate: the single preview surface below remains mounted
+         across file-tab changes, preserving the document-outline shell and sash. -->
     <DataTemplate DataType="{x:Type vm:DiffTab}">
       <views:DiffDocumentView />
     </DataTemplate>
@@ -19,8 +17,14 @@
       <RowDefinition Height="*" />
     </Grid.RowDefinitions>
 
-    <!-- Content: the workbench-selected tab (rendered by the FilePreviewTab/DiffTab templates above;
-         每个文档视图自带头部工具条,这里不再单独画面包屑行,避免叠加重复横条)。 -->
-    <ContentControl Grid.Row="0" Content="{Binding SelectedTab}" />
+    <!-- A persistent FilePreviewView keeps the right-hand outline surface, sash width and editor
+         chrome alive while switching between file tabs. Only its DataContext changes, so the
+         bound outline entries refresh without reconstructing the entire sidebar. -->
+    <views:FilePreviewView x:Name="PersistentFilePreview" Grid.Row="0"
+                           DataContext="{Binding SelectedFileTab}"
+                           Visibility="{Binding DataContext.HasSelectedFileTab, RelativeSource={RelativeSource AncestorType=views:EditorAreaView}, Converter={StaticResource BooleanToVisibilityConverter}}" />
+
+    <!-- Non-file editor content is still selected through its type-specific template. -->
+    <ContentControl Grid.Row="0" Content="{Binding SelectedDiffTab}" />
   </Grid>
 </UserControl>

@@ -23,8 +23,8 @@ public static class WorkbenchLayoutMetrics
 
     public const double SidebarMinimumWidth = 170;
     public const double SidebarDefaultWidth = 300;
-    public const double SidebarMaximumWidth = 720;
-    public const double SidebarMaximumFraction = 0.40;
+    public const double SidebarMaximumWidth = 960;
+    public const double SidebarMaximumFraction = 0.50;
 
     public const double EditorHostMinimumWidth = 520;
     public const double EditorGroupMinimumWidth = 240;

@@ -178,6 +178,9 @@
     <Thickness x:Key="InsetLink">4,2</Thickness>
     <Thickness x:Key="InsetIconButton">8,4</Thickness>
     <Thickness x:Key="InsetStatusItem">8,0</Thickness>
+    <!-- 空状态提示:图标顶边相对区域顶部的固定偏移(而非在区域内居中——居中会让同一提示的位置
+         随区域高度与窗口尺寸漂移,不同功能页之间对不齐)。上下左右边距见注释。 -->
+    <Thickness x:Key="EmptyStateTopInset">24,72,24,24</Thickness>
 
     <!-- radius scale (rounded-modern: 3 / 6 / 10, plus hero surface 14 and fully-round pill) -->
     <CornerRadius x:Key="RadiusSm">3</CornerRadius>

@@ -71,7 +71,13 @@ public interface IGitService
             yield break;
         }
 
-        yield return new GitDiffMetadataEvent(diff.Path, diff.OldPath, diff.IsStaged, diff.IsBinary, diff.IsNewFile);
+        // Test/default implementations may represent a stale selected side as a metadata-free
+        // empty diff. Preserve that distinction so callers do not mistake binary/rename metadata
+        // for an empty result eligible for a side fallback.
+        if (diff.HasMetadata || diff.IsBinary || diff.IsNewFile || diff.OldPath is not null)
+        {
+            yield return new GitDiffMetadataEvent(diff.Path, diff.OldPath, diff.IsStaged, diff.IsBinary, diff.IsNewFile);
+        }
         var emitted = 0;
         foreach (var hunk in diff.Hunks)
         {

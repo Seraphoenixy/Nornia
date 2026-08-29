@@ -61,6 +61,49 @@ public sealed class ProcessRunnerTests
     }
 
     [Fact]
+    public async Task StreamLinesWithTextFallbackAsync_DrainsStdoutLargerThanPipeBuffer()
+    {
+        // 回归:整段捕获曾"先等退出、后读 stdout"——子进程输出超过 OS 管道缓冲(Windows 数 KB)
+        // 时阻塞在写端永不退出,消费方随之永久挂起(大 diff 视图空白即源于此)。此处输出约 1 MB,
+        // 必须完整收回;若死锁复现,30 秒取消令牌让测试快速失败而非无限等待。
+        const int lineCount = 8000; // 8000 × 128 字符 ≈ 1 MB,远超管道缓冲
+        var command = "$o=[Console]::OpenStandardOutput(); $w=New-Object System.IO.StreamWriter($o); " +
+                      "1..8000 | ForEach-Object { $w.WriteLine(('L' + $_).PadRight(128, 'x')) }; $w.Flush()";
+        var runner = new ProcessRunner();
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+
+        var events = new List<Nornia.Core.Models.ProcessStreamEvent>();
+        await foreach (var item in runner.StreamLinesWithTextFallbackAsync(
+                         "powershell.exe", ["-NoProfile", "-Command", command], 1_000_000, null, cancellation.Token))
+        {
+            events.Add(item);
+        }
+
+        var lines = events.Where(e => e.Text is not null).Select(e => e.Text).ToList();
+        Assert.Equal(lineCount, lines.Count);
+        Assert.StartsWith("L1", lines[0]);
+        Assert.StartsWith("L8000", lines[^1]);
+        Assert.True(events[^1].IsCompleted);
+        Assert.Equal(0, events[^1].ExitCode);
+    }
+
+    [Fact]
+    public async Task StreamLinesWithTextFallbackAsync_LineCapKeepsTheAllowedPrefix()
+    {
+        // The byte capture may read several lines in one 64 KB chunk. Crossing the cap must retain
+        // the allowed prefix, not drop that whole chunk.
+        var events = new List<Nornia.Core.Models.ProcessStreamEvent>();
+        await foreach (var item in new ProcessRunner().StreamLinesWithTextFallbackAsync(
+                           "powershell.exe", ["-NoProfile", "-Command", "'first'; 'second'; 'third'"], maximumLines: 2))
+        {
+            events.Add(item);
+        }
+
+        Assert.Equal(["first", "second"], events.Where(item => item.Text is not null).Select(item => item.Text!).ToArray());
+        Assert.True(events[^1].OutputLimitReached);
+    }
+
+    [Fact]
     public async Task RunAsync_DecodesUtf8StandardOutput()
     {
         const string expected = "正在下载软件包";

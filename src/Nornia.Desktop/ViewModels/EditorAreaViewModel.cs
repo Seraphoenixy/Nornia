@@ -54,8 +54,14 @@ public sealed record GitDiffRequest(
     string? HeadBlobId = null,
     string? IndexBlobId = null)
 {
-    /// <summary>Stable identity so re-opening the same change activates its existing tab.</summary>
-    public string TabKey => CommitHash is null ? $"diff:{Path}" : $"diff:{CommitHash}:{Path}";
+    /// <summary>Stable identity so re-opening the same change activates its existing tab. The
+    /// working-tree side (w = 未暂存, s = 已暂存, u = 未跟踪) is part of the key: the staged and
+    /// unstaged diffs of one file are different documents, and keying on path alone made a re-open
+    /// from the other side silently activate the stale tab (and layout restore dropped one of the
+    /// two tabs under the duplicate-key dedupe).</summary>
+    public string TabKey => CommitHash is not null
+        ? $"diff:{CommitHash}:{Path}"
+        : $"diff:{Path}:{(IsUntracked ? "u" : IsStaged ? "s" : "w")}";
 }
 
 /// <summary>VS Code-style editor group shared by the explorer and the source-control panes. Explorer
@@ -3244,6 +3250,18 @@ public sealed partial class DiffTab : EditorTabItem
     private IDiffContentSource? _diffContentSource;
     private bool _restoreConfirmedForSession;
 
+    /// <summary>侧别覆盖:请求的 IsStaged/IsUntracked 来自打开时刻的状态快照,可能滞后于实际
+    /// index/HEAD(刷新未落地、或请求构建后更改被外部暂存/提交)——此时请求侧的 git diff 无输出,
+    /// 加载会对另一侧重试并采用有内容的侧(见 LoadCoreAsync 的空 diff 回退)。回退生效后
+    /// <c>null</c> 被替换为实际侧;显示(来源标签/标签状态)与块操作(暂存/取消暂存/还原)
+    /// 都跟随该值而非请求侧,保证"看到的差异"与"能做的操作"一致。</summary>
+    private bool? _displayStaged;
+
+    public bool DisplayIsStaged => _displayStaged ?? _request.IsStaged;
+
+    /// <summary>未跟踪侧仅当未发生回退时成立(回退必然落到暂存/未暂存侧)。</summary>
+    private bool DisplayIsUntracked => _displayStaged is null && _request.IsUntracked;
+
     /// <summary>D1 代次门:后启动的加载是唯一允许发布结果的加载。spool 读回 / 后台构建可能
     /// 跨多次 await 才落地,迟到的旧代次结果不得覆盖更新的加载(与 FilePreviewTab 的
     /// _presentationVersion 版门同构,但守护的是 diff 安装而非 TextMate 快照)。</summary>
@@ -3389,6 +3407,7 @@ public sealed partial class DiffTab : EditorTabItem
             var previousRows = SideBySideRows.ToArray();
             var previousHunks = Hunks;
             var previousRevision = _diffRevision;
+            var previousDisplayStaged = _displayStaged;
 
             _loadStarted = false;
             IsLoaded = false;
@@ -3421,6 +3440,7 @@ public sealed partial class DiffTab : EditorTabItem
 
                 Hunks = previousHunks;
                 _diffRevision = previousRevision;
+                _displayStaged = previousDisplayStaged;
                 IsLoaded = true;
                 DiffNotice = string.IsNullOrWhiteSpace(refreshNotice)
                     ? "无法刷新 Diff，已保留上一版本。"
@@ -3448,13 +3468,15 @@ public sealed partial class DiffTab : EditorTabItem
 
         try
         {
-            var revision = await _gitService.GetDiffRevisionWithBlobsAsync(
+            // 不用请求携带的 blob id(打开时刻状态快照,暂存/提交后即过期):复用它们会让 index
+            // 变化(如 git add)在修订标识上不可见,标签错过重载、一直显示旧侧内容。重查当前
+            // index/HEAD 的 blob(ls-files / rev-parse)使标识对侧别变化保持敏感;侧别跟随实际
+            // 显示侧(空 diff 回退后)。
+            var revision = await _gitService.GetDiffRevisionAsync(
                 _request.RepositoryPath,
                 Path,
-                _request.IsStaged,
-                _request.IsUntracked,
-                _request.HeadBlobId,
-                _request.IndexBlobId,
+                DisplayIsStaged,
+                DisplayIsUntracked,
                 _lifetimeCancellation.Token).ConfigureAwait(true);
             if (!_disposed && !string.Equals(revision, _diffRevision, StringComparison.Ordinal))
             {
@@ -3509,17 +3531,18 @@ public sealed partial class DiffTab : EditorTabItem
 
     public string ChangeCounter => ChangeCount == 0 ? string.Empty : $"{CurrentChangeIndex + 1} / {ChangeCount}";
 
-    /// <summary>Label of the diff source: 暂存 / 未暂存 / 未跟踪 / 提交 short-hash.</summary>
+    /// <summary>Label of the diff source: 暂存 / 未暂存 / 未跟踪 / 提交 short-hash. Follows the
+    /// display side so an empty-diff fallback that adopted the other side is labeled correctly.</summary>
     public string SourceLabel => _request.CommitHash is not null
         ? $"提交 {ShortHash(_request.CommitHash)}"
-        : _request.IsStaged ? "已暂存" : _request.IsUntracked ? "未跟踪" : "未暂存";
+        : DisplayIsUntracked ? "未跟踪" : DisplayIsStaged ? "已暂存" : "未暂存";
 
     /// <summary>Compact SCM marker used in the unified editor tab strip.</summary>
-    public new DiffTabStatus TabStatus => _request.CommitHash is not null
+    public override DiffTabStatus TabStatus => _request.CommitHash is not null
         ? DiffTabStatus.Commit
-        : _request.IsStaged ? DiffTabStatus.Staged : _request.IsUntracked ? DiffTabStatus.Untracked : DiffTabStatus.Modified;
+        : DisplayIsUntracked ? DiffTabStatus.Untracked : DisplayIsStaged ? DiffTabStatus.Staged : DiffTabStatus.Modified;
 
-    public new string TabStatusMarker => TabStatus switch
+    public override string TabStatusMarker => TabStatus switch
     {
         DiffTabStatus.Staged => "S",
         DiffTabStatus.Untracked => "U",
@@ -3527,7 +3550,7 @@ public sealed partial class DiffTab : EditorTabItem
         _ => "M",
     };
 
-    public new string TabStatusToolTip => $"{TabStatusMarker} · {SourceLabel}";
+    public override string TabStatusToolTip => $"{TabStatusMarker} · {SourceLabel}";
 
     /// <summary>Raised with the 0-based change-block index after 上一个/下一个更改; the view centers
     /// the target block in its current layout (inline line / side-by-side row).</summary>
@@ -3564,7 +3587,7 @@ public sealed partial class DiffTab : EditorTabItem
     public bool CanApplyHunk(int hunkIndex, GitHunkOperation operation)
     {
         if (_request.CommitHash is not null
-            || _request.IsUntracked
+            || DisplayIsUntracked
             || hunkIndex < 0
             || hunkIndex >= Hunks.Count
             || IsHunkOperationBusy)
@@ -3572,11 +3595,12 @@ public sealed partial class DiffTab : EditorTabItem
             return false;
         }
 
+        // 侧别跟随实际显示侧:空 diff 回退后内容属于另一侧,块操作必须作用到那一侧。
         return operation switch
         {
-            GitHunkOperation.Stage => !_request.IsStaged,
-            GitHunkOperation.Unstage => _request.IsStaged,
-            GitHunkOperation.Restore => !_request.IsStaged,
+            GitHunkOperation.Stage => !DisplayIsStaged,
+            GitHunkOperation.Unstage => DisplayIsStaged,
+            GitHunkOperation.Restore => !DisplayIsStaged,
             _ => false,
         };
     }
@@ -3618,7 +3642,7 @@ public sealed partial class DiffTab : EditorTabItem
                 _restoreConfirmedForSession = true;
             }
 
-            await _gitService.ApplyHunkAsync(_request.RepositoryPath, Path, _request.IsStaged, hunk, operation, cancellationToken).ConfigureAwait(true);
+            await _gitService.ApplyHunkAsync(_request.RepositoryPath, Path, DisplayIsStaged, hunk, operation, cancellationToken).ConfigureAwait(true);
             await ReloadDiffAsync().ConfigureAwait(true);
             HunkMutationCompleted?.Invoke(this, EventArgs.Empty);
             return true;
@@ -3748,6 +3772,7 @@ public sealed partial class DiffTab : EditorTabItem
 
         _loadStarted = true;
         _loadFailed = false;
+        _displayStaged = null; // 每次加载从请求侧重新开始;空 diff 回退可在本次加载中重新设置
         DiffTitle = _request.CommitHash is null
             ? Path
             : $"提交 {ShortHash(_request.CommitHash)} · {Path}";
@@ -3796,6 +3821,41 @@ public sealed partial class DiffTab : EditorTabItem
             {
                 DiffNotice = "无法读取该文件的 diff。";
                 return;
+            }
+
+            // 空差异回退:请求的侧别来自打开时刻的状态快照,可能滞后于实际 index/HEAD(静默刷新
+            // 未落地,或请求构建后更改被外部暂存/提交)。此时请求侧的 git diff 无输出,用户会看到
+            // "该文件没有可显示的差异"——而更改其实存在于另一侧。对另一侧重取一次,有内容即采用;
+            // 显示与块操作随后跟随 _displayStaged(实际侧)。两侧都空时保持原样(空态即事实)。
+            // Only a truly metadata-free result proves that the requested side went stale. Binary,
+            // rename/copy and empty-file changes can legitimately have no hunks and must remain on
+            // the side the user selected.
+            if (_request.CommitHash is null && !diff.HasMetadata && diff.Hunks.Count == 0)
+            {
+                var otherStaged = !_request.IsStaged;
+                var otherSource = await SpoolingDiffContentSource.CreateAsync(
+                    _gitService.StreamDiffAsync(_request.RepositoryPath, Path, otherStaged, false, ReadOnlyContentCapacity.WindowedDiffLines, IgnoreTrimWhitespace, _lifetimeCancellation.Token),
+                    _lifetimeCancellation.Token);
+                var otherDiff = CollectWindow((await otherSource.ReadWindowAsync(new DocumentRange(1, MaxDiffLines))).Events, Path, otherStaged);
+                if (otherDiff is not null && otherDiff.Hunks.Count > 0)
+                {
+                    if (_diffContentSource is not null)
+                    {
+                        await _diffContentSource.DisposeAsync().ConfigureAwait(true);
+                    }
+
+                    _diffContentSource = otherSource;
+                    diff = otherDiff;
+                    _displayStaged = otherStaged;
+                    OnPropertyChanged(nameof(SourceLabel));
+                    OnPropertyChanged(nameof(TabStatus));
+                    OnPropertyChanged(nameof(TabStatusMarker));
+                    OnPropertyChanged(nameof(TabStatusToolTip));
+                }
+                else
+                {
+                    await otherSource.DisposeAsync().ConfigureAwait(true);
+                }
             }
 
             // 阶段二(D1):行尾归一 → 限量填充 → 并排行构建 → 增删/块计数 全部在后台线程
@@ -3868,13 +3928,13 @@ public sealed partial class DiffTab : EditorTabItem
                 {
                     try
                     {
-                        var revision = await _gitService.GetDiffRevisionWithBlobsAsync(
+                        // 与 RefreshIfChangedAsync 同一口径:重查当前 index/HEAD 的 blob id(不复用
+                        // 请求里过期的快照值),且按实际显示侧计算——两侧口径一致,重载判定才闭环。
+                        var revision = await _gitService.GetDiffRevisionAsync(
                             _request.RepositoryPath,
                             Path,
-                            _request.IsStaged,
-                            _request.IsUntracked,
-                            _request.HeadBlobId,
-                            _request.IndexBlobId,
+                            DisplayIsStaged,
+                            DisplayIsUntracked,
                             _lifetimeCancellation.Token).ConfigureAwait(true);
                         if (!_disposed && generation == _loadGeneration)
                         {
@@ -4092,7 +4152,8 @@ public sealed partial class DiffTab : EditorTabItem
             }
         }
         Flush();
-        return new GitFileDiff(path, metadata?.OldPath, staged, metadata?.IsBinary == true, metadata?.IsNewFile == true, hunks);
+        return new GitFileDiff(path, metadata?.OldPath, staged, metadata?.IsBinary == true,
+            metadata?.IsNewFile == true, hunks, HasMetadata: metadata is not null);
 
         void Flush()
         {

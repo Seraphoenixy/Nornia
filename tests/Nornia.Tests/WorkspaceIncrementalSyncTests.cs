@@ -157,4 +157,77 @@ public sealed class WorkspaceIncrementalSyncTests : IDisposable
         // Dropped file rows must not linger in the projection.
         Assert.DoesNotContain(viewModel.WorkspaceTreeRows, row => ReferenceEquals(row, aRow));
     }
+
+    [Fact]
+    public async Task Refresh_ResetsExpansionState_FirstChevronClickExpandsInOneClick()
+    {
+        var viewModel = await CreateAsync();
+        var srcRow = FolderRow(viewModel, "src");
+        await viewModel.ToggleTreeFolderCommand.ExecuteAsync(srcRow); // expand
+        Assert.Contains(viewModel.WorkspaceTreeRows, row => row.Node.Name == "A.cs");
+
+        await viewModel.RefreshCommand.ExecuteAsync(null);
+
+        // 刷新后子节点是新实例:展开态必须同步重置(RefreshAsync 契约 "Expansion state resets for
+        // the refreshed subtree"),且 chevron 绑定(行 IsExpanded)与投影一致——两者都显示折叠。
+        // 旧行为遗留 IsExpanded=true 但无子行,第一次点击只翻转空展开(delta=0,无可见变化),
+        // 用户需点两次才真正展开。
+        var srcNode = viewModel.RootNodes[0].Children.Single(child => child.Name == "src");
+        Assert.False(srcNode.IsExpanded);
+        var srcRowAfterRefresh = FolderRow(viewModel, "src");
+        Assert.False(srcRowAfterRefresh.IsExpanded);
+        Assert.DoesNotContain(viewModel.WorkspaceTreeRows, row => row.Node.Name == "A.cs");
+
+        // 刷新后的第一次点击必须直接展开(加载 + 投影),无需第二次点击。
+        await viewModel.ToggleTreeFolderCommand.ExecuteAsync(srcRowAfterRefresh);
+
+        Assert.True(srcNode.IsExpanded);
+        Assert.Contains(viewModel.WorkspaceTreeRows, row => row.Node.Name == "A.cs");
+        Assert.Contains(viewModel.WorkspaceTreeRows, row => row.Node.Name == "B.cs");
+    }
+
+    [Fact]
+    public async Task StaleExpandedButUnloadedState_SingleClickLoadsAndProjects()
+    {
+        var viewModel = await CreateAsync();
+        var notesNode = viewModel.RootNodes[0].Children.Single(child => child.Name == "notes");
+        var notesRow = FolderRow(viewModel, "notes");
+
+        // 直接构造旧刷新遗留的不一致状态:chevron 显示已展开但子树未加载。先真实展开并等加载
+        // 完成,再把 IsLoaded 拨回 false(等价于旧 DropChildren:丢弃子树 + IsLoaded=false 但
+        // 不重置 IsExpanded;此时无在途加载,与生产遗留状态同构)。
+        notesNode.IsExpanded = true;
+        await notesNode.LoadChildrenAsync();
+        notesNode.IsLoaded = false;
+
+        await viewModel.ToggleTreeFolderCommand.ExecuteAsync(notesRow);
+
+        // 防御兜底应把这次点击变成真实展开:加载 + 重投影,而不是停留在"首次点击无效"。
+        Assert.True(notesNode.IsExpanded);
+        Assert.True(notesNode.IsLoaded);
+        Assert.Contains(viewModel.WorkspaceTreeRows, row => row.Node.Name == "todo.txt");
+    }
+
+    [Fact]
+    public async Task ToggleWhileLoading_AllowsFollowUpClickInsteadOfSilentSwallow()
+    {
+        var viewModel = await CreateAsync();
+        var srcRow = FolderRow(viewModel, "src");
+
+        // 第一次点击开始冷展开:命令在 await 磁盘枚举期间保持运行。AsyncRelayCommand 默认
+        // allowConcurrentExecutions=false → 运行中 CanExecute=false,用户在枚举窗口内的补点
+        // 会被静默吞掉(表现为"点两次才生效")。此断言钉住"窗口内仍可执行"。
+        var first = viewModel.ToggleTreeFolderCommand.ExecuteAsync(srcRow);
+        Assert.True(viewModel.ToggleTreeFolderCommand.CanExecute(srcRow));
+
+        // 窗口内补点(折叠):按正常切换语义处理,而不是被吞。
+        var second = viewModel.ToggleTreeFolderCommand.ExecuteAsync(srcRow);
+        await Task.WhenAll(first, second);
+
+        var srcNode = viewModel.RootNodes[0].Children.Single(child => child.Name == "src");
+        Assert.True(srcNode.IsLoaded); // 在途枚举仍完成,子树可用
+        Assert.False(srcNode.IsExpanded); // 两次点击 = 展开+折叠,净效果折叠(标准双击语义)
+        // 在途展开落空不投影幽灵子行:折叠态下无 A.cs 行。
+        Assert.DoesNotContain(viewModel.WorkspaceTreeRows, row => row.Node.Name == "A.cs");
+    }
 }

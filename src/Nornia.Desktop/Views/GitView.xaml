@@ -1010,6 +1010,7 @@
                       <MenuItem Header="打开 diff" Command="{Binding OpenChangeDiffCommand}"
                                 CommandParameter="{Binding PlacementTarget.SelectedItem.Change, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
                       <MenuItem Header="取消暂存文件夹" Command="{Binding UnstageFolderCommand}"
+                                Visibility="{Binding PlacementTarget.SelectedItem.IsFolder, RelativeSource={RelativeSource AncestorType=ContextMenu}, Converter={StaticResource BooleanToVisibilityConverter}}"
                                 CommandParameter="{Binding PlacementTarget.SelectedItem, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
                       <Separator />
                       <MenuItem Header="取消暂存选中" Command="{Binding UnstageSelectedChangesCommand}" />
@@ -1097,8 +1098,10 @@
                       <MenuItem Header="打开 diff" Command="{Binding OpenChangeDiffCommand}"
                                 CommandParameter="{Binding PlacementTarget.SelectedItem.Change, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
                       <MenuItem Header="丢弃文件夹更改" Command="{Binding DiscardFolderCommand}"
+                                Visibility="{Binding PlacementTarget.SelectedItem.IsFolder, RelativeSource={RelativeSource AncestorType=ContextMenu}, Converter={StaticResource BooleanToVisibilityConverter}}"
                                 CommandParameter="{Binding PlacementTarget.SelectedItem, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
                       <MenuItem Header="暂存文件夹" Command="{Binding StageFolderCommand}"
+                                Visibility="{Binding PlacementTarget.SelectedItem.IsFolder, RelativeSource={RelativeSource AncestorType=ContextMenu}, Converter={StaticResource BooleanToVisibilityConverter}}"
                                 CommandParameter="{Binding PlacementTarget.SelectedItem, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
                       <Separator />
                       <MenuItem Header="丢弃选中" Command="{Binding DiscardSelectedChangesCommand}" />

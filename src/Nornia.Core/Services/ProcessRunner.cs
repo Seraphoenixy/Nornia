@@ -10,6 +10,10 @@ namespace Nornia.Core.Services;
 
 public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
 {
+    // Text fallback must inspect a complete byte prefix to decide UTF-8 vs GB18030, so it cannot
+    // stream-decode byte-by-byte. Keep that prefix explicitly bounded; an unterminated generated
+    // line must not turn a read-only diff into an unbounded allocation.
+    private const int MaximumTextFallbackCaptureBytes = 64 * 1024 * 1024;
     private readonly ConcurrentDictionary<int, Process> _activeProcesses = new();
 
     public async Task<ProcessResult> RunAsync(
@@ -252,8 +256,7 @@ public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
     /// Like <see cref="IProcessRunner.StreamLinesAsync"/> but for text output that may carry a
     /// legacy Chinese encoding — git diff content lines pass the file's raw bytes through, so a
     /// GBK/ANSI file garbles under the fixed UTF-8 decode of <see cref="StreamLinesAsync"/>.
-    /// Stdout is captured as raw bytes (bounded by the line cap: the decoded lines can never
-    /// outnumber the newlines already emitted plus one), validated as strict UTF-8 over the whole
+    /// Stdout is captured as a bounded raw-byte prefix, validated as strict UTF-8 over the whole
     /// payload, and decoded as GB18030 when it is not clean — the same BOM/strict-UTF-8/GB18030
     /// strategy as the read-only preview decoder. Clean UTF-8 output costs one validation pass
     /// (a byte scan at memory-bandwidth speed) and otherwise streams lines exactly like
@@ -285,9 +288,8 @@ public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
         var emitted = 0;
         var limitReached = false;
 
-        // Raw stdout capture: stop retaining bytes once the newline count passes the line cap
-        // (decoded lines <= newlines + 1) but keep draining so the child never blocks on a full
-        // pipe; excess output is discarded and reported through the limit flag.
+        // Retain exactly the first maximumLines complete stdout lines, capped in bytes as well.
+        // Continue draining after either cap so the child never blocks on a full pipe.
         async Task<byte[]> CaptureStdoutAsync()
         {
             var captured = new MemoryStream(64 * 1024);
@@ -308,19 +310,27 @@ public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
                     continue;
                 }
 
-                for (var i = 0; i < read; i++)
+                var retained = 0;
+                while (retained < read && newlines < maximumLines && captured.Length + retained < MaximumTextFallbackCaptureBytes)
                 {
-                    if (chunk[i] == (byte)'\n') newlines++;
+                    if (chunk[retained] == (byte)'\n')
+                    {
+                        newlines++;
+                    }
+
+                    retained++;
                 }
 
-                if (newlines > maximumLines)
+                if (retained > 0)
+                {
+                    captured.Write(chunk, 0, retained);
+                }
+
+                if (retained < read)
                 {
                     capturing = false;
                     limitReached = true;
-                    continue;
                 }
-
-                captured.Write(chunk, 0, read);
             }
 
             return captured.ToArray();
@@ -346,8 +356,13 @@ public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
         {
             try
             {
-                await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+                // 顺序关键:必须先抽干 stdout 再等退出。整段捕获要求"进程结束前"持续读取——
+                // 若先等退出,子进程输出超过管道缓冲(Windows 默认数 KB)时会阻塞在写端,
+                // 永远退不出,等待方也随之永久挂起(大 diff 视图空白即源于此)。
+                // CaptureStdoutAsync 在管道写端关闭(进程退出)时返回,其后 WaitForExitAsync
+                // 立即完成;取消经 ReadAsync 触发 catch 分支杀进程,语义与原先一致。
                 var stdoutBytes = await CaptureStdoutAsync().ConfigureAwait(false);
+                await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
                 await error.ConfigureAwait(false);
                 var (encoding, bomLength) = DecodeEncodingForCapturedText(stdoutBytes);
                 var stdout = new MemoryStream(stdoutBytes, bomLength, stdoutBytes.Length - bomLength, writable: false);

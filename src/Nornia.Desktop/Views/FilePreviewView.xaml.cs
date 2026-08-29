@@ -55,6 +55,7 @@ public partial class FilePreviewView : UserControl
         GoToLineBox.PreviewKeyDown += OnGoToLineBoxKeyDown;
         CodeView.DocumentChanged += OnCodeDocumentChanged;
         CodeView.Editor.TextArea.Caret.PositionChanged += (_, _) => UpdatePositionText();
+        CodeView.Editor.TextArea.SelectionChanged += OnCodeSelectionChanged;
         // 每次预览渲染完成:分离 Markdig AST(大 AST 不随 FlowDocument 长期驻留),
         // 并在文档就绪后重跑位置恢复(结果赋值时的即时恢复可能仍面对旧/空文档)。
         MarkdownView.RenderCompleted += OnMarkdownRenderCompleted;
@@ -121,11 +122,6 @@ public partial class FilePreviewView : UserControl
                 ? null
                 : (segment.Offset, segment.Offset + segment.Length);
         };
-        CodeView.Editor.TextArea.SelectionChanged += (_, _) =>
-        {
-            _tab.HasTextSelection = !CodeView.Editor.TextArea.Selection.IsEmpty;
-            UpdatePositionText();
-        };
         _pendingRestore = _tab.ViewState;
         RestoreMarkdownPosition();
         // 接线时序兜底:继承的 DataContext 绑定可能先于本处理器完成渲染(RenderCompleted
@@ -150,6 +146,17 @@ public partial class FilePreviewView : UserControl
         CodeView.SetFoldingSections(_tab.FoldSections, _tab.ViewState?.FoldedOffsets, _tab.ViewState?.FoldedSymbolIds);
         UpdatePositionText();
         UpdateOutlineLayout();
+    }
+
+    private void OnCodeSelectionChanged(object? sender, EventArgs e)
+    {
+        if (_tab is not { } tab)
+        {
+            return;
+        }
+
+        tab.HasTextSelection = !CodeView.Editor.TextArea.Selection.IsEmpty;
+        UpdatePositionText();
     }
 
     /// <summary>大纲列使用可拖动的固定起始宽度；没有符号时完全收起，避免空侧栏占位。</summary>

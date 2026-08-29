@@ -214,9 +214,9 @@ public sealed class EditorAreaRestoreTests : IDisposable
                 new EditorLayoutState(GroupId: "left", Tabs:
                 [
                     new EditorTabState($"file:{path}", IsPreview: true),
-                    new EditorTabState("diff:src/A.cs", RepositoryPath: @"C:\repo", DiffPath: "src/A.cs",
+                    new EditorTabState("diff:src/A.cs:s", RepositoryPath: @"C:\repo", DiffPath: "src/A.cs",
                         IsStaged: true),
-                ], ActiveTabKey: "diff:src/A.cs"),
+                ], ActiveTabKey: "diff:src/A.cs:s"),
                 new EditorLayoutState(GroupId: "right", Tabs: [new EditorTabState($"file:{path2}")]),
             ],
             Weights: [0.3, 0.7],

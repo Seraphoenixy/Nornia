@@ -21,12 +21,26 @@ public partial class WorkspaceViewModel : PageViewModel
     private readonly IClipboardService _clipboard;
     private readonly ISettingsService _scopedSettings;
     private readonly IProjectWorkspaceService _workspaceService;
+    private readonly IWorkspaceFileWatcher _fileWatcher;
     private ISettingsSession? _settingsSession;
     private readonly WorkspaceStatusSource _statusSource = new();
     private bool _suppressSelectionOpen;
     private bool _suppressTreeSelectionOpen;
     private bool _compactFoldersEnabled;
     private readonly RevisionGate _settingsRevisionGate = new();
+
+    // ===== 树自动刷新(文件增删改的结构性监听,VS Code explorer 语义)=====
+    // 与 GitViewModel 的静默刷新同族:至多一次在途 + 至多一批合并的 pending + 最小间隔冷却。
+    // 监视器侧已做 200ms 尾部去抖;这里的 500ms 冷却保证构建期的高频事件每秒至多触发两轮
+    // 目录重枚举,而普通单次变更的树更新延迟 < ~1s。
+    private int _treeRefreshInFlight; // 0 = idle, 1 = a tree refresh is in flight
+    private int _treeRefreshPending;
+    private readonly object _pendingTreeGate = new();
+    private readonly HashSet<string> _pendingTreePaths = new(StringComparer.OrdinalIgnoreCase);
+    private readonly SemaphoreSlim _treeMutationGate = new(1, 1);
+    internal const long TreeRefreshMinimumIntervalMs = 500;
+    private long _lastTreeRefreshCompletedTicks; // Environment.TickCount64 value, monotonic
+    private int _treeRefreshRetryScheduled; // at most one pending retry timer
 
     /// <summary>行对象复用池:每节点至多一个存活行(身份即节点引用,对照 VS Code RowCache 的
     /// templateId 复用)。增量投影只发受影响区间的 CollectionChanged,未变行不重建容器;
@@ -83,12 +97,15 @@ public partial class WorkspaceViewModel : PageViewModel
     private bool areTreeGuidesVisible;
 
     public WorkspaceViewModel(IFolderPickerService folderPicker, ISettingsService settings,
-        IProjectWorkspaceService workspaceService, IUiLogService logService, IClipboardService clipboard) : base("资源管理器", logService)
+        IProjectWorkspaceService workspaceService, IUiLogService logService, IClipboardService clipboard,
+        IWorkspaceFileWatcher? fileWatcher = null) : base("资源管理器", logService)
     {
         _folderPicker = folderPicker;
         _scopedSettings = settings;
         _workspaceService = workspaceService;
         _clipboard = clipboard;
+        _fileWatcher = fileWatcher ?? NullWorkspaceFileWatcher.Instance;
+        _fileWatcher.FilesChanged += OnWorkspaceFilesChanged;
         _workspaceService.ContextChanged += OnWorkspaceSettingsChangedAsync;
         _selectionOpenScheduler.Action = RunPendingSelectionOpen;
         _selectionOpenScheduler.OnError = ex => LogService.Write("ERROR", $"树选中打开文件失败：{ex.Message}");
@@ -165,8 +182,12 @@ public partial class WorkspaceViewModel : PageViewModel
         FullSyncCount = 0;
         // VS Code opens a workspace with the root folder expanded so the tree is visible at once.
         root.IsExpanded = true;
+        // Attach before the first enumeration: otherwise a file created between enumeration and
+        // Attach remains absent until a manual refresh.
+        _fileWatcher.Attach(path);
         await root.LoadChildrenAsync();
         SyncTreeRows();
+        RefreshWatchedDirectories();
         WorkspaceOpened?.Invoke(this, path);
     }
 
@@ -188,19 +209,49 @@ public partial class WorkspaceViewModel : PageViewModel
     /// <summary>Expands or collapses one flattened folder row. Loading stays lazy: an expanded
     /// directory is enumerated only once, then rebuilding only changes the visible row projection.
     /// V4 快路径:展开/折叠只拼接受影响子树的区间(O(Δ),行对象按节点复用),不再整表重投影;
-    /// 缓存计数/行序不可用时(紧凑链形态变化、行不在投影中)回退全量 <see cref="SyncTreeRows"/>。</summary>
-    [RelayCommand]
+    /// 缓存计数/行序不可用时(紧凑链形态变化、行不在投影中)回退全量 <see cref="SyncTreeRows"/>。
+    /// 必须允许并发执行(AllowConcurrentExecutions):展开路径要 await 磁盘枚举(大目录可达
+    /// 数百毫秒~秒级)。AsyncRelayCommand 默认在运行中自禁用(CanExecute=false),用户在这段
+    /// 窗口内补点会被静默吞掉,表现为"点两次才生效";允许并发后补点按正常切换语义处理
+    /// (后到的折叠会令在途展开落空:delta 按实时 IsExpanded 计算为 0,不会投影出幽灵子行)。</summary>
+    [RelayCommand(AllowConcurrentExecutions = true)]
     private async Task ToggleTreeFolderAsync(WorkspaceFolderRow? row)
     {
         if (row is null) return;
 
         var node = row.Node;
+
+        // 防御兜底:"chevron 显示已展开但子树未加载"的不一致状态(IsExpanded=true 且只剩占位符)——
+        // 旧刷新行为的遗留(现由 DropChildren 同步重置),或未来某条 drop 路径忘记重置展开态。
+        // 此状态下按正常逻辑翻转只会切换空展开(delta=0,无可见变化),用户需点两次才生效;而用户
+        // 心智模型是"该目录未展开"(chevron 朝下但无子行),故本次点击直接加载并重投影,一次生效。
+        // 正常流程中加载在启动瞬间即置 IsLoaded=true(CoreAsync 首个 await 前),在途展开不会命中
+        // 本分支。
+        if (node.IsExpanded && !node.IsLoaded)
+        {
+            await node.LoadChildrenAsync();
+            SyncTreeRows();
+            RefreshWatchedDirectories();
+            return;
+        }
+
         var previousCount = node.VisibleRowCount;
         node.IsExpanded = !node.IsExpanded;
         if (node.IsExpanded)
         {
-            await node.LoadChildrenAsync();
+            if (node.IsLoaded)
+            {
+                // Collapsed directories are intentionally unwatched; refresh their immediate
+                // children on re-open so stale cached entries never survive the collapsed period.
+                await node.ReconcileChildrenAsync();
+            }
+            else
+            {
+                await node.LoadChildrenAsync();
+            }
         }
+
+        RefreshWatchedDirectories();
 
         var delta = node.VisibleRowCount - previousCount;
         var start = -1;
@@ -475,6 +526,7 @@ public partial class WorkspaceViewModel : PageViewModel
         {
             await ExpandRecursiveAsync(node);
             SyncTreeRows();
+            RefreshWatchedDirectories();
         }
     }
 
@@ -498,13 +550,308 @@ public partial class WorkspaceViewModel : PageViewModel
             return;
         }
 
-        foreach (var root in RootNodes.ToArray())
+        await _treeMutationGate.WaitAsync();
+        try
         {
-            DropTreeRecursive(root);
+            _fileWatcher.Attach(WorkspacePath);
+            foreach (var root in RootNodes.ToArray())
+            {
+                DropTreeRecursive(root);
+            }
+
+            RootNodes[0].IsExpanded = true;
+            await RootNodes[0].LoadChildrenAsync();
+            SyncTreeRows();
+            RefreshWatchedDirectories();
+        }
+        finally
+        {
+            _treeMutationGate.Release();
+        }
+    }
+
+    /// <summary>Watcher burst (UI thread): filter to visible, relevant structural changes and start
+    /// a throttled tree refresh. Everything irrelevant — git metadata churn, excluded files, and
+    /// anything inside a name-ignored directory (node_modules/bin/obj/…) — is dropped here so an
+    /// external <c>git add</c> or a build never causes a single directory re-enumeration.</summary>
+    private void OnWorkspaceFilesChanged(object? sender, WorkspaceFilesChangedEventArgs e)
+    {
+        var root = WorkspacePath;
+        if (string.IsNullOrWhiteSpace(root) || RootNodes.Count == 0)
+        {
+            return;
         }
 
-        await RootNodes[0].LoadChildrenAsync();
-        SyncTreeRows();
+        if (!string.Equals(Path.GetFullPath(e.RootPath), Path.GetFullPath(root), StringComparison.OrdinalIgnoreCase))
+        {
+            return; // delayed callback from a previous workspace generation
+        }
+
+        var rootFull = root.TrimEnd('\\', '/');
+        foreach (var fullPath in e.ChangedPaths)
+        {
+            var trimmed = fullPath.TrimEnd('\\', '/');
+            if (trimmed.Length <= rootFull.Length ||
+                !trimmed.StartsWith(rootFull + "\\", StringComparison.OrdinalIgnoreCase))
+            {
+                continue; // outside the workspace (the root itself / parents are skipped —
+                          // a root-level change would surface as its children's parent = root)
+            }
+
+            var relative = trimmed[(rootFull.Length + 1)..].Replace('\\', '/');
+            // .git 元数据变化不构成可见树变化(Git 视图有自己的监听链)。
+            if (relative.StartsWith(".git/", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            // 枚举过滤会隐藏 Ignored 命名的目录(node_modules/bin/obj/.vs):其内部变化不可见。
+            // 末段是 Ignored 名字的文件(如名为 "bin" 的文件)仍会显示,只在其确为目录时跳过。
+            var segments = relative.Split('/');
+            for (var i = 0; i < segments.Length - 1; i++)
+            {
+                if (WorkspaceNode.Ignored.Contains(segments[i]))
+                {
+                    goto next;
+                }
+            }
+
+            if (WorkspaceNode.Ignored.Contains(segments[^1]) && Directory.Exists(trimmed))
+            {
+                goto next;
+            }
+
+            if (_statusSource.IsExcluded(relative))
+            {
+                goto next;
+            }
+
+            lock (_pendingTreeGate)
+            {
+                _pendingTreePaths.Add(fullPath);
+            }
+        next:
+            ;
+        }
+
+        bool hasPending;
+        lock (_pendingTreeGate)
+        {
+            hasPending = _pendingTreePaths.Count > 0;
+        }
+
+        if (hasPending)
+        {
+            StartTreeRefresh(immediate: false);
+        }
+    }
+
+    /// <summary>Single-flight + merged pending + minimum-interval entry for the watcher-driven tree
+    /// refresh (same shape as GitViewModel's silent refresh; the tree has no IsBusy to gate on —
+    /// manual refreshes and auto refreshes simply coalesce through the in-flight flag).</summary>
+    private void StartTreeRefresh(bool immediate)
+    {
+        if (Interlocked.CompareExchange(ref _treeRefreshInFlight, 1, 0) == 1)
+        {
+            Interlocked.Exchange(ref _treeRefreshPending, 1);
+            return;
+        }
+
+        if (!immediate)
+        {
+            var elapsedMs = Environment.TickCount64 - _lastTreeRefreshCompletedTicks;
+            if (elapsedMs < TreeRefreshMinimumIntervalMs)
+            {
+                Interlocked.Exchange(ref _treeRefreshInFlight, 0);
+                Interlocked.Exchange(ref _treeRefreshPending, 1);
+                ScheduleTreeRefreshRetry(TreeRefreshMinimumIntervalMs - elapsedMs);
+                return;
+            }
+        }
+
+        Interlocked.Exchange(ref _treeRefreshPending, 0);
+        _ = RunTreeRefreshAsync(); // its finally releases the in-flight flag
+    }
+
+    /// <summary>Schedules at most one retry of the pending tree refresh after
+    /// <paramref name="delayMs"/>; re-enters through <see cref="StartTreeRefresh"/>, which
+    /// re-checks every guard before actually refreshing.</summary>
+    private void ScheduleTreeRefreshRetry(long delayMs)
+    {
+        if (Interlocked.Exchange(ref _treeRefreshRetryScheduled, 1) == 1)
+        {
+            return; // a retry is already scheduled; it will pick up the pending flag
+        }
+
+        _ = Task.Delay(TimeSpan.FromMilliseconds(delayMs)).ContinueWith(_ =>
+        {
+            Interlocked.Exchange(ref _treeRefreshRetryScheduled, 0);
+            if (Volatile.Read(ref _treeRefreshPending) == 0)
+            {
+                return;
+            }
+
+            var dispatcher = Application.Current?.Dispatcher;
+            if (dispatcher is null)
+            {
+                StartTreeRefresh(immediate: false); // no WPF app (unit tests without STA context)
+                return;
+            }
+
+            // Never run UI-bound collection mutations on a ThreadPool fallback. If the dispatcher
+            // is busy, keeping this retry queued is safe; it will run when the UI can consume it.
+            dispatcher.BeginInvoke(new Action(() =>
+            {
+                StartTreeRefresh(immediate: false);
+            }));
+        });
+    }
+
+    /// <summary>Re-enumerates only the loaded directories that contain a changed path (the nearest
+    /// loaded ancestor per path) and re-projects the rows once. Unloaded (never expanded) folders
+    /// are left alone — they enumerate fresh on their next expansion, exactly like a lazy tree
+    /// should. Expansion state is preserved: this is an in-place update, not a refresh-reset.</summary>
+    private async Task RunTreeRefreshAsync()
+    {
+        var gateHeld = false;
+        try
+        {
+            await _treeMutationGate.WaitAsync();
+            gateHeld = true;
+            HashSet<string> paths;
+            lock (_pendingTreeGate)
+            {
+                paths = new HashSet<string>(_pendingTreePaths, StringComparer.OrdinalIgnoreCase);
+                _pendingTreePaths.Clear();
+            }
+
+            if (paths.Count == 0)
+            {
+                return;
+            }
+
+            // V-诊断计数器(与 IncrementalSpliceCount / FullSyncCount 同族;测试断言自动刷新是否启动)。
+            TreeAutoRefreshRuns++;
+
+            // Index of every loaded directory node (the tree is lazy: only expanded/loaded dirs exist).
+            var loadedDirs = new Dictionary<string, WorkspaceNode>(StringComparer.OrdinalIgnoreCase);
+            foreach (var root in RootNodes)
+            {
+                if (root.IsLoaded)
+                {
+                    CollectLoadedDirs(root, loadedDirs);
+                }
+            }
+
+            var rootFull = WorkspacePath.TrimEnd('\\', '/');
+            var toReload = new List<WorkspaceNode>();
+            foreach (var fullPath in paths)
+            {
+                // The changed item's parent is the directory whose child list must change; walk up
+                // until a loaded ancestor is found (a brand-new top-level folder's parent is the
+                // root, which is loaded right after the workspace opens).
+                var candidate = Path.GetDirectoryName(fullPath.TrimEnd('\\', '/'));
+                while (!string.IsNullOrEmpty(candidate))
+                {
+                    if (string.Equals(candidate.TrimEnd('\\', '/'), rootFull, StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (RootNodes.Count > 0 && RootNodes[0].IsLoaded)
+                        {
+                            toReload.Add(RootNodes[0]);
+                        }
+
+                        break;
+                    }
+
+                    if (loadedDirs.TryGetValue(candidate, out var node))
+                    {
+                        toReload.Add(node);
+                        break;
+                    }
+
+                    candidate = Path.GetDirectoryName(candidate);
+                }
+            }
+
+            if (toReload.Count == 0)
+            {
+                return;
+            }
+
+            // 就地协调:保留存活子节点对象(身份 = 已加载态/展开态/选区/行缓存),只增删真正
+            // 变化的条目;目录 I/O 并行(各自在线程池枚举),子树变更回 UI 线程落地。
+            var loads = new List<Task>(toReload.Count);
+            foreach (var node in toReload.Distinct())
+            {
+                loads.Add(node.ReconcileChildrenAsync());
+            }
+
+            await Task.WhenAll(loads);
+            SyncTreeRows();
+            RefreshWatchedDirectories();
+        }
+        finally
+        {
+            if (gateHeld)
+            {
+                _treeMutationGate.Release();
+            }
+            Interlocked.Exchange(ref _treeRefreshInFlight, 0);
+            _lastTreeRefreshCompletedTicks = Environment.TickCount64;
+            if (Interlocked.Exchange(ref _treeRefreshPending, 0) == 1)
+            {
+                StartTreeRefresh(immediate: false);
+            }
+        }
+    }
+
+    /// <summary>Watch only directories whose children are currently materialized. Collapsed lazy
+    /// folders reconcile on their next expansion, so they do not need native watchers.</summary>
+    private void RefreshWatchedDirectories()
+    {
+        var directories = new List<string>();
+        foreach (var root in RootNodes)
+        {
+            CollectWatchedDirectories(root, directories, isRoot: true);
+        }
+
+        _fileWatcher.UpdateDirectories(directories);
+    }
+
+    private static void CollectWatchedDirectories(WorkspaceNode node, List<string> directories, bool isRoot)
+    {
+        if (!node.IsDirectory || !node.IsLoaded || (!isRoot && !node.IsExpanded))
+        {
+            return;
+        }
+
+        directories.Add(node.Path);
+        foreach (var child in node.Children)
+        {
+            if (child.IsDirectory && !child.IsPlaceholder)
+            {
+                CollectWatchedDirectories(child, directories, isRoot: false);
+            }
+        }
+    }
+
+    /// <summary>Collects this loaded directory node and the loaded descendants reachable through
+    /// its non-placeholder children into <paramref name="index"/>, keyed by full path.</summary>
+    private static void CollectLoadedDirs(WorkspaceNode node, Dictionary<string, WorkspaceNode> index)
+    {
+        if (!node.IsDirectory)
+        {
+            return;
+        }
+
+        index[node.Path] = node;
+        foreach (var child in node.Children)
+        {
+            if (child.IsDirectory && !child.IsPlaceholder && child.IsLoaded)
+            {
+                CollectLoadedDirs(child, index);
+            }
+        }
     }
 
     /// <summary>并行展开目录树(旧实现是 DFS 串行 await,大仓库"展开全部"逐目录等待磁盘 I/O)。
@@ -645,6 +992,9 @@ public partial class WorkspaceViewModel : PageViewModel
     /// <summary>V4 模型诊断计数器:整表重建(CollectVisibleRows + CollectionDiffer)的次数。</summary>
     internal int FullSyncCount { get; private set; }
 
+    /// <summary>V-诊断计数器:文件监视驱动的树自动刷新实际执行的次数(过滤后无可刷新内容的不计)。</summary>
+    internal int TreeAutoRefreshRuns { get; private set; }
+
     /// <summary>测试/诊断:强制整表同步一次(与真实路径同一实现)。</summary>
     internal void SyncTreeRowsForTest() => SyncTreeRows();
 
@@ -726,6 +1076,7 @@ public partial class WorkspaceViewModel : PageViewModel
                 }
 
                 SyncTreeRows(match);
+                RefreshWatchedDirectories();
 
                 // 增量同步不再重置列表滚动;显式通知视图把目标行滚入视野(旧整表重建靠选区
                 // 变化隐式滚动,增量更新下选中项可能已可见,需显式 reveal)。
@@ -769,25 +1120,46 @@ public partial class WorkspaceViewModel : PageViewModel
             }
         }
 
-        foreach (var node in RootNodes)
+        foreach (var path in affected)
         {
-            ApplyDecorationIfAffected(node, affected);
+            FindLoadedNode(path)?.RefreshDecoration();
         }
     }
 
-    private static void ApplyDecorationIfAffected(WorkspaceNode node, HashSet<string> affected)
+    /// <summary>Resolves one loaded node by workspace-relative path without walking unrelated
+    /// loaded subtrees. Git status updates typically touch a handful of paths; recursively
+    /// scanning every expanded node made that common path O(the whole explorer).</summary>
+    private WorkspaceNode? FindLoadedNode(string relativePath)
     {
-        // 遍历仍然覆盖全部已加载节点(树本身是懒加载的),但 RefreshDecoration 只对受影响者
-        // 执行(避免逐节点字典查找 + 属性变更通知)。
-        if (affected.Contains(node.RelativePath.Replace('\\', '/')))
+        if (RootNodes.Count == 0)
         {
-            node.RefreshDecoration();
+            return null;
         }
 
-        foreach (var child in node.Children)
+        WorkspaceNode? current = RootNodes[0];
+        if (string.IsNullOrEmpty(relativePath))
         {
-            ApplyDecorationIfAffected(child, affected);
+            return current;
         }
+
+        foreach (var segment in relativePath.Split('/', StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (current is null || !current.IsDirectory || !current.IsLoaded)
+            {
+                return null;
+            }
+
+            var next = current.Children.FirstOrDefault(child =>
+                !child.IsPlaceholder && string.Equals(child.Name, segment, StringComparison.OrdinalIgnoreCase));
+            if (next is null)
+            {
+                return null;
+            }
+
+            current = next;
+        }
+
+        return current;
     }
 
     partial void OnSelectedTreeRowChanged(WorkspaceTreeRow? value)
@@ -1252,7 +1624,9 @@ public sealed class WorkspaceStatusSource
 
 public sealed partial class WorkspaceNode : ObservableObject
 {
-    private static readonly HashSet<string> Ignored = new(StringComparer.OrdinalIgnoreCase) { ".git", "node_modules", "bin", "obj", ".vs" };
+    /// <summary>目录名黑名单(枚举时隐藏)。<see cref="WorkspaceViewModel"/> 的树自动刷新过滤
+    /// 必须与它同源,否则会被这些目录内部的变化白白触发重枚举。</summary>
+    internal static readonly HashSet<string> Ignored = new(StringComparer.OrdinalIgnoreCase) { ".git", "node_modules", "bin", "obj", ".vs" };
 
     private readonly string _rootPath;
     private readonly WorkspaceStatusSource _statusSource;
@@ -1427,43 +1801,18 @@ public sealed partial class WorkspaceNode : ObservableObject
         Children.Clear();
         try
         {
-            // .NET 没有异步目录枚举:把同步枚举放到线程池,超大目录(构建产物/依赖)的枚举
-            // 不再阻塞 UI 线程——展开/打开卡顿的修复点之一。
-            var (directories, files) = await Task.Run(() =>
-            {
-                var dirs = Directory.EnumerateDirectories(Path)
-                    .Where(path => !Ignored.Contains(System.IO.Path.GetFileName(path)) &&
-                                  !_statusSource.IsExcluded(System.IO.Path.GetRelativePath(_rootPath, path)))
-                    .OrderBy(System.IO.Path.GetFileName)
-                    .ToList();
-                var fs = Directory.EnumerateFiles(Path)
-                    .Where(path => !_statusSource.IsExcluded(System.IO.Path.GetRelativePath(_rootPath, path)))
-                    .OrderBy(System.IO.Path.GetFileName)
-                    .ToList();
-                return (dirs, fs);
-            });
+            var (directories, files) = await EnumerateChildrenCoreAsync();
 
             // Children 的变更回到 UI 线程(续延捕获自 UI 上下文);顺序与旧同步版一致:
             // 排序后的目录在前,排序后的文件在后。
             foreach (var directory in directories)
             {
-                var node = new WorkspaceNode(directory, true, _rootPath, _statusSource)
-                {
-                    Parent = this,
-                    // 子节点继承本节点的紧凑标志(根节点由 VM 按设置写入)。
-                    CompactFolders = CompactFolders,
-                };
-                Children.Add(node);
+                Children.Add(CreateChildNode(directory, true));
             }
 
             foreach (var file in files)
             {
-                var node = new WorkspaceNode(file, false, _rootPath, _statusSource)
-                {
-                    Parent = this,
-                    CompactFolders = CompactFolders,
-                };
-                Children.Add(node);
+                Children.Add(CreateChildNode(file, false));
             }
         }
         catch (Exception)
@@ -1479,12 +1828,112 @@ public sealed partial class WorkspaceNode : ObservableObject
         }
     }
 
-    /// <summary>Resets a directory node to its unloaded placeholder state (explorer refresh).</summary>
+    /// <summary>枚举本目录的可见条目(同名/排除规则过滤 + 排序)。.NET 没有异步目录枚举:
+    /// 同步枚举放到线程池,超大目录(构建产物/依赖)的枚举不再阻塞 UI 线程——展开/打开卡顿
+    /// 的修复点之一。失败时抛出(调用方决定降级)。</summary>
+    private Task<(string[] Directories, string[] Files)> EnumerateChildrenCoreAsync() => Task.Run(() =>
+    {
+        var directories = Directory.EnumerateDirectories(Path)
+            .Where(path => !Ignored.Contains(System.IO.Path.GetFileName(path)) &&
+                           !_statusSource.IsExcluded(System.IO.Path.GetRelativePath(_rootPath, path)))
+            .OrderBy(System.IO.Path.GetFileName)
+            .ToArray();
+        var files = Directory.EnumerateFiles(Path)
+            .Where(path => !_statusSource.IsExcluded(System.IO.Path.GetRelativePath(_rootPath, path)))
+            .OrderBy(System.IO.Path.GetFileName)
+            .ToArray();
+        return (directories, files);
+    });
+
+    private WorkspaceNode CreateChildNode(string fullPath, bool isDirectory) =>
+        new(fullPath, isDirectory, _rootPath, _statusSource)
+        {
+            Parent = this,
+            // 子节点继承本节点的紧凑标志(根节点由 VM 按设置写入)。
+            CompactFolders = CompactFolders,
+        };
+
+    /// <summary>树自动刷新的就地协调(与 LoadChildrenCoreAsync 的区别):**保留**磁盘上仍存在的
+    /// 子节点对象——节点身份承载已加载状态、展开态、选区与行缓存,整表重建会把兄弟子树的这些
+    /// 状态一并抹掉(一次无关变更让整棵子树"失忆",展开态全丢)。只有真正新增/消失的条目产生
+    /// 子树变化;顺序(目录在前、文件在后、各自字母序)按磁盘实况重排。枚举失败时保持现状。</summary>
+    public async Task ReconcileChildrenAsync()
+    {
+        if (!IsDirectory || !IsLoaded)
+        {
+            return; // 未加载目录保持惰性:下次展开时按磁盘实况枚举
+        }
+
+        if (_pendingLoad is not null)
+        {
+            await _pendingLoad; // 序列化:进行中的展开加载完成后按同一磁盘实况收敛
+        }
+
+        string[] directories;
+        string[] files;
+        try
+        {
+            (directories, files) = await EnumerateChildrenCoreAsync();
+        }
+        catch (Exception)
+        {
+            return; // 枚举失败:保留既有子树,下一次刷新重试
+        }
+
+        // 存活节点按全路径索引(同一目录下文件与目录不可能同名同路径)。
+        var survivors = new Dictionary<string, WorkspaceNode>(StringComparer.OrdinalIgnoreCase);
+        foreach (var child in Children)
+        {
+            if (!child.IsPlaceholder)
+            {
+                survivors[child.Path] = child;
+            }
+        }
+
+        var reconciled = new List<WorkspaceNode>(directories.Length + files.Length);
+        foreach (var directory in directories)
+        {
+            reconciled.Add(ResolveOrCreate(directory, true));
+        }
+
+        foreach (var file in files)
+        {
+            reconciled.Add(ResolveOrCreate(file, false));
+        }
+
+        WorkspaceNode ResolveOrCreate(string fullPath, bool isDirectory)
+        {
+            if (survivors.TryGetValue(fullPath, out var keep))
+            {
+                survivors.Remove(fullPath);
+                return keep;
+            }
+
+            return CreateChildNode(fullPath, isDirectory);
+        }
+
+        // survivors 剩余者 = 磁盘上已消失的条目(自然丢弃);顺序按磁盘实况重排。不要 Clear()
+        // 再逐项 Add：一个文件变化不应让大目录的 CollectionView 收到 N 次重建通知。
+        CollectionDiffer.Apply(Children, reconciled, ReferenceEqualityComparer.Instance);
+
+        // V4: 子节点集合变化可能改变紧凑链形态与可见行数,重算自身并向父链传播。
+        RecomputeVisibleRowCountChain();
+    }
+
+    /// <summary>Resets a directory node to its unloaded, collapsed placeholder state (explorer refresh).</summary>
     public void DropChildren()
     {
         if (!IsDirectory)
         {
             return;
+        }
+
+        // 刷新丢弃子树时展开态必须同步重置(RefreshAsync 契约:"Expansion state resets for the
+        // refreshed subtree")。否则 IsExpanded 仍为 true 但只剩占位符——chevron 显示"已展开"却
+        // 投影不出子行,用户第一次点击只是翻转空展开(delta=0,无可见变化),第二次才真正展开。
+        if (IsExpanded)
+        {
+            IsExpanded = false;
         }
 
         IsLoaded = false;

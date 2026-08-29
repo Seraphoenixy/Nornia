@@ -11,7 +11,7 @@
         Title="Nornia" Width="1360" Height="820" MinWidth="960" MinHeight="680"
         Icon="/Nornia.Desktop;component/Assets/app.ico"
         Background="{DynamicResource WindowBrush}" Foreground="{DynamicResource TextBrush}"
-        WindowStyle="None" ResizeMode="CanResize" WindowStartupLocation="CenterScreen"
+        WindowStyle="None" ResizeMode="CanResize" WindowStartupLocation="CenterScreen" ShowActivated="True"
         PreviewKeyDown="MainWindow_PreviewKeyDown" DpiChanged="MainWindow_DpiChanged">
 
   <Window.Resources>
@@ -147,9 +147,8 @@
              避免被系统双击/拖动区域当作非客户区拦截。 -->
         <StackPanel Orientation="Horizontal" VerticalAlignment="Center" Margin="12,0,0,0"
                     shell:WindowChrome.IsHitTestVisibleInChrome="True">
-          <Border Width="18" Height="18" Background="{DynamicResource AccentBrush}" CornerRadius="{StaticResource RadiusLg}">
-            <TextBlock Text="N" FontSize="{DynamicResource TypeBody}" FontWeight="Bold" Foreground="{DynamicResource ActivityBarBadgeForegroundBrush}" HorizontalAlignment="Center" VerticalAlignment="Center" />
-          </Border>
+          <Image Width="18" Height="18" Stretch="Uniform" SnapsToDevicePixels="True"
+                 Source="/Nornia.Desktop;component/Assets/app.ico" />
         </StackPanel>
 
         <!-- VS Code menu bar embedded in the title strip: 文件/编辑/选择/查看/转到/运行/终端/帮助 -->
@@ -291,7 +290,7 @@
       <Grid.ColumnDefinitions>
         <!-- Activity bar width follows the glyph scale (48px items inside). -->
         <ColumnDefinition Width="Auto" />
-        <ColumnDefinition x:Name="SidebarColumn" Width="300" MinWidth="0" MaxWidth="720" />
+        <ColumnDefinition x:Name="SidebarColumn" Width="300" MinWidth="0" MaxWidth="960" />
         <ColumnDefinition x:Name="SidebarSplitterColumn" Width="5" />
         <ColumnDefinition Width="*" MinWidth="{DynamicResource MinEditorWidth}" />
       </Grid.ColumnDefinitions>

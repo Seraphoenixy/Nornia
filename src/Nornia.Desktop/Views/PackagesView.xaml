@@ -6,8 +6,11 @@
              xmlns:vm="clr-namespace:Nornia.Desktop.ViewModels">
   <UserControl.Resources>
     <!-- Mode segment (已安装 / 可升级 / 搜索): one shared style, the active segment gets the
-         bright foreground + accent underline like the bottom-panel tabs. -->
+         bright foreground + accent underline like the bottom-panel tabs. 分段间不留间隔、固定
+         等宽(64px 容纳 3 字标签并留足边距):三个分段贴合呈分段控件外观,而非稀疏的独立 Tab。 -->
     <Style x:Key="ModeSegmentButtonStyle" TargetType="Button" BasedOn="{StaticResource PanelTabButton}">
+      <Setter Property="Margin" Value="0" />
+      <Setter Property="Width" Value="64" />
       <Style.Triggers>
         <DataTrigger Binding="{Binding ListMode}" Value="Installed">
           <Setter Property="Foreground" Value="{DynamicResource BrightTextBrush}" />

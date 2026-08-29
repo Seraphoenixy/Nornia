@@ -3,7 +3,9 @@
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:local="clr-namespace:Nornia.Desktop.Views"
              x:Name="Root">
-  <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Margin="{StaticResource SpaceXxl}" MaxWidth="420">
+  <!-- 位置固定:内容锚定在区域顶部的固定偏移(EmptyStateTopInset),不再随区域高度/窗口尺寸
+       在垂直方向居中漂移——所有功能空页面共用同一锚定规则,提示位置彼此对齐。 -->
+  <StackPanel HorizontalAlignment="Center" VerticalAlignment="Top" Margin="{StaticResource EmptyStateTopInset}" MaxWidth="420">
     <TextBlock Text="{Binding Icon, ElementName=Root}"
                FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconEmpty}"
                Foreground="{DynamicResource MutedTextBrush}" HorizontalAlignment="Center" />

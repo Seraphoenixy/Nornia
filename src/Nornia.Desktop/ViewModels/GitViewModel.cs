@@ -32,13 +32,17 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     private readonly IClipboardService _clipboard;
     private readonly IGitRepositoryWatcher _repositoryWatcher;
     private readonly IProjectWorkspaceService _workspaceService;
+    // The view model is composed on the WPF UI thread in the application. Capture that owning
+    // context instead of consulting Application.Current from a timer continuation: tests and
+    // secondary WPF hosts can expose a global Dispatcher that belongs to another, idle thread.
+    private readonly SynchronizationContext? _uiContext;
 
     // Silent auto-refresh bookkeeping (watcher-driven): at most one refresh in flight, at most one
     // merged refresh pending; a pending refresh that hits a busy (user operation) state is deferred
     // until IsBusy goes back to false (see the OnPropertyChanged override). The in-flight flag is an
     // int taken with CAS because the retry timer can re-enter from a thread-pool thread.
     private int _quietRefreshInFlight; // 0 = idle, 1 = a refresh is in flight
-    private bool _quietRefreshPending;
+    private int _quietRefreshPending;
     private bool _enableScmAutoRefresh = true;
     private readonly RevisionGate _settingsRevisionGate = new();
 
@@ -48,10 +52,13 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     // start a fresh `git status`. Bursts inside the window only record a pending refresh that a
     // single retry timer runs once the window elapses. Manual refreshes and the catch-up refresh
     // after a user operation are exempt (they pass immediate: true).
-    internal const long QuietRefreshMinimumIntervalMs = 2000;
+    // 500ms (was 2000ms): the watcher already debounces 200ms, so a 2s post-completion cooldown made
+    // every change landing right after a refresh wait ~2s (and mid-flight changes a second full
+    // cooldown) before the changes column updated — the "changes not picked up in time" complaint.
+    // 500ms caps git-status frequency at 2/s during bursts while keeping update latency < ~1s.
+    internal const long QuietRefreshMinimumIntervalMs = 500;
     private long _lastQuietRefreshCompletedUtcTicks; // Environment.TickCount64 value, monotonic
     private int _quietRefreshRetryScheduled; // at most one pending retry timer
-    private int _quietRefreshRetryRan; // guards the dispatcher-posted retry against its grace fallback
 
     // HEAD signature of the last full state load: working-tree edits cannot move HEAD, so quiet
     // refreshes stay status-only while a moved HEAD (external commit / branch switch) escalates
@@ -637,6 +644,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         _clipboard = clipboard;
         _repositoryWatcher = repositoryWatcher;
         _workspaceService = workspaceService;
+        _uiContext = SynchronizationContext.Current;
         _stateStore = stateStore;
         _scopedSettings = settingsService;
         _repositoryWatcher.ChangesDetected += (_, _) => HandleWatcherChanges();
@@ -930,13 +938,22 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     }
 
     [RelayCommand(CanExecute = nameof(CanStageFolder))]
-    private async Task StageFolderAsync(ScmFolderNode? folder)
+    private async Task StageFolderAsync(ScmRowNode? node)
     {
+        // The tree context menu is hosted by the ListBox, so a file row can briefly remain
+        // its PlacementTarget.SelectedItem while the menu is being rebuilt. Accept the common
+        // tree-row base type and reject files here instead of letting the generated command
+        // throw while coercing ScmFileNode to ScmFolderNode.
+        if (node is not ScmFolderNode folder)
+        {
+            return;
+        }
+
         var paths = ChangesUnderFolder(UnstagedChanges, folder)
             .Select(change => change.Path)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
-        if (paths.Length == 0 || folder is null)
+        if (paths.Length == 0)
         {
             return;
         }
@@ -949,17 +966,24 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         RefreshChangeCommands();
     }
 
-    private bool CanStageFolder(ScmFolderNode? folder) =>
-        IsRepository && ChangesUnderFolder(UnstagedChanges, folder).Count > 0;
+    private bool CanStageFolder(ScmRowNode? node) =>
+        node is ScmFolderNode folder
+        && IsRepository
+        && ChangesUnderFolder(UnstagedChanges, folder).Count > 0;
 
     [RelayCommand(CanExecute = nameof(CanUnstageFolder))]
-    private async Task UnstageFolderAsync(ScmFolderNode? folder)
+    private async Task UnstageFolderAsync(ScmRowNode? node)
     {
+        if (node is not ScmFolderNode folder)
+        {
+            return;
+        }
+
         var paths = ChangesUnderFolder(StagedChanges, folder)
             .Select(change => change.Path)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
-        if (paths.Length == 0 || folder is null)
+        if (paths.Length == 0)
         {
             return;
         }
@@ -972,17 +996,24 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         RefreshChangeCommands();
     }
 
-    private bool CanUnstageFolder(ScmFolderNode? folder) =>
-        IsRepository && ChangesUnderFolder(StagedChanges, folder).Count > 0;
+    private bool CanUnstageFolder(ScmRowNode? node) =>
+        node is ScmFolderNode folder
+        && IsRepository
+        && ChangesUnderFolder(StagedChanges, folder).Count > 0;
 
     [RelayCommand(CanExecute = nameof(CanDiscardFolder))]
-    private async Task DiscardFolderAsync(ScmFolderNode? folder)
+    private async Task DiscardFolderAsync(ScmRowNode? node)
     {
+        if (node is not ScmFolderNode folder)
+        {
+            return;
+        }
+
         var paths = ChangesUnderFolder(UnstagedChanges, folder)
             .Select(change => change.Path)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
-        if (paths.Length == 0 || folder is null)
+        if (paths.Length == 0)
         {
             return;
         }
@@ -1003,8 +1034,10 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         RefreshChangeCommands();
     }
 
-    private bool CanDiscardFolder(ScmFolderNode? folder) =>
-        IsRepository && ChangesUnderFolder(UnstagedChanges, folder).Count > 0;
+    private bool CanDiscardFolder(ScmRowNode? node) =>
+        node is ScmFolderNode folder
+        && IsRepository
+        && ChangesUnderFolder(UnstagedChanges, folder).Count > 0;
 
     [RelayCommand(CanExecute = nameof(CanCommit))]
     private async Task CommitAsync()
@@ -1478,7 +1511,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     protected override void OnPropertyChanged(PropertyChangedEventArgs e)
     {
         base.OnPropertyChanged(e);
-        if (e.PropertyName == nameof(IsBusy) && !IsBusy && _quietRefreshPending)
+        if (e.PropertyName == nameof(IsBusy) && !IsBusy && Volatile.Read(ref _quietRefreshPending) == 1)
         {
             StartQuietRefresh(immediate: true);
         }
@@ -1504,7 +1537,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     {
         if (Interlocked.CompareExchange(ref _quietRefreshInFlight, 1, 0) == 1)
         {
-            _quietRefreshPending = true;
+            Interlocked.Exchange(ref _quietRefreshPending, 1);
             return;
         }
 
@@ -1512,7 +1545,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         {
             // A user operation is running; catch up with the latest state when it finishes.
             Interlocked.Exchange(ref _quietRefreshInFlight, 0);
-            _quietRefreshPending = true;
+            Interlocked.Exchange(ref _quietRefreshPending, 1);
             return;
         }
 
@@ -1524,13 +1557,13 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
                 // Inside the cooldown after the last silent refresh: record the pending refresh
                 // and run it once the interval elapses (single retry timer, at most one).
                 Interlocked.Exchange(ref _quietRefreshInFlight, 0);
-                _quietRefreshPending = true;
+                Interlocked.Exchange(ref _quietRefreshPending, 1);
                 ScheduleQuietRefreshRetry(QuietRefreshMinimumIntervalMs - elapsedMs);
                 return;
             }
         }
 
-        _quietRefreshPending = false;
+        Interlocked.Exchange(ref _quietRefreshPending, 0);
         _ = RunQuietRefreshAsync(); // its finally releases the in-flight flag
     }
 
@@ -1547,37 +1580,24 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         _ = Task.Delay(TimeSpan.FromMilliseconds(delayMs)).ContinueWith(_ =>
         {
             Interlocked.Exchange(ref _quietRefreshRetryScheduled, 0);
-            if (!_quietRefreshPending)
+            if (Volatile.Read(ref _quietRefreshPending) == 0)
             {
                 return;
             }
 
-            var dispatcher = System.Windows.Application.Current?.Dispatcher;
-            if (dispatcher is null)
+            if (_uiContext is null)
             {
                 HandleWatcherChanges(); // no WPF app (unit tests without STA context)
                 return;
             }
 
-            // Marshaled to the UI thread: the refresh mutates bound observable state. The real
-            // app's message loop pumps the dispatcher within one frame; a grace-period fallback
-            // covers hosts that keep a WPF Application alive without pumping it (test processes
-            // sharing the STA context), where a plain BeginInvoke would park forever.
-            Interlocked.Exchange(ref _quietRefreshRetryRan, 0);
-            dispatcher.BeginInvoke(new Action(() =>
+            // Marshal back to the context that owns the ViewModel and its bound collections.
+            // Do not use Application.Current.Dispatcher here: it may belong to an unrelated WPF
+            // host (notably a shared STA test host) whose queue is not currently being pumped.
+            _uiContext.Post(_ =>
             {
-                if (Interlocked.Exchange(ref _quietRefreshRetryRan, 1) == 0)
-                {
-                    HandleWatcherChanges();
-                }
-            }));
-            _ = Task.Delay(1000).ContinueWith(_ =>
-            {
-                if (Interlocked.Exchange(ref _quietRefreshRetryRan, 1) == 0)
-                {
-                    HandleWatcherChanges();
-                }
-            });
+                HandleWatcherChanges();
+            }, null);
         });
     }
 
@@ -1612,9 +1632,8 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             // in flight (they set the pending flag above) may not restart another status for at
             // least QuietRefreshMinimumIntervalMs.
             _lastQuietRefreshCompletedUtcTicks = Environment.TickCount64;
-            if (_quietRefreshPending)
+            if (Interlocked.Exchange(ref _quietRefreshPending, 0) == 1)
             {
-                _quietRefreshPending = false;
                 HandleWatcherChanges();
             }
         }

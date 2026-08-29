@@ -23,8 +23,8 @@ public sealed class WorkbenchLayoutMetricsTests
     public void SidebarMaximumUsesAvailableWorkbenchWidth()
     {
         Assert.Equal(170, WorkbenchLayoutMetrics.SidebarMaximumFor(200));
-        Assert.Equal(400, WorkbenchLayoutMetrics.SidebarMaximumFor(1000));
-        Assert.Equal(720, WorkbenchLayoutMetrics.SidebarMaximumFor(2400));
+        Assert.Equal(500, WorkbenchLayoutMetrics.SidebarMaximumFor(1000));
+        Assert.Equal(960, WorkbenchLayoutMetrics.SidebarMaximumFor(2400));
     }
 
     [Fact]

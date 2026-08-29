@@ -115,6 +115,33 @@ internal sealed class FakeGitRepositoryWatcher : IGitRepositoryWatcher
     }
 }
 
+/// <summary>Watcher fake for the explorer tree auto-refresh tests: records attach calls and lets
+/// the test raise <see cref="FilesChanged"/> deterministically (the production watcher debounces
+/// and marshals; the VM tests drive the post-debounce event directly).</summary>
+internal sealed class FakeWorkspaceFileWatcher : IWorkspaceFileWatcher
+{
+    public List<string> AttachedPaths { get; } = [];
+    public List<IReadOnlyCollection<string>> WatchedDirectorySets { get; } = [];
+    public int DetachCalls { get; private set; }
+    public bool Disposed { get; private set; }
+
+    public event EventHandler<WorkspaceFilesChangedEventArgs>? FilesChanged;
+
+    public void Attach(string rootPath) => AttachedPaths.Add(rootPath);
+
+    public void UpdateDirectories(IEnumerable<string> directories) =>
+        WatchedDirectorySets.Add(directories.ToArray());
+
+    public void Detach() => DetachCalls++;
+
+    public void RaiseChanged(string rootPath, params string[] fullPaths) =>
+        FilesChanged?.Invoke(this, new WorkspaceFilesChangedEventArgs(
+            rootPath,
+            new HashSet<string>(fullPaths, StringComparer.OrdinalIgnoreCase)));
+
+    public void Dispose() => Disposed = true;
+}
+
 internal sealed class FakeRuntimeInventory(
     IReadOnlyList<CoreRuntime> refreshResult,
     IReadOnlyList<CoreRuntime>? persisted = null) : IRuntimeInventoryService
@@ -410,6 +437,12 @@ internal sealed class FakeGitService : IGitService
     public GitRepositoryStatus? StatusAfterInitialization { get; set; }
     public Exception? InitializeException { get; set; }
     public GitFileDiff? DiffResult { get; set; }
+
+    /// <summary>When set, takes precedence over <see cref="DiffResult"/> per side
+    /// (key: staged flag + untracked flag) — used to simulate "requested side empty, other side has
+    /// content" for the diff empty-fallback tests.</summary>
+    public Dictionary<(bool Staged, bool Untracked), GitFileDiff?>? DiffResultBySide { get; set; }
+
     public string DiffRevision { get; set; } = "revision-1";
     public Dictionary<string, string> DiffRevisions { get; } = new(StringComparer.OrdinalIgnoreCase);
     public List<(string RepositoryPath, string Path, bool Staged, bool IsUntracked)> DiffRequests { get; } = [];
@@ -488,7 +521,10 @@ internal sealed class FakeGitService : IGitService
     public Task<GitFileDiff?> GetDiffAsync(string repositoryPath, string path, bool staged, bool isUntracked = false, CancellationToken cancellationToken = default)
     {
         DiffRequests.Add((repositoryPath, path, staged, isUntracked));
-        return Task.FromResult(DiffResult);
+        var result = DiffResultBySide is { } bySide && bySide.TryGetValue((staged, isUntracked), out var sideResult)
+            ? sideResult
+            : DiffResult;
+        return Task.FromResult(result);
     }
 
     public Task<string> GetDiffRevisionAsync(string repositoryPath, string path, bool staged, bool isUntracked = false, CancellationToken cancellationToken = default) =>

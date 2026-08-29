@@ -44,6 +44,14 @@ public sealed partial class EditorGroupViewModel : ObservableObject
     [ObservableProperty]
     private EditorTabItem? selectedTab;
 
+    /// <summary>The selected file tab rendered by this group's persistent preview surface.</summary>
+    public FilePreviewTab? SelectedFileTab => SelectedTab as FilePreviewTab;
+
+    /// <summary>The selected diff tab rendered by this group's diff content template.</summary>
+    public DiffTab? SelectedDiffTab => SelectedTab as DiffTab;
+
+    public bool HasSelectedFileTab => SelectedFileTab is not null;
+
     /// <summary>该组是否为当前活动组(驱动活动组边框高亮)。</summary>
     [ObservableProperty]
     private bool isActive;
@@ -127,6 +135,12 @@ public sealed partial class EditorGroupViewModel : ObservableObject
             _mru.Remove(value);
             _mru.Insert(0, value);
         }
+
+        // EditorAreaView is hosted once per group and inherits this view model as its DataContext.
+        // Keep its type-specific projections in sync whenever the group's selection changes.
+        OnPropertyChanged(nameof(SelectedFileTab));
+        OnPropertyChanged(nameof(SelectedDiffTab));
+        OnPropertyChanged(nameof(HasSelectedFileTab));
 
         SelectedTabChanged?.Invoke(this, EventArgs.Empty);
     }

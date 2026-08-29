@@ -99,7 +99,7 @@ public sealed class MainViewModelTests
         Assert.Equal(170, fixture.Main.SidebarWidth);
 
         fixture.Main.SidebarWidth = 9999;
-        Assert.Equal(720, fixture.Main.SidebarWidth);
+        Assert.Equal(WorkbenchLayoutMetrics.SidebarMaximumWidth, fixture.Main.SidebarWidth);
     }
 
     [Fact]

@@ -353,6 +353,137 @@ public sealed class EditorAreaViewModelTests : IDisposable
     }
 
     [Fact]
+    public void GitDiffRequest_TabKey_DistinguishesWorkingTreeSides()
+    {
+        // 暂存/未暂存/未跟踪是同一文件的三个不同文档:键必须区分侧别,否则跨侧重开会
+        // 激活错误侧的旧标签,布局恢复也会因重复键丢掉其中一个。
+        var unstaged = new GitDiffRequest(@"C:\repo", "src/A.cs", false, false);
+        var staged = new GitDiffRequest(@"C:\repo", "src/A.cs", IsStaged: true, IsUntracked: false);
+        var untracked = new GitDiffRequest(@"C:\repo", "src/A.cs", false, IsUntracked: true);
+        var commit = new GitDiffRequest(@"C:\repo", "src/A.cs", false, false, "a".PadRight(40, '0'));
+
+        Assert.Equal("diff:src/A.cs:w", unstaged.TabKey);
+        Assert.Equal("diff:src/A.cs:s", staged.TabKey);
+        Assert.Equal("diff:src/A.cs:u", untracked.TabKey);
+        Assert.Equal($"diff:{commit.CommitHash}:src/A.cs", commit.TabKey);
+        Assert.NotEqual(unstaged.TabKey, staged.TabKey);
+        Assert.NotEqual(unstaged.TabKey, untracked.TabKey);
+    }
+
+    [Fact]
+    public async Task OpenDiffAsync_SameFileOtherSide_CreatesSeparateTab()
+    {
+        var (editor, _) = Create();
+
+        await editor.OpenDiffAsync(new GitDiffRequest(@"C:\repo", "src/A.cs", IsStaged: false, IsUntracked: false));
+        await editor.OpenDiffAsync(new GitDiffRequest(@"C:\repo", "src/A.cs", IsStaged: true, IsUntracked: false));
+
+        var tabs = editor.OpenTabs.OfType<DiffTab>().ToArray();
+        Assert.Equal(2, tabs.Length);
+        Assert.Contains(tabs, tab => tab.Request.IsStaged);
+        Assert.Contains(tabs, tab => !tab.Request.IsStaged);
+    }
+
+    private static GitFileDiff EmptyDiff(string path) => new(path, null, false, false, false, []);
+
+    [Fact]
+    public async Task OpenDiffAsync_RequestedSideEmpty_FallsBackToOtherSide()
+    {
+        // 状态快照滞后(刷新未落地 / 请求构建后更改被外部暂存):请求的未暂存侧 git diff 为空,
+        // 标签必须采用已暂存侧的内容,而不是显示"该文件没有可显示的差异"。
+        var git = new FakeGitService
+        {
+            DiffResultBySide = new Dictionary<(bool Staged, bool Untracked), GitFileDiff?>
+            {
+                [(false, false)] = EmptyDiff("src/A.cs"),
+                [(true, false)] = SampleDiff(),
+            },
+        };
+        var editor = new EditorAreaViewModel(git, new FakeUiLogService());
+
+        await editor.OpenDiffAsync(new GitDiffRequest(@"C:\repo", "src/A.cs", IsStaged: false, IsUntracked: false));
+
+        var tab = Assert.IsType<DiffTab>(Assert.Single(editor.OpenTabs));
+        Assert.True(tab.IsLoaded);
+        Assert.True(tab.HasDiff);
+        Assert.Contains(tab.DiffLines, line => line.Kind == GitDiffLineKind.Added && line.Text == "added");
+        Assert.Equal("已暂存", tab.SourceLabel);
+        Assert.Equal(DiffTabStatus.Staged, tab.TabStatus);
+        Assert.Equal("S", tab.TabStatusMarker);
+    }
+
+    [Fact]
+    public async Task OpenDiffAsync_BothSidesEmpty_StaysOnRequestedSide()
+    {
+        var git = new FakeGitService
+        {
+            DiffResultBySide = new Dictionary<(bool Staged, bool Untracked), GitFileDiff?>
+            {
+                [(false, false)] = EmptyDiff("src/A.cs"),
+                [(true, false)] = EmptyDiff("src/A.cs"),
+            },
+        };
+        var editor = new EditorAreaViewModel(git, new FakeUiLogService());
+
+        await editor.OpenDiffAsync(new GitDiffRequest(@"C:\repo", "src/A.cs", IsStaged: false, IsUntracked: false));
+
+        var tab = Assert.IsType<DiffTab>(Assert.Single(editor.OpenTabs));
+        Assert.True(tab.IsLoaded);
+        Assert.True(tab.IsEmptyDiff);
+        Assert.Equal("未暂存", tab.SourceLabel);
+        Assert.Equal(DiffTabStatus.Modified, tab.TabStatus);
+    }
+
+    [Fact]
+    public async Task OpenDiffAsync_BinaryRequestedSide_DoesNotFallBackToOtherSide()
+    {
+        var binary = new GitFileDiff("src/A.cs", null, false, IsBinary: true, IsNewFile: false, []);
+        var git = new FakeGitService
+        {
+            DiffResultBySide = new Dictionary<(bool Staged, bool Untracked), GitFileDiff?>
+            {
+                [(false, false)] = binary,
+                [(true, false)] = SampleDiff(),
+            },
+        };
+        var editor = new EditorAreaViewModel(git, new FakeUiLogService());
+
+        await editor.OpenDiffAsync(new GitDiffRequest(@"C:\repo", "src/A.cs", IsStaged: false, IsUntracked: false));
+
+        var tab = Assert.IsType<DiffTab>(Assert.Single(editor.OpenTabs));
+        Assert.Equal("未暂存", tab.SourceLabel);
+        Assert.Empty(tab.DiffLines);
+        Assert.Single(git.DiffRequests);
+    }
+
+    [Fact]
+    public async Task ApplyHunk_FollowsFallbackSide()
+    {
+        // 请求说未暂存、回退采用了已暂存侧内容:块操作必须作用到已暂存侧(git 调用 staged=true),
+        // 且"暂存"操作对已暂存侧禁用、"取消暂存"可用。
+        var git = new FakeGitService
+        {
+            DiffResultBySide = new Dictionary<(bool Staged, bool Untracked), GitFileDiff?>
+            {
+                [(false, false)] = EmptyDiff("src/A.cs"),
+                [(true, false)] = SampleDiff(),
+            },
+        };
+        var tab = new DiffTab(git, new GitDiffRequest(@"C:\repo", "src/A.cs", IsStaged: false, IsUntracked: false),
+            new FakeUiLogService(), new FakeClipboardService());
+
+        await tab.LoadAsync();
+        Assert.True(tab.HasDiff);
+        Assert.False(tab.CanApplyHunk(0, GitHunkOperation.Stage));
+        Assert.True(tab.CanApplyHunk(0, GitHunkOperation.Unstage));
+        Assert.True(await tab.ApplyHunkAsync(0, GitHunkOperation.Unstage));
+
+        var operation = git.HunkOperations[^1];
+        Assert.True(operation.Staged);
+        Assert.Equal(GitHunkOperation.Unstage, operation.Operation);
+    }
+
+    [Fact]
     public async Task FileAndDiffTabs_CoexistIndependently()
     {
         var (editor, _) = Create();

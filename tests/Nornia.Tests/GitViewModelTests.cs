@@ -472,6 +472,36 @@ public sealed class GitViewModelTests : IDisposable
     }
 
     [Fact]
+    public async Task WatcherChanges_MidFlightCatchUp_LandsWithinSnappyWindow()
+    {
+        // 更改栏"未及时监听到更改"的回归防线:落在静默刷新在途期间(或刚结束后的冷却窗内)的
+        // 变更,其补刷必须在"一个最小间隔 + 一次状态读取"内落地。旧的 2000ms 最小间隔让这条链
+        // 最长达到 3-4s;上限取 1900ms —— 新值(500ms)下最坏路径约 1.5s,旧值下最短也要 2000ms,
+        // 二者可区分。
+        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var git = new FakeGitService { Status = SampleStatus(), DiffResult = SampleDiff(), StatusGate = gate.Task };
+        var (viewModel, _, _, _, _) = Create(git);
+        viewModel.RepositoryPath = _repoPath;
+
+        Watcher.RaiseChangesDetected(); // in-flight, blocked on the gate
+        Watcher.RaiseChangesDetected(); // merges into the pending slot
+        Assert.Single(git.StatusRequests);
+
+        gate.SetResult();
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        var deadline = DateTime.UtcNow.AddSeconds(3);
+        while (git.StatusRequests.Count < 2 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(10);
+        }
+        stopwatch.Stop();
+
+        Assert.Equal(2, git.StatusRequests.Count);
+        Assert.True(stopwatch.ElapsedMilliseconds < 1900,
+            $"mid-flight catch-up took {stopwatch.ElapsedMilliseconds}ms; expected < 1900ms (one minimum interval + one status)");
+    }
+
+    [Fact]
     public async Task WatcherBurstsInsideMinimumInterval_CoalesceToOneDeferredRefresh()
     {
         // G1 (VS Code throttle + post-completion cooldown): a burst that lands inside the minimum
@@ -1234,6 +1264,22 @@ public sealed class GitViewModelTests : IDisposable
 
         viewModel.ToggleFolderCommand.Execute(src);
         Assert.Contains(viewModel.UnstagedTreeRows, row => row is ScmFileNode file && file.Change.Path == "src/A.cs");
+    }
+
+    [Fact]
+    public async Task FolderCommands_RejectTreeFileNodesWithoutThrowing()
+    {
+        var (viewModel, _, _, _, _) = Create();
+        viewModel.RepositoryPath = _repoPath;
+        await viewModel.RefreshCommand.ExecuteAsync(null);
+
+        var file = viewModel.UnstagedTreeRows.OfType<ScmFileNode>()
+            .First(row => row.Change.Path == "src/A.cs");
+
+        Assert.False(viewModel.StageFolderCommand.CanExecute(file));
+        Assert.False(viewModel.DiscardFolderCommand.CanExecute(file));
+        await viewModel.StageFolderCommand.ExecuteAsync(file);
+        await viewModel.DiscardFolderCommand.ExecuteAsync(file);
     }
 
     [Fact]

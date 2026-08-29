@@ -682,10 +682,13 @@ public sealed class DesignSystemResourceTests
     {
         // exe 图标(ApplicationIcon)与窗口图标(Window.Icon)共用同一品牌瓦片,且资产确实存在。
         var csproj = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Nornia.Desktop.csproj"));
-        Assert.Contains("<ApplicationIcon>Assets\\app.ico</ApplicationIcon>", csproj);
-        Assert.Contains("<Resource Include=\"Assets\\app.ico\" />", csproj);
+        Assert.Contains("<RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>", csproj);
+        Assert.Contains("<NorniaAppIcon>Assets\\app.ico</NorniaAppIcon>", csproj);
+        Assert.Contains("<ApplicationIcon>$(NorniaAppIcon)</ApplicationIcon>", csproj);
+        Assert.Contains("<Resource Include=\"$(NorniaAppIcon)\" />", csproj);
         var main = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/MainWindow.xaml"));
         Assert.Contains("Icon=\"/Nornia.Desktop;component/Assets/app.ico\"", main);
+        Assert.Contains("Source=\"/Nornia.Desktop;component/Assets/app.ico\"", main);
         Assert.True(File.Exists(Path.Combine(RepoRoot, "src/Nornia.Desktop/Assets/app.ico")), "缺少应用图标资产 app.ico");
     }
 
@@ -733,7 +736,7 @@ public sealed class DesignSystemResourceTests
             ["PackagesView.xaml"] = ["{StaticResource InsetCard}", "{StaticResource GapVerticalSm}"],
             ["ProjectsView.xaml"] = ["{StaticResource InsetPage}", "{StaticResource MarginFieldRow}"],
             ["TerminalView.xaml"] = ["{StaticResource InsetToolbar}", "{StaticResource GapLeftSm}"],
-            ["EmptyStateControl.xaml"] = ["{StaticResource SpaceXxl}", "{StaticResource GapMd}"],
+            ["EmptyStateControl.xaml"] = ["{StaticResource EmptyStateTopInset}", "{StaticResource GapMd}"],
         };
 
         foreach (var (fileName, tokens) in expected)
@@ -1253,7 +1256,10 @@ public sealed class DesignSystemResourceTests
         var preview = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/FilePreviewView.xaml"));
         var document = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/CodeDocumentView.xaml"));
 
-        Assert.Contains("DataType=\"{x:Type vm:FilePreviewTab}\"", editorArea);
+        Assert.Contains("x:Name=\"PersistentFilePreview\"", editorArea);
+        Assert.Contains("DataContext=\"{Binding SelectedFileTab}\"", editorArea);
+        Assert.Contains("HasSelectedFileTab", editorArea);
+        Assert.DoesNotContain("DataType=\"{x:Type vm:FilePreviewTab}\"", editorArea);
         Assert.Contains("<views:FilePreviewView", editorArea);
         Assert.Contains("<views:CodeDocumentView", preview);
         Assert.Contains("IsReadOnly=\"True\"", document);
@@ -1658,14 +1664,18 @@ public sealed class DesignSystemResourceTests
     {
         var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/MainWindow.xaml"));
         var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
+        var startup = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml.cs"));
 
         Assert.Contains("MinWidth=\"960\"", view);
+        Assert.Contains("ShowActivated=\"True\"", view);
         Assert.Contains("x:Name=\"EditorPanelHost\"", view);
         Assert.Contains("<Grid.ColumnDefinitions>", view);
         Assert.Contains("Grid.Column=\"2\" Orientation=\"Horizontal\" HorizontalAlignment=\"Right\"", view);
         Assert.DoesNotContain("<DockPanel Height=\"{DynamicResource SizeTabBar}\"", view);
         Assert.Contains("SizeWorkbenchSplitter", app);
         Assert.Contains("MinEditorWidth", app);
+        Assert.Contains("mainWindow.Activate();", startup);
+        Assert.Contains("DispatcherPriority.ApplicationIdle", startup);
     }
 
     [Fact]

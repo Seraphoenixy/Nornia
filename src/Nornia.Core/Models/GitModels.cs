@@ -139,7 +139,8 @@ public sealed record GitFileDiff(
     bool IsStaged,
     bool IsBinary,
     bool IsNewFile,
-    IReadOnlyList<GitDiffHunk> Hunks)
+    IReadOnlyList<GitDiffHunk> Hunks,
+    bool HasMetadata = false)
 {
     public bool IsEmpty => Hunks.Count == 0;
 

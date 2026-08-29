@@ -87,6 +87,8 @@ public partial class App : Application
             .AddSingleton<IGitRepositoryWatcher, GitRepositoryWatcher>()
             // 源码视图自动刷新:已打开文件的外部变更监听(EditorAreaViewModel 统一 Watch/Unwatch)。
             .AddSingleton<IFileContentWatcher, FileContentWatcher>()
+            // 资源管理器树自动刷新:工作区根目录的结构性监听(文件/目录的增删改,VS Code explorer 语义)。
+            .AddSingleton<IWorkspaceFileWatcher, WorkspaceFileWatcher>()
             // Read-only code workbench services (file type, decoding, outlines, search).
             .AddSingleton<ICodeFileTypeRegistry, CodeFileTypeRegistry>()
             .AddSingleton<ITextDocumentDecoder, TextDocumentDecoder>()
@@ -147,8 +149,25 @@ public partial class App : Application
         // 窗口先显示、后台继续;首屏读库方(任务中心)以 NorniaDatabase.Initialization 为闸门。
         var databaseReady = InitializeDatabaseAsync();
 
-        MainWindow = _services.GetRequiredService<MainWindow>();
-        MainWindow.Show();
+        var mainWindow = _services.GetRequiredService<MainWindow>();
+        MainWindow = mainWindow;
+        mainWindow.Show();
+        // Show() normally activates a first window, but the asynchronous startup path and the
+        // restored layout can leave it behind the launcher's foreground window. Request
+        // activation explicitly while this user-initiated startup still owns foreground rights.
+        mainWindow.Activate();
+        mainWindow.Focus();
+        _ = Dispatcher.BeginInvoke(DispatcherPriority.ApplicationIdle, new Action(() =>
+        {
+            // Loaded layout restoration can run after Show and change WindowState/placement.
+            // A final, non-intrusive activation keeps the initial shell in front without trying
+            // to steal focus later in the application's lifetime.
+            if (mainWindow.IsVisible && !mainWindow.IsActive)
+            {
+                mainWindow.Activate();
+                mainWindow.Focus();
+            }
+        }));
         base.OnStartup(e);
 
         // M9: 窗口已显示,才做旧日志保留清理(枚举+删除 I/O 不再占用启动关键路径)。

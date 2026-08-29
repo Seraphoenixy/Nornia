@@ -1141,8 +1141,10 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
         }
 
         Flush();
+        var hasMetadata = metadata is not null;
         metadata ??= new GitDiffMetadataEvent(string.Empty, null, false, false, false);
-        return new GitFileDiff(metadata.Path, metadata.OldPath, metadata.IsStaged, metadata.IsBinary, metadata.IsNewFile, hunks);
+        return new GitFileDiff(metadata.Path, metadata.OldPath, metadata.IsStaged, metadata.IsBinary,
+            metadata.IsNewFile, hunks, HasMetadata: hasMetadata);
 
         void Flush()
         {
