@@ -351,8 +351,8 @@ public sealed class TerminalSurfaceControl : FrameworkElement
     }
 
     /// <summary>把一行渲染进独立 DrawingVisual 并缓存(内容画在 y=0,位置由调用方的
-    /// 平移变换定位 → 滚动无需失效缓存,T2)。背景 run + 单段 FormattedText;前景色按
-    /// 同色 run 合并为一次 <c>SetForegroundBrush(start,count)</c>(旧实现逐格一次)。</summary>
+    /// 平移变换定位 → 滚动无需失效缓存,T2)。背景 run 按网格 + 前景文本按"网格锚定分段":
+    /// 每段锚定在其起始列的网格 x 上(详见段循环注释),同色连续段一段一次 DrawText。</summary>
     private DrawingVisual? RenderLine(TerminalCell[] line, string text)
     {
         var typeface = EnsureTypeface();
@@ -386,29 +386,40 @@ public sealed class TerminalSurfaceControl : FrameworkElement
             {
                 hasText = true;
                 var dpi = VisualTreeHelper.GetDpi(this).PixelsPerDip;
-                var formatted = new FormattedText(text, CultureInfo.CurrentUICulture, FlowDirection.LeftToRight, typeface, TerminalFontSize, foreground, dpi);
-                // 前景色按 run 合并:同色连续段一次 SetForegroundBrush(start,count)。
-                var colorRunStart = 0;
-                var colorRun = 0;
-                var inColorRun = false;
-                for (var column = 0; column <= line.Length; column++)
+                // 网格锚定分段:背景与光标按"列×_cellWidth"网格定位,而文本若整行一段、
+                // 按字体自然 advance 累加定位,CJK 宽字符/回退字形的 advance 与网格的偏差会
+                // 逐字累计——光标块与最后一个字符之间显出"看得见的空隙"(模型里并无空格)。
+                // 与 xterm.js/Windows Terminal 一致,让字形贴齐网格:每段画在其起始列的网格 x,
+                // 偏差只在段内存在、不跨段累计。分段边界 = 前景色变化 / 宽字符(独立成段,
+                // 其双格宽度由网格表达)/ \0 占位格(宽字符第二格与空格,跳过不画)。
+                // 纯 ASCII 单色行 → 恰为一段画在 x=0,与旧实现完全同成本。
+                var segmentStart = -1;
+                var segmentColor = 0;
+                for (var column = 0; column <= text.Length; column++)
                 {
-                    var color = column < line.Length ? line[column].Foreground : 0;
-                    if (inColorRun && color != colorRun)
+                    var drawable = column < text.Length && line[column].Char != '\0';
+                    var color = column < text.Length ? line[column].Foreground : 0;
+                    var boundary = column == text.Length
+                        || !drawable
+                        || (segmentStart >= 0 && (color != segmentColor || line[column].Width == 2));
+                    if (!boundary)
                     {
-                        formatted.SetForegroundBrush(ColorBrush(colorRun), colorRunStart, column - colorRunStart);
-                        inColorRun = false;
+                        continue;
                     }
 
-                    if (!inColorRun && color != 0)
+                    if (segmentStart >= 0)
                     {
-                        colorRun = color;
-                        colorRunStart = column;
-                        inColorRun = true;
+                        var segment = text[segmentStart..column];
+                        var brush = segmentColor != 0 ? ColorBrush(segmentColor) : foreground;
+                        var formatted = new FormattedText(
+                            segment, CultureInfo.CurrentUICulture, FlowDirection.LeftToRight, typeface,
+                            TerminalFontSize, brush, dpi);
+                        context.DrawText(formatted, new Point(segmentStart * _cellWidth, 0));
                     }
+
+                    segmentStart = drawable ? column : -1;
+                    segmentColor = color;
                 }
-
-                context.DrawText(formatted, new Point(0, 0));
             }
         }
 
@@ -535,89 +546,70 @@ public sealed class TerminalSurfaceControl : FrameworkElement
         }
 
         var control = (Keyboard.Modifiers & ModifierKeys.Control) != 0;
-        var shift = (Keyboard.Modifiers & ModifierKeys.Shift) != 0;
 
-        switch (e.Key)
+        // Ctrl 组合是仅有的端侧特例(复制/粘贴/控制字符);Ctrl+方向键等其余组合键
+        // 故意落到下方查表按普通键透传,与既有行为一致。
+        if (control)
         {
-            case Key.Enter:
-                session.WriteTextAsync("\r");
-                e.Handled = true;
-                return;
-            case Key.Back:
-                session.WriteTextAsync("\x7f");
-                e.Handled = true;
-                return;
-            case Key.Tab:
-                session.WriteTextAsync(shift ? "\x1b[Z" : "\t");
-                e.Handled = true;
-                return;
-            case Key.Escape:
-                session.WriteTextAsync("\x1b");
-                e.Handled = true;
-                return;
-            case Key.Up:
-                session.WriteTextAsync("\x1b[A");
-                e.Handled = true;
-                return;
-            case Key.Down:
-                session.WriteTextAsync("\x1b[B");
-                e.Handled = true;
-                return;
-            case Key.Right:
-                session.WriteTextAsync("\x1b[C");
-                e.Handled = true;
-                return;
-            case Key.Left:
-                session.WriteTextAsync("\x1b[D");
-                e.Handled = true;
-                return;
-            case Key.Home:
-                session.WriteTextAsync("\x1b[H");
-                e.Handled = true;
-                return;
-            case Key.End:
-                session.WriteTextAsync("\x1b[F");
-                e.Handled = true;
-                return;
-            case Key.PageUp:
-                session.WriteTextAsync("\x1b[5~");
-                e.Handled = true;
-                return;
-            case Key.PageDown:
-                session.WriteTextAsync("\x1b[6~");
-                e.Handled = true;
-                return;
-            case Key.Delete:
-                session.WriteTextAsync("\x1b[3~");
-                e.Handled = true;
-                return;
-            case Key.C when control:
-                if (CopySelection())
-                {
-                    ClearSelection();
-                }
-                else
-                {
-                    session.WriteTextAsync("\x03");
-                }
+            switch (e.Key)
+            {
+                case Key.C:
+                    if (CopySelection())
+                    {
+                        ClearSelection();
+                    }
+                    else
+                    {
+                        session.WriteTextAsync("\x03");
+                    }
 
-                e.Handled = true;
-                return;
-            case Key.V when control:
-                PasteClipboard();
-                e.Handled = true;
-                return;
+                    e.Handled = true;
+                    return;
+                case Key.V:
+                    PasteClipboard();
+                    e.Handled = true;
+                    return;
+                case >= Key.A and <= Key.Z:
+                    session.WriteTextAsync(((char)(e.Key - Key.A + 1)).ToString());
+                    e.Handled = true;
+                    return;
+            }
         }
 
-        if (control && e.Key is >= Key.A and <= Key.Z)
+        // 纯透传:VT 序列原样写给 shell——历史导航、光标移动、清行全部由 shell 原生处理,
+        // 端侧不加任何前缀/改写(改写会重置 PSReadLine 的历史枚举,表现为只能召回最近一条)。
+        var sequence = e.Key switch
         {
-            session.WriteTextAsync(((char)(e.Key - Key.A + 1)).ToString());
-            e.Handled = true;
+            Key.Tab when (Keyboard.Modifiers & ModifierKeys.Shift) != 0 => "\x1b[Z",
+            Key.Tab => "\t",
+            Key.Enter => "\r",
+            Key.Back => "\x7f",
+            Key.Escape => "\x1b",
+            Key.Up => ArrowUpSequence,
+            Key.Down => ArrowDownSequence,
+            Key.Right => "\x1b[C",
+            Key.Left => "\x1b[D",
+            Key.Home => "\x1b[H",
+            Key.End => "\x1b[F",
+            Key.PageUp => "\x1b[5~",
+            Key.PageDown => "\x1b[6~",
+            Key.Delete => "\x1b[3~",
+            _ => null,
+        };
+
+        if (sequence is null)
+        {
+            base.OnKeyDown(e);
             return;
         }
 
-        base.OnKeyDown(e);
+        session.WriteTextAsync(sequence);
+        e.Handled = true;
     }
+
+    /// <summary>标准 VT 方向键序列(CSI A/B):直接透传给 shell,不加任何前缀处理。</summary>
+    internal const string ArrowUpSequence = "\x1b[A";
+    internal const string ArrowDownSequence = "\x1b[B";
 
     protected override void OnTextInput(TextCompositionEventArgs e)
     {

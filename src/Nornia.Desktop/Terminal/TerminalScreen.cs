@@ -58,6 +58,12 @@ public sealed class TerminalScreen
     private int _savedColumn;
     private int _regionTop;
     private int _regionBottom;
+    // DEC REP(CSI b)需要"上一个图形字符"及其属性:ConPTY 的差分渲染器用 REP 压缩重复字符段。
+    private char _lastGraphicChar;
+    private int _lastForeground;
+    private int _lastBackground;
+    private bool _lastBold;
+    private bool _lastUnderline;
     private bool _dirty;
     private bool _suspendChanged;
     private readonly AnsiParser _parser;
@@ -260,17 +266,43 @@ public sealed class TerminalScreen
             }
             else
             {
+                // 关键顺序:先更新 _columns 再建行 —— BlankRow()/NewRows() 按当前 _columns
+                // 分配行宽;若先建行后改列数,列变宽时所有"新"行仍是旧宽度,后续写入右侧列
+                // 直接越界(复现:面板变宽后执行 dotnet build,输出超过旧列宽即崩)。
+                var oldColumns = _columns;
+                _columns = newColumns;
                 var resized = NewRows(newRows);
                 var copyRows = Math.Min(newRows, _rows.Count);
                 for (var row = 0; row < copyRows; row++)
                 {
                     var source = _rows[_rows.Count - copyRows + row];
                     var dest = resized[row];
-                    var copyLength = Math.Min(newColumns, _columns);
+                    var copyLength = Math.Min(newColumns, oldColumns);
                     copyLength = Math.Min(copyLength, Math.Min(source.Length, dest.Length));
                     if (copyLength > 0)
                     {
                         Array.Copy(source, 0, dest, 0, copyLength);
+                    }
+                }
+
+                // 滚动环形缓冲的行数组也必须同步到新列宽:否则下一次滚动会把旧宽度的槽位
+                // 数组"就地复用"为新底行,行比 _columns 短,后续写入/渲染访问右侧列越界
+                // (复现路径:面板变宽 → 长输出滚动,如 dotnet build)。内容按最小宽度拷贝,
+                // 版本整体 +1(截断行的渲染缓存必须失效)。
+                if (_scrollbackRing is not null)
+                {
+                    for (var slot = 0; slot < _scrollbackRing.Length; slot++)
+                    {
+                        var existing = _scrollbackRing[slot];
+                        if (existing is null || existing.Length == newColumns)
+                        {
+                            continue;
+                        }
+
+                        var resizedRow = new TerminalCell[newColumns];
+                        Array.Copy(existing, resizedRow, Math.Min(existing.Length, newColumns));
+                        _scrollbackRing[slot] = resizedRow;
+                        _scrollbackVersionRing![slot]++;
                     }
                 }
 
@@ -282,8 +314,7 @@ public sealed class TerminalScreen
                     newVersions[row] = _rowVersions[_rowVersions.Length - copyVersionRows + row] + 1;
                 }
 
-                _columns = newColumns;
-                _primary = resized;
+                _primary = resized; // _columns 已在分支开头更新(新行按新宽度分配)
                 _alternateVersions = null;
                 _alternate = null; // T7: 备用屏惰性分配;列变化不预建
                 _primaryVersions = newVersions;
@@ -478,6 +509,12 @@ public sealed class TerminalScreen
             }
         }
 
+        // 记录"上一个图形字符"(DEC REP 用):控制字符与零宽组合字符不更新。
+        _lastGraphicChar = character;
+        _lastForeground = foreground;
+        _lastBackground = background;
+        _lastBold = bold;
+        _lastUnderline = underline;
         BumpRow(_cursorRow);
         MarkDirty();
     }
@@ -614,6 +651,156 @@ public sealed class TerminalScreen
                     break;
             }
 
+            MarkDirty();
+        }
+
+        RaiseChanged();
+    }
+
+    /// <summary>ECH — Erase Characters(CSI n X):从光标起擦 n 格(不越过行尾),光标不动。
+    /// ConPTY 差分渲染器在"行中段变空白"(如短历史命令替换长命令的召回重绘)时发 ECH;
+    /// 只有空白延伸到行尾才发 EL(CSI K)。不支持 ECH 时旧文字残留——正是历史召回尾部
+    /// 文字擦不掉的根因。与 EL 同约定:填充为默认单元格。</summary>
+    internal void EraseCharacters(int count)
+    {
+        lock (_gate)
+        {
+            var row = _rows[_cursorRow];
+            var start = Math.Min(_cursorColumn, row.Length - 1);
+            var end = Math.Min(row.Length - 1, start + Math.Max(0, count) - 1);
+            ClearCellsWithWidth(row, start, end);
+            BumpRow(_cursorRow);
+            MarkDirty();
+        }
+
+        RaiseChanged();
+    }
+
+    /// <summary>DCH — Delete Characters(CSI n P):光标起删 n 格,右侧同行内容左移,行尾补空。</summary>
+    internal void DeleteCharacters(int count)
+    {
+        lock (_gate)
+        {
+            var row = _rows[_cursorRow];
+            var width = row.Length;
+            var delete = Math.Clamp(count, 0, width - _cursorColumn);
+            if (delete > 0)
+            {
+                for (var column = _cursorColumn; column < width; column++)
+                {
+                    row[column] = column + delete < width ? row[column + delete] : default;
+                }
+
+                BumpRow(_cursorRow);
+                MarkDirty();
+            }
+        }
+
+        RaiseChanged();
+    }
+
+    /// <summary>ICH — Insert Characters(CSI n @):光标起右移 n 格(挤出行尾),空出的格补空。</summary>
+    internal void InsertCharacters(int count)
+    {
+        lock (_gate)
+        {
+            var row = _rows[_cursorRow];
+            var width = row.Length;
+            var insert = Math.Clamp(count, 0, width - _cursorColumn);
+            if (insert > 0)
+            {
+                for (var column = width - 1; column >= _cursorColumn; column--)
+                {
+                    row[column] = column - insert >= _cursorColumn ? row[column - insert] : default;
+                }
+
+                BumpRow(_cursorRow);
+                MarkDirty();
+            }
+        }
+
+        RaiseChanged();
+    }
+
+    /// <summary>REP — Repeat(CSI n b):从光标起重复写"上一个图形字符" n 次(属性随原字符)。
+    /// 无前序图形字符时忽略。宽字符经同一写入路径保持双格/延迟换行语义。</summary>
+    internal void RepeatLastCharacter(int count)
+    {
+        lock (_gate)
+        {
+            if (_lastGraphicChar == '\0')
+            {
+                return;
+            }
+
+            for (var i = 0; i < Math.Max(0, count); i++)
+            {
+                WriteCharCore(_lastGraphicChar, _lastForeground, _lastBackground, _lastBold, _lastUnderline);
+            }
+        }
+
+        RaiseChanged();
+    }
+
+    /// <summary>IL — Insert Lines(CSI n L):滚动区域内、光标行起插入 n 条空行,区域底行被挤出。
+    /// 光标在滚动区域外时无效(与 ScrollUp/ScrollDown 不同,它们作用于整个区域)。</summary>
+    internal void InsertLines(int count)
+    {
+        lock (_gate)
+        {
+            if (_cursorRow < _regionTop || _cursorRow > _regionBottom)
+            {
+                return;
+            }
+
+            var insert = Math.Clamp(count, 0, _regionBottom - _cursorRow + 1);
+            for (var i = 0; i < insert; i++)
+            {
+                for (var row = _regionBottom; row > _cursorRow; row--)
+                {
+                    _rows[row] = _rows[row - 1];
+                    _rowVersions[row] = _rowVersions[row - 1];
+                }
+
+                _rows[_cursorRow] = BlankRow();
+                _rowVersions[_cursorRow] = 0;
+            }
+
+            _cursorColumn = 0; // VT510:IL/DL 将光标复位到第一列
+            _wrapPending = false;
+            MarkRowsDirty();
+            MarkDirty();
+        }
+
+        RaiseChanged();
+    }
+
+    /// <summary>DL — Delete Lines(CSI n M):滚动区域内删除光标行起的 n 行,下方行上移,区域底补空。</summary>
+    internal void DeleteLines(int count)
+    {
+        lock (_gate)
+        {
+            if (_cursorRow < _regionTop || _cursorRow > _regionBottom)
+            {
+                return;
+            }
+
+            var delete = Math.Clamp(count, 0, _regionBottom - _cursorRow + 1);
+            for (var i = 0; i < delete; i++)
+            {
+                for (var row = _cursorRow; row < _regionBottom; row++)
+                {
+                    _rows[row] = _rows[row + 1];
+                    _rowVersions[row] = _rowVersions[row + 1];
+                }
+
+                _rows[_regionBottom] = BlankRow();
+                _rowVersions[_regionBottom] = 0;
+            }
+
+            _cursorColumn = 0;
+            _wrapPending = false;
+            MarkRowsDirty();
             MarkDirty();
         }
 
@@ -827,7 +1014,9 @@ public sealed class TerminalScreen
     private void EnsureCursorWithinScreen()
     {
         _cursorRow = Math.Clamp(_cursorRow, 0, _rows.Count - 1);
-        _cursorColumn = Math.Clamp(_cursorColumn, 0, _columns - 1);
+        // 防御性收口:按实际行宽(而非仅 _columns)钳制列,任何时序残留的窄行都不会越界。
+        var rowWidth = Math.Min(_columns, _rows[_cursorRow].Length);
+        _cursorColumn = Math.Clamp(_cursorColumn, 0, rowWidth - 1);
     }
 
     private void MoveDownWrapping()
@@ -861,13 +1050,15 @@ public sealed class TerminalScreen
                     _primaryVersions[row] = _primaryVersions[row + 1];
                 }
 
-                if (recycled is not null)
+                if (recycled is not null && recycled.Length == _columns)
                 {
                     Array.Clear(recycled, 0, recycled.Length);
                     _primary[_regionBottom] = recycled;
                 }
                 else
                 {
+                    // 环形槽位数组宽度与当前列数不符(resize 时序残留)时不得复用,
+                    // 否则行比 _columns 短,写入右侧列越界。
                     _primary[_regionBottom] = BlankRow();
                 }
 
@@ -900,6 +1091,21 @@ public sealed class TerminalScreen
     {
         for (var column = Math.Max(0, start); column <= Math.Min(end, row.Length - 1); column++)
         {
+            row[column] = default;
+        }
+    }
+
+    /// <summary>按擦除语义清格,处理宽字符双格配对:擦除起点落在宽字符的占位格时,
+    /// 连宽头一起清,避免留下"有头无身"的半格渲染。</summary>
+    private static void ClearCellsWithWidth(TerminalCell[] row, int start, int end)
+    {
+        for (var column = Math.Max(0, start); column <= Math.Min(end, row.Length - 1); column++)
+        {
+            if (column > 0 && row[column - 1].Width == 2)
+            {
+                row[column - 1] = default;
+            }
+
             row[column] = default;
         }
     }

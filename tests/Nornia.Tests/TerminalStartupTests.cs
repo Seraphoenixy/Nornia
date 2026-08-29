@@ -1,4 +1,5 @@
 using Nornia.Desktop.Services;
+using Nornia.Desktop.Views.Controls;
 using System.IO;
 
 namespace Nornia.Tests;
@@ -105,6 +106,127 @@ public sealed class TerminalStartupTests
                 () => session.Screen!.ToPlainText().Contains(marker, StringComparison.Ordinal),
                 TimeSpan.FromSeconds(20));
             Assert.True(echoed, "写入终端的命令未在屏幕模型中回显——输入管道在启动后失效。");
+        }
+        finally
+        {
+            await service.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task InteractiveHistoryNavigation_ReplacesLongCurrentDraft()
+    {
+        var pwsh = FindExecutable("pwsh.exe") ?? FindExecutable("powershell.exe");
+        if (pwsh is null) return;
+
+        var service = new TerminalService();
+        var profile = new ShellProfile("shell-history", "PowerShell", pwsh, "-NoLogo");
+        try
+        {
+            var session = await service.StartAsync(profile, Environment.CurrentDirectory);
+            if (!session.IsInteractive) return;
+
+            Assert.NotNull(session.Screen);
+            await WaitUntilAsync(() => !string.IsNullOrWhiteSpace(session.Screen!.ToPlainText()), TimeSpan.FromSeconds(20));
+
+            const string historyCommand = "Write-Output __nornia_history_short__";
+            const string longerHistoryCommand = "Write-Output __nornia_longer_history_item_with_tail_marker__";
+            const string longerTail = "tail_marker";
+            const string draft = "this_is_a_much_longer_unsubmitted_terminal_command_draft";
+            const string draftTail = "terminal_command_draft";
+
+            // 先执行"更长"的历史项再执行"更短"的:之后 Up→Up→Down 时,短项会覆盖长项的
+            // 行尾区域,是 ConPTY 差分发出 ECH(行中段擦除)的真实场景。
+            session.WriteTextAsync(longerHistoryCommand + "\r");
+            Assert.True(await WaitUntilAsync(
+                () => session.Screen!.ToPlainText().Contains("__nornia_longer_history_item", StringComparison.Ordinal),
+                TimeSpan.FromSeconds(20)));
+
+            session.WriteTextAsync(historyCommand + "\r");
+            Assert.True(await WaitUntilAsync(
+                () => session.Screen!.ToPlainText().Contains("__nornia_history_short__", StringComparison.Ordinal),
+                TimeSpan.FromSeconds(20)));
+
+            await Task.Delay(1500);
+            session.WriteTextAsync(draft);
+            Assert.True(await WaitUntilAsync(
+                () => session.Screen!.ToPlainText().Replace("\n", string.Empty, StringComparison.Ordinal)
+                    .Contains(draft, StringComparison.Ordinal),
+                TimeSpan.FromSeconds(10)), session.Screen!.ToPlainText());
+
+            // 纯透传(不加清行前缀):PSReadLine 原生用历史项整行替换当前草稿,并在按 Down 时
+            // 恢复草稿——历史枚举状态不被打断,连续 Up 可逐条回溯。
+            session.WriteTextAsync(TerminalSurfaceControl.ArrowUpSequence);
+            Assert.True(await WaitUntilAsync(() =>
+            {
+                var output = session.Screen!.ToPlainText().Replace("\n", string.Empty, StringComparison.Ordinal);
+                var prompt = output.LastIndexOf("PS ", StringComparison.Ordinal);
+                var activeLine = prompt >= 0 ? output[prompt..] : output;
+                return activeLine.Contains(historyCommand, StringComparison.Ordinal)
+                    && !activeLine.Contains(draft, StringComparison.Ordinal)
+                    && !activeLine.Contains(draftTail, StringComparison.Ordinal);
+            }, TimeSpan.FromSeconds(10)), "上箭头未用历史命令完整替换当前长草稿。");
+
+            // 连续翻阅:Up 到更长历史项,再 Down 回到更短项——短项替换长项后行尾不得残留
+            // 长项尾部(依赖 ECH/EL 擦除链路完整)。
+            session.WriteTextAsync(TerminalSurfaceControl.ArrowUpSequence);
+            Assert.True(await WaitUntilAsync(() =>
+            {
+                var output = session.Screen!.ToPlainText().Replace("\n", string.Empty, StringComparison.Ordinal);
+                var prompt = output.LastIndexOf("PS ", StringComparison.Ordinal);
+                var activeLine = prompt >= 0 ? output[prompt..] : output;
+                return activeLine.Contains("__nornia_longer_history_item", StringComparison.Ordinal);
+            }, TimeSpan.FromSeconds(10)), "连续上箭头未回溯到更早的历史项。");
+
+            session.WriteTextAsync(TerminalSurfaceControl.ArrowDownSequence);
+            Assert.True(await WaitUntilAsync(() =>
+            {
+                var output = session.Screen!.ToPlainText().Replace("\n", string.Empty, StringComparison.Ordinal);
+                var prompt = output.LastIndexOf("PS ", StringComparison.Ordinal);
+                var activeLine = prompt >= 0 ? output[prompt..] : output;
+                return activeLine.Contains(historyCommand, StringComparison.Ordinal)
+                    && !activeLine.Contains(longerTail, StringComparison.Ordinal);
+            }, TimeSpan.FromSeconds(10)), "下箭头回到短历史项后,长历史项尾部文字残留在行尾。");
+        }
+        finally
+        {
+            await service.DisposeAsync();
+        }
+    }
+
+    [Fact]
+    public async Task InteractiveRapidTyping_ExecutesDotnetBuildWithoutReorderingEnter()
+    {
+        var pwsh = FindExecutable("pwsh.exe") ?? FindExecutable("powershell.exe");
+        if (pwsh is null) return;
+
+        var project = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory,
+            "..", "..", "..", "..", "..", "src", "Nornia.Core", "Nornia.Core.csproj"));
+        if (!File.Exists(project)) return;
+
+        var service = new TerminalService();
+        var profile = new ShellProfile("shell-dotnet-build", "PowerShell", pwsh, "-NoLogo");
+        try
+        {
+            var session = await service.StartAsync(profile, Environment.CurrentDirectory);
+            if (!session.IsInteractive) return;
+
+            Assert.NotNull(session.Screen);
+            await WaitUntilAsync(() => !string.IsNullOrWhiteSpace(session.Screen!.ToPlainText()),
+                TimeSpan.FromSeconds(20));
+
+            var outputPath = Path.Combine(Path.GetTempPath(), "nornia-terminal-build", Guid.NewGuid().ToString("N"));
+            var command = $"dotnet build \"{project}\" --no-restore --nologo -o \"{outputPath}\"; Write-Output __nornia_dotnet_build_done_$LASTEXITCODE";
+            foreach (var character in command)
+            {
+                session.WriteTextAsync(character.ToString());
+            }
+
+            session.WriteTextAsync("\r");
+
+            Assert.True(await WaitUntilAsync(
+                () => session.Screen!.ToPlainText().Contains("__nornia_dotnet_build_done_0", StringComparison.Ordinal),
+                TimeSpan.FromSeconds(40)), session.Screen!.ToPlainText());
         }
         finally
         {
