@@ -18,6 +18,7 @@ public partial class ExplorerPageViewModel : PageViewModel, INavigationTarget
     private readonly IDesktopNavigationService _navigation;
     private IProjectWorkspaceService? _workspaceService;
     private GitRepositoryStatus? _latestGitStatus;
+    private CancellationTokenSource? _activeEditorRevealCancellation;
 
     public WorkspaceViewModel Explorer { get; }
     public EditorAreaViewModel Editor { get; }
@@ -52,6 +53,7 @@ public partial class ExplorerPageViewModel : PageViewModel, INavigationTarget
         Explorer.WorkspaceSelectionRequested += (_, path) => _ = OpenProjectPathAsync(path);
         Explorer.FileOpenRequested += (_, path) => _ = OpenExplorerFileAsync(path);
         Explorer.FileOpenPermanentRequested += (_, path) => _ = OpenExplorerFileAsync(path, permanent: true);
+        Editor.SelectedTabChanged += (_, _) => QueueActiveEditorReveal();
         Explorer.DiffOpenRequested += async (_, node) =>
         {
             var info = Explorer.GetGitInfo(node.RelativePath);
@@ -217,6 +219,68 @@ public partial class ExplorerPageViewModel : PageViewModel, INavigationTarget
     private void OnWorkspaceOpened(object? sender, string root)
     {
         Terminal.WorkingDirectory = root;
+        // 布局恢复可能先于工作区树加载完成；树就绪后再同步一次当前活动文件。
+        QueueActiveEditorReveal();
+    }
+
+    /// <summary>活动编辑器变化时在资源管理器树中自动定位对应文件。快速切换标签时取消旧定位，
+    /// 防止较慢的目录枚举完成后把选区倒退到已经失活的文件。</summary>
+    private void QueueActiveEditorReveal()
+    {
+        var cancellation = new CancellationTokenSource();
+        var previous = Interlocked.Exchange(ref _activeEditorRevealCancellation, cancellation);
+        previous?.Cancel();
+        _ = RevealActiveEditorAsync(cancellation);
+    }
+
+    private async Task RevealActiveEditorAsync(CancellationTokenSource cancellation)
+    {
+        try
+        {
+            var relativePath = ActiveEditorProjectRelativePath();
+            if (relativePath is not null)
+            {
+                await Explorer.RevealNodeAsync(relativePath, cancellation.Token);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        {
+            LogService.Write("WARNING", $"无法在资源管理器中定位活动文件：{ex.Message}");
+        }
+        finally
+        {
+            Interlocked.CompareExchange(ref _activeEditorRevealCancellation, null, cancellation);
+            cancellation.Dispose();
+        }
+    }
+
+    private string? ActiveEditorProjectRelativePath()
+    {
+        if (string.IsNullOrWhiteSpace(Explorer.WorkspacePath))
+        {
+            return null;
+        }
+
+        var fullPath = Editor.SelectedTab switch
+        {
+            FilePreviewTab file => file.Path,
+            DiffTab diff => Path.Combine(diff.Request.RepositoryPath, diff.Request.Path),
+            _ => null,
+        };
+        if (string.IsNullOrWhiteSpace(fullPath))
+        {
+            return null;
+        }
+
+        var relative = Path.GetRelativePath(Path.GetFullPath(Explorer.WorkspacePath), Path.GetFullPath(fullPath));
+        if (relative == "." || relative == ".." || Path.IsPathRooted(relative)
+            || relative.StartsWith(".." + Path.DirectorySeparatorChar, StringComparison.Ordinal)
+            || relative.StartsWith(".." + Path.AltDirectorySeparatorChar, StringComparison.Ordinal))
+        {
+            return null;
+        }
+
+        return relative.Replace('\\', '/');
     }
 
     /// <summary>Explorer events cannot await the preview operation. Keep failures at this boundary

@@ -54,5 +54,17 @@ Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs 
 Name: "{group}\Nornia"; Filename: "{app}\Nornia.Desktop.exe"; WorkingDir: "{app}"
 Name: "{autodesktop}\Nornia"; Filename: "{app}\Nornia.Desktop.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
+; 在 Windows 资源管理器的文件夹/文件右键菜单注册"Nornia"项(当前用户,PrivilegesRequired=lowest
+; 时写 HKCU\Software\Classes,卸载时整体删除)。Directory 作用于文件夹;通配符 "*" 作用于所有文件。
+[Registry]
+Root: HKCU; Subkey: "Software\Classes\Directory\shell\Nornia"; ValueType: string; ValueName: ""; ValueData: "使用 Nornia 打开"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\Directory\shell\Nornia"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\Nornia.Desktop.exe,0"
+Root: HKCU; Subkey: "Software\Classes\Directory\shell\Nornia"; ValueType: string; ValueName: "OnlyInContextMenu"; ValueData: ""
+Root: HKCU; Subkey: "Software\Classes\Directory\shell\Nornia\command"; ValueType: string; ValueName: ""; ValueData: """{app}\Nornia.Desktop.exe"" ""%1"""
+Root: HKCU; Subkey: "Software\Classes\*\shell\Nornia"; ValueType: string; ValueName: ""; ValueData: "使用 Nornia 打开"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\*\shell\Nornia"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\Nornia.Desktop.exe,0"
+Root: HKCU; Subkey: "Software\Classes\*\shell\Nornia"; ValueType: string; ValueName: "OnlyInContextMenu"; ValueData: ""
+Root: HKCU; Subkey: "Software\Classes\*\shell\Nornia\command"; ValueType: string; ValueName: ""; ValueData: """{app}\Nornia.Desktop.exe"" ""%1"""
+
 [Run]
 Filename: "{app}\Nornia.Desktop.exe"; Description: "启动 Nornia"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent

@@ -1127,6 +1127,18 @@ public sealed class DesignSystemResourceTests
     }
 
     [Fact]
+    public void GitChangeRowInlineActions_OpenFilesInFlatAndTreeLayouts()
+    {
+        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
+
+        Assert.Equal(2, CountOccurrences(view, "ToolTip=\"打开文件\""));
+        Assert.Equal(2, CountOccurrences(view, "Content=\"{StaticResource CodiconGoToFile}\""));
+        Assert.Equal(2, CountOccurrences(view,
+            "Command=\"{Binding DataContext.OpenFilePreviewCommand, RelativeSource={RelativeSource AncestorType=views:GitView}}\""));
+        Assert.DoesNotContain("ToolTip=\"在资源管理器中显示\"", view);
+    }
+
+    [Fact]
     public void SearchRows_UseSingleLineLocationColumnAndPathToolTip()
     {
         var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/SearchSidebarView.xaml"));

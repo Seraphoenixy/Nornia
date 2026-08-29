@@ -40,6 +40,7 @@ public sealed class StorageIntegrationTests : IAsyncLifetime
         Assert.Contains("projects", tables);
         Assert.Contains("environment_profiles", tables);
         Assert.Contains("environment_bindings", tables);
+        Assert.Contains("scan_state", tables);
         // 日志类表已不再属于 schema(旧库上的残留会被清理)。
         Assert.DoesNotContain("logs", tables);
         Assert.DoesNotContain("environment_repair_logs", tables);
@@ -53,8 +54,31 @@ public sealed class StorageIntegrationTests : IAsyncLifetime
         await repository.UpsertSnapshotAsync([runtime], 100);
         await repository.UpsertSnapshotAsync([], 200);
 
+        // GetAllAsync 是"在场清单"读取(快照优先路径的唯一数据源):未再次发现的行在库内
+        // 保留 Missing 状态,但不再作为有效清单返回。
+        Assert.Empty(await repository.GetAllAsync());
+        await using var connection = _database.CreateConnection();
+        var statuses = await connection.QueryAsync<int>("SELECT status FROM runtimes;");
+        Assert.All(statuses, status => Assert.Equal((int)RuntimeStatus.Missing, status));
+    }
+
+    [Fact]
+    public async Task RuntimeSnapshot_ReadsErrorStatusBackAsBrokenDetection()
+    {
+        var repository = new RuntimeRepository(_database);
+        var broken = CreateRuntime(".NET", "0.0.0-broken") with
+        {
+            Status = RuntimeStatus.Error,
+            DetectionStatus = DetectionStatus.Broken
+        };
+        await repository.UpsertSnapshotAsync([broken], 100);
+
+        // 持久化不存检测明细:RuntimeStatus.Error 只由 Broken 检测写入,读回时据此推导,
+        // 保证快照优先路径与实时扫描在 IsBroken 展示上一致。
         var persisted = Assert.Single(await repository.GetAllAsync());
-        Assert.Equal(RuntimeStatus.Missing, persisted.Status);
+        Assert.Equal(RuntimeStatus.Error, persisted.Status);
+        Assert.Equal(DetectionStatus.Broken, persisted.DetectionStatus);
+        Assert.True(persisted.IsBroken);
     }
 
     [Fact]
@@ -66,9 +90,35 @@ public sealed class StorageIntegrationTests : IAsyncLifetime
         await repository.ReplaceSnapshotAsync([package], 100);
         await repository.ReplaceSnapshotAsync([], 200);
 
-        var persisted = Assert.Single(await repository.GetAllAsync());
-        Assert.Equal("2.56.0", persisted.AvailableVersion);
-        Assert.False(persisted.IsInstalled);
+        // 与 Runtime 同理:GetAllAsync 只返回在场记录,卸载/移除的包保留库内历史但不再返回。
+        Assert.Empty(await repository.GetAllAsync());
+        await using var connection = _database.CreateConnection();
+        var statuses = await connection.QueryAsync<int>("SELECT status FROM packages;");
+        Assert.All(statuses, status => Assert.Equal(0, status));
+    }
+
+    [Fact]
+    public async Task ScanState_RoundTripsPerKind()
+    {
+        var repository = new InventoryScanStateRepository(_database);
+        Assert.Null(await repository.GetAsync("runtimes"));
+
+        await repository.UpsertAsync(new InventoryScanState("runtimes", 1000, 42, "FP-1"));
+        await repository.UpsertAsync(new InventoryScanState("packages", 2000, 99, string.Empty));
+
+        var runtimes = await repository.GetAsync("runtimes");
+        Assert.NotNull(runtimes);
+        Assert.Equal("runtimes", runtimes.Kind);
+        Assert.Equal(1000, runtimes.ScannedAt);
+        Assert.Equal(42, runtimes.DurationMs);
+        Assert.Equal("FP-1", runtimes.Fingerprint);
+        Assert.Null(await repository.GetAsync("cache"));
+
+        // 同 kind 重复写入按主键覆盖(最新扫描胜出)。
+        await repository.UpsertAsync(new InventoryScanState("runtimes", 3000, 7, "FP-2"));
+        var latest = await repository.GetAsync("runtimes");
+        Assert.Equal(3000, latest!.ScannedAt);
+        Assert.Equal("FP-2", latest.Fingerprint);
     }
 
     [Fact]

@@ -50,6 +50,17 @@ public partial class SidebarTreeGuideLayer : FrameworkElement
 
     private void OnThemeChanged(object? sender, AppTheme theme)
     {
+        // 非宿主线程的广播归组回宿主 Dispatcher(见 CodeDocumentView.OnThemeChanged)。
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.InvokeAsync(() =>
+            {
+                _brush = null;
+                InvalidateVisual();
+            });
+            return;
+        }
+
         _brush = null;
         InvalidateVisual();
     }

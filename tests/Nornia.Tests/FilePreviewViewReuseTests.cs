@@ -31,18 +31,25 @@ public sealed class FilePreviewViewReuseTests
             window.Show();
             window.UpdateLayout();
             WpfStaContext.PumpQueue();
-            var editor = FindVisualChild<EditorAreaView>(groupView);
-            var persistentPreview = FindVisualChild<FilePreviewView>(editor);
-            Assert.Same(firstTab, persistentPreview.DataContext);
-            Assert.Equal(Visibility.Visible, persistentPreview.Visibility);
+            try
+            {
+                var editor = FindVisualChild<EditorAreaView>(groupView);
+                var persistentPreview = FindVisualChild<FilePreviewView>(editor);
+                Assert.Same(firstTab, persistentPreview.DataContext);
+                Assert.Equal(Visibility.Visible, persistentPreview.Visibility);
 
-            group.SelectedTab = secondTab;
-            window.UpdateLayout();
-            WpfStaContext.PumpQueue();
+                group.SelectedTab = secondTab;
+                window.UpdateLayout();
+                WpfStaContext.PumpQueue();
 
-            Assert.Same(persistentPreview, FindVisualChild<FilePreviewView>(editor));
-            Assert.Same(secondTab, persistentPreview.DataContext);
-            window.Close();
+                Assert.Same(persistentPreview, FindVisualChild<FilePreviewView>(editor));
+                Assert.Same(secondTab, persistentPreview.DataContext);
+            }
+            finally
+            {
+                // 已加载视图持有 ThemeEvents 强订阅;断言失败也必须卸载,避免跨测试类泄漏。
+                window.Close();
+            }
         });
     }
 
@@ -73,16 +80,23 @@ public sealed class FilePreviewViewReuseTests
             window.Show();
             window.UpdateLayout();
             WpfStaContext.PumpQueue();
-            var editor = FindVisualChild<EditorAreaView>(groupView);
-            var persistentPreview = FindVisualChild<FilePreviewView>(editor);
+            try
+            {
+                var editor = FindVisualChild<EditorAreaView>(groupView);
+                var persistentPreview = FindVisualChild<FilePreviewView>(editor);
 
-            group.SelectedTab = diffTab;
-            window.UpdateLayout();
-            WpfStaContext.PumpQueue();
+                group.SelectedTab = diffTab;
+                window.UpdateLayout();
+                WpfStaContext.PumpQueue();
 
-            Assert.Equal(Visibility.Collapsed, persistentPreview.Visibility);
-            Assert.Same(diffTab, FindVisualChild<DiffDocumentView>(editor).DataContext);
-            window.Close();
+                Assert.Equal(Visibility.Collapsed, persistentPreview.Visibility);
+                Assert.Same(diffTab, FindVisualChild<DiffDocumentView>(editor).DataContext);
+            }
+            finally
+            {
+                // 已加载视图持有 ThemeEvents 强订阅;断言失败也必须卸载,避免跨测试类泄漏。
+                window.Close();
+            }
         });
     }
 

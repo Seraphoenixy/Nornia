@@ -10,6 +10,22 @@ namespace Nornia.Tests;
 public sealed class LanguagePresentationTests
 {
     [Fact]
+    public async Task XamlComments_KeepCommentHighlightingForTextAndAcrossLines()
+    {
+        const string xaml = "<Grid><!-- same line --></Grid>\n<!-- first line\nsecond line -->\n<TextBlock />";
+        var type = CodeFileTypeRegistry.Instance.FromPath("View.xaml");
+        var snapshot = await CodePresentationService.Instance.AnalyzeAsync(xaml, type, 1);
+
+        static CodeTokenSpan TokenAt(CodePresentationSnapshot result, int line, int column) =>
+            result.Tokens.Where(token => token.Line == line && token.Start <= column && token.Start + token.Length > column).Last();
+
+        Assert.Equal(CodeTokenKind.Comment, TokenAt(snapshot, 1, 12).Kind); // same-line body
+        Assert.Equal(CodeTokenKind.Comment, TokenAt(snapshot, 2, 8).Kind);  // opening-line body
+        Assert.Equal(CodeTokenKind.Comment, TokenAt(snapshot, 3, 2).Kind);  // continuation body
+        Assert.Equal(CodeTokenRole.Comment, TokenTheme.Resolve(TokenAt(snapshot, 3, 2).Scopes)!.Role);
+    }
+
+    [Fact]
     public async Task AnalyzeAsync_UsesTextMateTokensAndKeepsVersion()
     {
         var type = CodeFileTypeRegistry.Instance.FromPath("Demo.cs");

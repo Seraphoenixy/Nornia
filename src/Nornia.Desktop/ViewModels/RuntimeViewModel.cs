@@ -23,13 +23,17 @@ public partial class RuntimeViewModel(
     IConfirmationService confirmationService,
     IUiLogService logService,
     IClipboardService? clipboard = null,
-    IUiPerformanceMetrics? performanceMetrics = null) : PageViewModel("运行库", logService), INavigationTarget
+    IUiPerformanceMetrics? performanceMetrics = null,
+    IInventoryScanStateRepository? scanStateRepository = null) : PageViewModel("运行库", logService), INavigationTarget
 {
     private readonly IClipboardService _clipboard = clipboard ?? NullClipboardService.Instance;
 
     public BulkObservableCollection<ManagedComponentItem> Runtimes { get; } = [];
     public ObservableCollection<ManagedComponentItem> SelectedRuntimes { get; } = [];
     public ICollectionView FilteredRuntimes => CollectionViewSource.GetDefaultView(Runtimes);
+
+    /// <summary>页头新鲜度提示:快照何时扫描,由 scan_state 提供(空表示不可用/未注册仓库)。</summary>
+    [ObservableProperty] private string lastScanDisplay = string.Empty;
 
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(RemoveCommand))]
@@ -39,7 +43,7 @@ public partial class RuntimeViewModel(
     [ObservableProperty] private string filterText = string.Empty;
     public string SelectedRuntimeSummary => SelectedRuntime is null ? "选择 Runtime 查看版本、路径和可用操作。" : $"{SelectedRuntime.Name} {SelectedRuntime.Version} · {SelectedRuntime.Architecture} · {SelectedRuntime.InstallPath}";
 
-    protected override Task OnFirstActivatedAsync()
+    protected override async Task OnFirstActivatedAsync()
     {
         SelectedRuntimes.CollectionChanged += (_, _) =>
         {
@@ -48,7 +52,27 @@ public partial class RuntimeViewModel(
             NotifyCopyCommands();
         };
         FilteredRuntimes.Filter = MatchesFilter;
-        return ScanAsync();
+        // 快照优先:先用持久化清单立即渲染首屏(扫描可能长达数秒),再走 TTL 门控刷新;
+        // 快照足够新且环境指纹未变时,门控刷新直接返回库内数据,不派生任何进程。
+        await SeedPersistedAsync();
+        await LoadFromInventoryAsync();
+    }
+
+    /// <summary>从持久化快照立即填充列表,失败静默(门控刷新会落回全扫兜底)。</summary>
+    private async Task SeedPersistedAsync()
+    {
+        try
+        {
+            var runtimes = await inventoryService.GetPersistedAsync();
+            var packages = await packageInventoryService.GetPersistedAsync();
+            PublishRuntimes(runtimes, packages);
+            LastScanDisplay = await InventoryScanAgeText.LoadAsync(
+                scanStateRepository, InventoryScanAgeText.RuntimeScanKind);
+        }
+        catch
+        {
+            // 持久化暂不可用(如表未建好):交给下面的门控刷新处理。
+        }
     }
 
     // ===== Copy commands (grid 复制选中 / 复制全部) =====
@@ -74,21 +98,31 @@ public partial class RuntimeViewModel(
 
     private bool CanCopyAllRuntimes() => Runtimes.Count > 0;
 
+    /// <summary>首激活的门控加载:快照新鲜时直接返回库内数据(零进程派生),否则全量扫描。</summary>
+    private Task LoadFromInventoryAsync() => RunAsync("读取运行库", async cancellationToken =>
+    {
+        SetPageLoading();
+        try
+        {
+            await ReloadRuntimesAsync(forceRescan: false, cancellationToken);
+            PublishListState();
+        }
+        catch (Exception ex)
+        {
+            SetPageError($"读取失败：{ex.Message}");
+            throw;
+        }
+    }, "确认相关命令已加入 PATH，或查看 Problems。", canCancel: true);
+
+    /// <summary>用户显式发起的扫描:永远强制重扫并更新持久化快照与 scan_state。</summary>
     [RelayCommand]
     private Task ScanAsync() => RunAsync("扫描 Runtime", async cancellationToken =>
     {
         SetPageLoading();
         try
         {
-            await ReloadRuntimesAsync(cancellationToken);
-            if (Runtimes.Count == 0)
-            {
-                SetPageEmpty("没有已扫描到的 Runtime。点击「重新扫描」开始。");
-            }
-            else
-            {
-                SetPageReady();
-            }
+            await ReloadRuntimesAsync(forceRescan: true, cancellationToken);
+            PublishListState();
         }
         catch (Exception ex)
         {
@@ -96,6 +130,18 @@ public partial class RuntimeViewModel(
             throw;
         }
     }, "确认相关命令已加入 PATH，或查看 Problems。", canCancel: true);
+
+    private void PublishListState()
+    {
+        if (Runtimes.Count == 0)
+        {
+            SetPageEmpty("没有已扫描到的 Runtime。点击「重新扫描」开始。");
+        }
+        else
+        {
+            SetPageReady();
+        }
+    }
 
     [RelayCommand(CanExecute = nameof(CanRemoveSelected))]
     private Task RemoveAsync() => RunAsync("移除 Runtime", async cancellationToken =>
@@ -146,7 +192,7 @@ public partial class RuntimeViewModel(
                 }
             }
         }
-        await ReloadRuntimesAsync(cancellationToken);
+        await ReloadRuntimesAsync(forceRescan: true, cancellationToken);
     }, "确认 Runtime 未被占用，再查看 Problems。", canCancel: true);
 
     [RelayCommand(CanExecute = nameof(CanUpgradeSelected))]
@@ -188,13 +234,26 @@ public partial class RuntimeViewModel(
                 }
             }
         }
-        await ReloadRuntimesAsync(cancellationToken);
+        await ReloadRuntimesAsync(forceRescan: true, cancellationToken);
     }, "查看 Output 中的安装器诊断后重试。", canCancel: true);
 
-    private async Task ReloadRuntimesAsync(CancellationToken cancellationToken = default)
+    /// <summary>重载运行库列表。forceRescan=true 用于显式扫描与移除/升级等变更后的重载
+    /// (两个清单都绕过合并缓存与持久化快照 TTL);false 用于页面首激活的门控加载。</summary>
+    private async Task ReloadRuntimesAsync(bool forceRescan, CancellationToken cancellationToken = default)
     {
-        var runtimes = await inventoryService.RefreshForcedAsync(cancellationToken);
-        var packages = await packageInventoryService.RefreshAsync(OperationProgress, cancellationToken);
+        var runtimes = forceRescan
+            ? await inventoryService.RefreshForcedAsync(cancellationToken)
+            : await inventoryService.RefreshAsync(cancellationToken);
+        var packages = forceRescan
+            ? await packageInventoryService.RefreshForcedAsync(OperationProgress, cancellationToken)
+            : await packageInventoryService.RefreshAsync(OperationProgress, cancellationToken);
+        PublishRuntimes(runtimes, packages);
+        LastScanDisplay = await InventoryScanAgeText.LoadAsync(
+            scanStateRepository, InventoryScanAgeText.RuntimeScanKind, cancellationToken);
+    }
+
+    private void PublishRuntimes(IReadOnlyList<CoreRuntime> runtimes, IReadOnlyList<PackageInfo> packages)
+    {
         var snapshot = runtimes
                      .Where(runtime => EnvironmentComponentCatalog.Get(runtime.Name)?.Category == EnvironmentComponentCategory.Runtime)
                      .OrderBy(runtime => runtime.Name).ThenByDescending(runtime => runtime.Version)

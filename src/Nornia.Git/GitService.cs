@@ -883,6 +883,73 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
         return RunGitAsync(repositoryPath, ["checkout", branchName], cancellationToken: cancellationToken);
     }
 
+    public async Task<IReadOnlyList<GitTagInfo>> GetTagsAsync(string repositoryPath, CancellationToken cancellationToken = default)
+    {
+        var result = await RunGitAsync(
+            repositoryPath,
+            ["for-each-ref", "--format=%(refname:short)%09%(objectname)%09%(objecttype)%00", "refs/tags"],
+            cancellationToken: cancellationToken,
+            readOnly: true);
+
+        var tags = new List<GitTagInfo>();
+        foreach (var record in result.StandardOutput.Split('\0', StringSplitOptions.RemoveEmptyEntries))
+        {
+            var fields = record.Split('\t');
+            if (fields.Length == 0 || string.IsNullOrWhiteSpace(fields[0]))
+            {
+                continue;
+            }
+
+            tags.Add(new GitTagInfo(
+                Name: fields[0].Trim(),
+                TipHash: fields.Length > 1 && !string.IsNullOrWhiteSpace(fields[1]) ? fields[1].Trim() : null,
+                IsAnnotated: fields.Length > 2 && fields[2].Trim() == "tag"));
+        }
+
+        return tags;
+    }
+
+    public Task CreateTagAsync(string repositoryPath, string tagName, bool annotate = false, string? message = null, string? targetRef = null, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(tagName);
+        var args = new List<string> { "tag" };
+        if (annotate)
+        {
+            args.Add("-a");
+            // Annotated tags without -m would open the editor and block; always pass a message.
+            args.Add("-m");
+            args.Add(string.IsNullOrWhiteSpace(message) ? string.Empty : message);
+        }
+        args.Add(tagName);
+        if (!string.IsNullOrWhiteSpace(targetRef)) args.Add(targetRef);
+        // Failure (e.g. tag already exists / invalid logger) throws and surfaces via RunAsync.
+        return RunGitAsync(repositoryPath, args, cancellationToken: cancellationToken);
+    }
+
+    public Task DeleteTagAsync(string repositoryPath, string tagName, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(tagName);
+        return RunGitAsync(repositoryPath, ["tag", "-d", tagName], cancellationToken: cancellationToken);
+    }
+
+    public Task PushTagAsync(string repositoryPath, string tagName, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(tagName);
+        return RunGitAsync(repositoryPath, ["push", "origin", tagName], cancellationToken: cancellationToken);
+    }
+
+    public Task PushAllTagsAsync(string repositoryPath, CancellationToken cancellationToken = default) =>
+        RunGitAsync(repositoryPath, ["push", "origin", "--tags"], cancellationToken: cancellationToken);
+
+    public Task FetchTagsAsync(string repositoryPath, CancellationToken cancellationToken = default) =>
+        RunGitAsync(repositoryPath, ["fetch", "--tags"], cancellationToken: cancellationToken);
+
+    public Task CheckoutTagAsync(string repositoryPath, string tagName, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(tagName);
+        return RunGitAsync(repositoryPath, ["checkout", tagName], cancellationToken: cancellationToken);
+    }
+
     public Task FetchAsync(string repositoryPath, CancellationToken cancellationToken = default) =>
         RunGitAsync(repositoryPath, ["fetch", "--prune"], cancellationToken: cancellationToken);
 

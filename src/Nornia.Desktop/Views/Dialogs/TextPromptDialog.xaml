@@ -1,0 +1,33 @@
+<Window x:Class="Nornia.Desktop.Views.Dialogs.TextPromptDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="输入"
+        WindowStyle="ToolWindow"
+        ResizeMode="NoResize"
+        SizeToContent="WidthAndHeight"
+        WindowStartupLocation="CenterOwner"
+        Background="{DynamicResource MenuBackgroundBrush}"
+        Foreground="{DynamicResource TextBrush}"
+        MinWidth="360" MaxWidth="460">
+    <StackPanel Margin="16">
+        <TextBlock x:Name="PromptText" Text="请输入标签名" Foreground="{DynamicResource MutedTextBrush}"
+                   FontSize="{DynamicResource TypeBody}" TextWrapping="Wrap" Margin="0,0,0,8" />
+        <TextBox x:Name="InputBox" FontSize="{DynamicResource TypeBody}" Padding="4"
+                 Background="{DynamicResource QuickInputBackgroundBrush}"
+                 Foreground="{DynamicResource TextBrush}"
+                 BorderBrush="{DynamicResource ButtonSplitDividerBrush}" Margin="0,0,0,10"
+                 KeyDown="InputBox_KeyDown" />
+        <CheckBox x:Name="AnnotateCheck" Content="创建注释化标签（附消息）" Foreground="{DynamicResource TextBrush}"
+                  Checked="AnnotateCheck_Checked" Unchecked="AnnotateCheck_Checked" Margin="0,0,0,8" />
+        <TextBox x:Name="MessageBox" FontSize="{DynamicResource TypeBody}" Padding="4"
+                 Height="72" AcceptsReturn="True" TextWrapping="Wrap"
+                 Background="{DynamicResource QuickInputBackgroundBrush}"
+                 Foreground="{DynamicResource TextBrush}"
+                 BorderBrush="{DynamicResource ButtonSplitDividerBrush}"
+                 Visibility="Collapsed" Margin="0,0,0,12" />
+        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button Content="取消" MinWidth="88" Margin="0,0,8,0" Padding="12,4" IsCancel="True" />
+            <Button Content="确定" MinWidth="88" Padding="12,4" Style="{StaticResource PrimaryButton}" IsDefault="True" Click="OkButton_Click" />
+        </StackPanel>
+    </StackPanel>
+</Window>

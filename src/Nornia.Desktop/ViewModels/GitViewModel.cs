@@ -1344,6 +1344,129 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
 
     private bool CanSwitchBranch(GitBranchInfo? branch) => branch is { IsCurrent: false };
 
+    // ===== Git 标签管理 =====
+
+    /// <summary>当前选中提交上的标签徽标(仅 Kind==Tag),供最近提交行右键菜单呈现每个标签的子操作。</summary>
+    public IReadOnlyList<GitLogRefBadge> SelectedLogRowTags =>
+        SelectedLogRow?.RefBadges.Where(badge => badge.IsTag).ToArray() ?? [];
+
+    /// <summary>选中提交上每个标签的完整操作节点,供最近提交行右键菜单渲染嵌套「标签」子菜单。
+    /// 数据源为 <see cref="SelectedLogRowTags"/>(仅 Kind==Tag),随选中提交变化重算。</summary>
+    public IReadOnlyList<GitTagMenuNode> SelectedLogRowTagMenus =>
+        SelectedLogRowTags
+            .Select(badge => new GitTagMenuNode(
+                badge.Name,
+                [
+                    new GitMenuCommandItem("复制标签名", CopyTagNameCommand),
+                    new GitMenuCommandItem("推送标签", PushTagCommand),
+                    new GitMenuCommandItem("检出标签", CheckoutTagCommand),
+                    new GitMenuCommandItem("删除标签", DeleteTagCommand),
+                ]))
+            .ToArray();
+
+    [RelayCommand]
+    private async Task CreateTagAtCommitAsync()
+    {
+        var row = SelectedLogRow;
+        var hash = row?.Commit.Hash;
+        await PromptAndCreateTagAsync(hash, hash is null ? "在 HEAD 创建标签" : $"在提交 {row!.Commit.ShortHash} 创建标签");
+    }
+
+    [RelayCommand]
+    private async Task CreateTagAtHeadAsync() => await PromptAndCreateTagAsync(null, "在 HEAD 创建标签");
+
+    /// <summary>弹出标签名对话框,确认后创建标签(轻量或注释化)并刷新历史徽标。</summary>
+    private async Task PromptAndCreateTagAsync(string? targetRef, string operation)
+    {
+        var owner = System.Windows.Application.Current?.MainWindow;
+        var result = Views.Dialogs.TextPromptDialog.ShowPrompt(owner, operation, "输入新标签名（可用空格分隔，不带 refs/tags/ 前缀）");
+        if (!result.Confirmed || string.IsNullOrWhiteSpace(result.Text))
+        {
+            LogService.Write("INFO", $"已取消：{operation}。");
+            return;
+        }
+
+        var name = result.Text;
+        await RunAsync(operation, async cancellationToken =>
+        {
+            await _gitService.CreateTagAsync(RepositoryPath, name, result.Annotated, result.Message, targetRef, cancellationToken);
+            await LoadStateAsync(cancellationToken);
+        }, canCancel: true);
+    }
+
+    [RelayCommand]
+    private async Task CopyTagNameAsync(string? tagName)
+    {
+        if (string.IsNullOrWhiteSpace(tagName)) return;
+        _clipboard.SetText(tagName);
+        LogService.Write("INFO", $"已复制标签名：{tagName}");
+    }
+
+    [RelayCommand]
+    private async Task PushTagAsync(string? tagName)
+    {
+        if (string.IsNullOrWhiteSpace(tagName)) return;
+        await RunAsync($"推送标签 {tagName}", async cancellationToken =>
+        {
+            await _gitService.PushTagAsync(RepositoryPath, tagName, cancellationToken);
+            await LoadStateAsync(cancellationToken);
+        }, canCancel: true);
+    }
+
+    [RelayCommand]
+    private async Task PushAllTagsAsync()
+    {
+        await RunAsync("推送全部标签", async cancellationToken =>
+        {
+            await _gitService.PushAllTagsAsync(RepositoryPath, cancellationToken);
+            await LoadStateAsync(cancellationToken);
+        }, canCancel: true);
+    }
+
+    [RelayCommand]
+    private async Task FetchTagsAsync()
+    {
+        await RunAsync("拉取所有标签", async cancellationToken =>
+        {
+            await _gitService.FetchTagsAsync(RepositoryPath, cancellationToken);
+            await LoadStateAsync(cancellationToken);
+        }, canCancel: true);
+    }
+
+    [RelayCommand]
+    private async Task DeleteTagAsync(string? tagName)
+    {
+        if (string.IsNullOrWhiteSpace(tagName)) return;
+        if (!_confirmationService.Confirm("删除标签", $"确定删除本地标签“{tagName}”？该操作不可撤销（远端标签需另行删除）。"))
+        {
+            LogService.Write("INFO", $"已取消删除标签：{tagName}。");
+            return;
+        }
+
+        await RunAsync($"删除标签 {tagName}", async cancellationToken =>
+        {
+            await _gitService.DeleteTagAsync(RepositoryPath, tagName, cancellationToken);
+            await LoadStateAsync(cancellationToken);
+        }, canCancel: true);
+    }
+
+    [RelayCommand]
+    private async Task CheckoutTagAsync(string? tagName)
+    {
+        if (string.IsNullOrWhiteSpace(tagName)) return;
+        if (!_confirmationService.Confirm("检出标签", $"将检出到标签“{tagName}”，HEAD 会进入分离状态（detached HEAD）。此后提交不归属于任何分支，建议先在目标分支上新建分支再继续开发。确定继续？"))
+        {
+            LogService.Write("INFO", $"已取消检出标签：{tagName}。");
+            return;
+        }
+
+        await RunAsync($"检出标签 {tagName}", async cancellationToken =>
+        {
+            await _gitService.CheckoutTagAsync(RepositoryPath, tagName, cancellationToken);
+            await LoadStateAsync(cancellationToken);
+        }, "已在分离 HEAD 状态；如需继续开发，请先创建或切换到新分支。", canCancel: true);
+    }
+
     // ===== Section expansion (session-only) =====
 
     [RelayCommand]
@@ -2613,7 +2736,7 @@ public sealed partial class GitLogRow : ObservableObject
                     : reference.Kind == GitRefKind.Tag
                         ? "InfoAccentBrush"
                         : $"GraphLane{(GitViewModel.StableHash(reference.Name) % 6) + 1}Brush";
-            badges.Add(new GitLogRefBadge(reference.Name, glyph, colorKey));
+            badges.Add(new GitLogRefBadge(reference.Name, glyph, colorKey, reference.Kind));
         }
 
         RefBadges = badges;
@@ -2655,14 +2778,15 @@ public sealed partial class GitLogRow : ObservableObject
     {
         get
         {
-            var body = string.IsNullOrWhiteSpace(Commit.Body) ? string.Empty : "\n" + Commit.Body.Trim();
-            return $"提交: {Commit.ShortHash} ({Commit.Hash})\n提交人: {Commit.AuthorName} <{Commit.AuthorEmail}>\n提交时间: {Commit.AuthorDate:yyyy-MM-dd HH:mm}（距今 {CommitAgeText}）\n{Commit.Subject}{body}";
+            return $"提交: {Commit.ShortHash} ({Commit.Hash})\n提交人: {Commit.AuthorName} <{Commit.AuthorEmail}>\n提交时间: {Commit.AuthorDate:yyyy-MM-dd HH:mm}（距今 {CommitAgeText}）\n{FullMessage}";
         }
     }
 
     /// <summary>提交信息全文(主题 + 正文),交悬浮窗的 markdown 渲染器使用。</summary>
     public string FullMessage =>
-        string.IsNullOrWhiteSpace(Commit.Body) ? Commit.Subject : Commit.Subject + "\n\n" + Commit.Body;
+        !string.IsNullOrWhiteSpace(Commit.Message)
+            ? Commit.Message.TrimEnd()
+            : string.IsNullOrWhiteSpace(Commit.Body) ? Commit.Subject : Commit.Subject + "\n\n" + Commit.Body;
 
     /// <summary>提交时间相对当前本地时间的间隔,用于悬浮窗中的人类可读时间提示。</summary>
     public string CommitAgeText => FormatCommitAge(Commit.AuthorDate, DateTimeOffset.Now);
@@ -2711,9 +2835,19 @@ public sealed partial class GitLogRow : ObservableObject
     public override int GetHashCode() => Commit.GetHashCode();
 }
 
-/// <summary>提交行/悬浮窗里的一个分支徽标:显示名 + 图标字形(本地分支 git-branch,
-/// 远端分支 cloud)+ 分支色键(主题令牌名,与图形泳道同源,随主题换肤)。</summary>
-public sealed record GitLogRefBadge(string Name, string Glyph, string ColorKey);
+/// <summary>提交行/悬浮窗里的一个引用徽标:显示名 + 图标字形(本地分支 git-branch,
+/// 远端分支 cloud,标签 tag)+ 分支色键(主题令牌名,与图形泳道同源,随主题换肤)+ 引用类型,
+/// 用于让"标签操作"仅对标签徽标生效。</summary>
+public sealed record GitLogRefBadge(string Name, string Glyph, string ColorKey, GitRefKind Kind)
+{
+    public bool IsTag => Kind == GitRefKind.Tag;
+}
+
+/// <summary>右键子菜单里一项可执行操作(标题 + 命令)。</summary>
+public sealed record GitMenuCommandItem(string Header, System.Windows.Input.ICommand Command);
+
+/// <summary>「选中提交的标签」子菜单中的一个标签节点(标签名 + 它的全部操作)。</summary>
+public sealed record GitTagMenuNode(string TagName, IReadOnlyList<GitMenuCommandItem> Actions);
 
 /// <summary>折叠栏内联的一个更改文件:包住 <see cref="GitFileChange"/> 并提供显示派生与所属行
 /// (行携带提交哈希,点击文件即可打开该提交的 diff)。</summary>

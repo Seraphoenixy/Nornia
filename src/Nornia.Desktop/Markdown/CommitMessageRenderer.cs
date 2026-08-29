@@ -127,7 +127,7 @@ public static class CommitMessageRenderer
         if (line.Length >= 2 && (line[0] == '-' || line[0] == '*' || line[0] == '+') && line[1] == ' ')
         {
             var itemParagraph = NewParagraph();
-            itemParagraph.Padding = new Thickness(14, 0, 0, 0);
+            itemParagraph.Padding = new Thickness(6, 0, 0, 0);
             var bullet = new Run("• ") { Foreground = Resolve("MutedTextBrush") };
             itemParagraph.Inlines.Add(bullet);
             AppendInline(itemParagraph, line[2..]);
@@ -139,7 +139,7 @@ public static class CommitMessageRenderer
         if (ordered)
         {
             var itemParagraph = NewParagraph();
-            itemParagraph.Padding = new Thickness(14, 0, 0, 0);
+            itemParagraph.Padding = new Thickness(6, 0, 0, 0);
             var bullet = new Run($"{line[..numberLength].TrimEnd('.', ')')}. ") { Foreground = Resolve("MutedTextBrush") };
             itemParagraph.Inlines.Add(bullet);
             AppendInline(itemParagraph, line[numberLength..].TrimStart());

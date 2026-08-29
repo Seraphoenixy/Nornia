@@ -650,6 +650,8 @@ public sealed class TextMateLanguageTokenizer : ILanguageTokenizer
             var tokens = new List<CodeTokenSpan>();
             var lineNumber = 1;
             IStateStack state = StateStack.NULL;
+            var repairXmlComments = _profile.LanguageId is "xml" or "xaml";
+            var inXmlComment = false;
             var lineStart = 0;
             while (lineStart <= text.Length)
             {
@@ -659,6 +661,7 @@ public sealed class TextMateLanguageTokenizer : ILanguageTokenizer
                 var length = newline < 0 ? remaining.Length : newline;
                 if (length > 0 && remaining[length - 1] == '\r') length--;
                 var line = text.Slice(lineStart, length);
+                var lineTokenStart = tokens.Count;
                 if ((lineNumber - 1) % 256 == 0) _checkpoints[lineNumber] = state;
                 if (line.Length <= MaxTokenizedLineLength)
                 {
@@ -670,6 +673,14 @@ public sealed class TextMateLanguageTokenizer : ILanguageTokenizer
                         state = result.RuleStack;
                         AppendTokens(tokens, result.Tokens, _profile, lineNumber, line);
                     }
+                }
+                if (repairXmlComments)
+                {
+                    // TextMateSharp.Grammars 2.0.4 的 XML grammar 会标记 <!-- / -->，却把
+                    // 二者之间的正文发成 text.xml / Plain。用 grammar 已确认的起始标记维护
+                    // 跨行状态，并在最后追加覆盖 token，使 XAML/XML 注释全文使用注释色。
+                    AppendXmlCommentRepairTokens(tokens, lineTokenStart, tokens.Count,
+                        lineNumber, line.Span, ref inXmlComment);
                 }
                 // 超长行(> MaxTokenizedLineLength,对标 vscode editor.maxTokenizationLineLength=2000
                 // "Lines above this length will not be tokenized for performance reasons")整体
@@ -709,6 +720,61 @@ public sealed class TextMateLanguageTokenizer : ILanguageTokenizer
                 }
                 var tokenLength = Math.Max(0, token.EndIndex - token.StartIndex);
                 if (tokenLength > 0) tokens.Add(new CodeTokenSpan(lineNumber, token.StartIndex, tokenLength, kind, token.Scopes.ToArray()));
+            }
+        }
+
+        private static void AppendXmlCommentRepairTokens(
+            List<CodeTokenSpan> tokens,
+            int grammarTokenStart,
+            int grammarTokenEnd,
+            int lineNumber,
+            ReadOnlySpan<char> line,
+            ref bool inComment)
+        {
+            var scan = 0;
+            while (scan < line.Length)
+            {
+                if (!inComment)
+                {
+                    var opening = -1;
+                    for (var index = grammarTokenStart; index < grammarTokenEnd; index++)
+                    {
+                        var token = tokens[index];
+                        if (token.Start < scan || token.Start + 4 > line.Length
+                            || !line.Slice(token.Start, 4).SequenceEqual("<!--"))
+                        {
+                            continue;
+                        }
+
+                        if (token.Kind == CodeTokenKind.Comment)
+                        {
+                            opening = token.Start;
+                            break;
+                        }
+                    }
+
+                    if (opening < 0)
+                    {
+                        return;
+                    }
+
+                    scan = opening;
+                    inComment = true;
+                }
+
+                var closingOffset = line[scan..].IndexOf("-->");
+                if (closingOffset < 0)
+                {
+                    tokens.Add(new CodeTokenSpan(lineNumber, scan, line.Length - scan,
+                        CodeTokenKind.Comment, ["text.xml", "comment.block.xml"]));
+                    return;
+                }
+
+                var end = scan + closingOffset + 3;
+                tokens.Add(new CodeTokenSpan(lineNumber, scan, end - scan,
+                    CodeTokenKind.Comment, ["text.xml", "comment.block.xml"]));
+                inComment = false;
+                scan = end;
             }
         }
 

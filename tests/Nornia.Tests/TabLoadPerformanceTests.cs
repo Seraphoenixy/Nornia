@@ -454,6 +454,27 @@ internal sealed class GatedFakeGitService : IGitService
     public Task<IReadOnlyList<GitCommitInfo>> GetOutgoingCommitsAsync(string repositoryPath, string upstreamReference, int count = 30, CancellationToken cancellationToken = default) =>
         Task.FromResult<IReadOnlyList<GitCommitInfo>>([]);
 
+    public Task<IReadOnlyList<GitTagInfo>> GetTagsAsync(string repositoryPath, CancellationToken cancellationToken = default) =>
+        Task.FromResult<IReadOnlyList<GitTagInfo>>([]);
+
+    public Task CreateTagAsync(string repositoryPath, string tagName, bool annotate = false, string? message = null, string? targetRef = null, CancellationToken cancellationToken = default) =>
+        Task.CompletedTask;
+
+    public Task DeleteTagAsync(string repositoryPath, string tagName, CancellationToken cancellationToken = default) =>
+        Task.CompletedTask;
+
+    public Task PushTagAsync(string repositoryPath, string tagName, CancellationToken cancellationToken = default) =>
+        Task.CompletedTask;
+
+    public Task PushAllTagsAsync(string repositoryPath, CancellationToken cancellationToken = default) =>
+        Task.CompletedTask;
+
+    public Task FetchTagsAsync(string repositoryPath, CancellationToken cancellationToken = default) =>
+        Task.CompletedTask;
+
+    public Task CheckoutTagAsync(string repositoryPath, string tagName, CancellationToken cancellationToken = default) =>
+        Task.CompletedTask;
+
     public Task<IReadOnlyList<GitStashInfo>> GetStashesAsync(string repositoryPath, CancellationToken cancellationToken = default) =>
         Task.FromResult<IReadOnlyList<GitStashInfo>>([]);
 

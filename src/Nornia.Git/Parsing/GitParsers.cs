@@ -581,9 +581,10 @@ public sealed partial class GitDiffStreamParser(string path, bool staged)
 public static class GitLogParser
 {
     /// <summary>字段 8 为 <c>git log --decorate=full</c> 下的 <c>%D</c> 引用清单,形如
-    /// <c>HEAD -&gt; refs/heads/main, refs/remotes/origin/main</c>;无引用时为空。</summary>
+    /// <c>HEAD -&gt; refs/heads/main, refs/remotes/origin/main</c>;字段 9 的 <c>%B</c>
+    /// 保留完整提交消息及原始换行,避免 <c>%s</c> 把同一段落中的列表折叠成一行。</summary>
     public const string Format =
-        "%H%x1f%h%x1f%s%x1f%an%x1f%ae%x1f%aI%x1f%b%x1f%P%x1f%D%x1e";
+        "%H%x1f%h%x1f%s%x1f%an%x1f%ae%x1f%aI%x1f%b%x1f%P%x1f%D%x1f%B%x1e";
 
     public static IReadOnlyList<GitCommitInfo> Parse(string output)
     {
@@ -639,7 +640,8 @@ public static class GitLogParser
                 fields.Length > 7
                     ? fields[7].Split(' ', StringSplitOptions.RemoveEmptyEntries)
                     : null,
-                fields.Length > 8 ? ParseRefs(fields[8]) : null));
+                fields.Length > 8 ? ParseRefs(fields[8]) : null,
+                Message: fields.Length > 9 ? fields[9].TrimEnd('\r', '\n') : null));
             commitChunks.Add(chunkIndex);
         }
 

@@ -322,9 +322,9 @@
             </Style>
           </StackPanel.Style>
           <!-- 更改行动作(参数:平铺行传 GitChangeItem,树状行传其 Change,与原模板一致) -->
-          <Button Style="{StaticResource ScmChangeOnlyActionButtonStyle}" Content="{StaticResource CodiconOpenInWindow}" FontFamily="{StaticResource IconFontFamily}"
-                  ToolTip="在资源管理器中显示"
-                  Command="{Binding DataContext.RevealInExplorerCommand, RelativeSource={RelativeSource AncestorType=views:GitView}}"
+          <Button Style="{StaticResource ScmChangeOnlyActionButtonStyle}" Content="{StaticResource CodiconGoToFile}" FontFamily="{StaticResource IconFontFamily}"
+                  ToolTip="打开文件"
+                  Command="{Binding DataContext.OpenFilePreviewCommand, RelativeSource={RelativeSource AncestorType=views:GitView}}"
                   CommandParameter="{Binding Converter={StaticResource ScmFileRow}, ConverterParameter=ChangeTarget}" />
           <Button Style="{StaticResource ScmUnstagedActionButtonStyle}" Content="{StaticResource CodiconAdd}" FontFamily="{StaticResource IconFontFamily}" ToolTip="暂存"
                   Command="{Binding DataContext.StageChangeCommand, RelativeSource={RelativeSource AncestorType=views:GitView}}"
@@ -527,9 +527,9 @@
               </Style.Triggers>
             </Style>
           </StackPanel.Style>
-          <Button Style="{StaticResource ScmChangeRowActionButtonStyle}" Content="{StaticResource CodiconOpenInWindow}" FontFamily="{StaticResource IconFontFamily}"
-                  ToolTip="在资源管理器中显示"
-                  Command="{Binding DataContext.RevealInExplorerCommand, RelativeSource={RelativeSource AncestorType=views:GitView}}" CommandParameter="{Binding Change}" />
+          <Button Style="{StaticResource ScmChangeRowActionButtonStyle}" Content="{StaticResource CodiconGoToFile}" FontFamily="{StaticResource IconFontFamily}"
+                  ToolTip="打开文件"
+                  Command="{Binding DataContext.OpenFilePreviewCommand, RelativeSource={RelativeSource AncestorType=views:GitView}}" CommandParameter="{Binding Change}" />
           <Button Style="{StaticResource ScmUnstagedActionButtonStyle}" Content="{StaticResource CodiconAdd}" FontFamily="{StaticResource IconFontFamily}" ToolTip="暂存"
                   Command="{Binding DataContext.StageChangeCommand, RelativeSource={RelativeSource AncestorType=views:GitView}}" CommandParameter="{Binding Change}" />
           <Button Style="{StaticResource ScmStagedActionButtonStyle}" Content="{StaticResource CodiconRemove}" FontFamily="{StaticResource IconFontFamily}" ToolTip="取消暂存"
@@ -1226,6 +1226,16 @@
                   <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconCloudDownload}" FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconInline}" ToolTip="拉取（快进）" Command="{Binding PullCommand}" Margin="0" />
                   <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconCloudUpload}" FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconInline}" ToolTip="推送" Command="{Binding PushCommand}" Margin="0" />
                   <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconSync}" FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconInline}" ToolTip="安全同步" Command="{Binding SyncCommand}" Margin="0" Foreground="{DynamicResource SuccessBrush}" />
+                  <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconMore}" FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconInline}" ToolTip="更多操作" Margin="0" Click="MoreActionsButton_Click">
+                    <Button.ContextMenu>
+                      <ContextMenu>
+                        <MenuItem Header="在 HEAD 创建标签…" Command="{Binding CreateTagAtHeadCommand}" />
+                        <Separator />
+                        <MenuItem Header="拉取所有标签" Command="{Binding FetchTagsCommand}" />
+                        <MenuItem Header="推送全部标签" Command="{Binding PushAllTagsCommand}" />
+                      </ContextMenu>
+                    </Button.ContextMenu>
+                  </Button>
                 </StackPanel>
               </Grid>
             <!-- 最近提交：左缘提交图形（VS Code 图表列），底部按页加载更多 -->
@@ -1254,6 +1264,36 @@
                   <ContextMenu>
                     <MenuItem Header="复制哈希" Command="{Binding CopyCommitHashesCommand}" InputGestureText="Ctrl+C" />
                     <MenuItem Header="复制主题" Command="{Binding CopyCommitSubjectsCommand}" />
+                    <Separator />
+                    <MenuItem Header="在此提交创建标签…" Command="{Binding CreateTagAtCommitCommand}" />
+                    <!-- 选中提交上含标签时,为每个标签呈现一项嵌套子菜单(复制/推送/检出/删除);无标签时整项隐藏 -->
+                    <MenuItem Header="选中提交的标签" ItemsSource="{Binding SelectedLogRowTagMenus}">
+                      <MenuItem.Style>
+                        <Style TargetType="MenuItem">
+                          <Setter Property="Visibility" Value="Visible" />
+                          <Style.Triggers>
+                            <DataTrigger Binding="{Binding SelectedLogRowTags.Count}" Value="0">
+                              <Setter Property="Visibility" Value="Collapsed" />
+                            </DataTrigger>
+                          </Style.Triggers>
+                        </Style>
+                      </MenuItem.Style>
+                      <MenuItem.ItemContainerStyle>
+                        <Style TargetType="MenuItem">
+                          <Setter Property="Header" Value="{Binding TagName}" />
+                          <Setter Property="ItemsSource" Value="{Binding Actions}" />
+                          <Setter Property="ItemContainerStyle">
+                            <Setter.Value>
+                              <Style TargetType="MenuItem">
+                                <Setter Property="Header" Value="{Binding Header}" />
+                                <Setter Property="Command" Value="{Binding Command}" />
+                                <Setter Property="CommandParameter" Value="{Binding TagName, RelativeSource={RelativeSource AncestorType=MenuItem}}" />
+                              </Style>
+                            </Setter.Value>
+                          </Setter>
+                        </Style>
+                      </MenuItem.ItemContainerStyle>
+                    </MenuItem>
                   </ContextMenu>
                 </ListBox.ContextMenu>
               </ListBox>

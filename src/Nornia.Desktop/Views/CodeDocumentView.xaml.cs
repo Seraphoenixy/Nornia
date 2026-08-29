@@ -1571,7 +1571,19 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
         CodeEditor.TextArea.TextView.Redraw();
     }
 
-    private void OnThemeChanged(object? sender, AppTheme theme) => ApplyTheme();
+    private void OnThemeChanged(object? sender, AppTheme theme)
+    {
+        // 主题广播在生产路径恒为 UI 线程;测试进程里 xunit 并行测试类可能从工作线程 Raise,
+        // 而已加载视图(含未及卸载的残留实例)的订阅会收到回调——非宿主线程只归组回宿主
+        // Dispatcher,避免跨线程触碰 DependencyObject(其余视图订阅者同此模式)。
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.InvokeAsync(ApplyTheme);
+            return;
+        }
+
+        ApplyTheme();
+    }
 
     private Brush? Brush(string key) => TryFindResource(key) as Brush ?? Application.Current?.TryFindResource(key) as Brush;
 

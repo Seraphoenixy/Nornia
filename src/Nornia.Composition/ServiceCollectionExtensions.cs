@@ -36,6 +36,7 @@ public static class ServiceCollectionExtensions
             .AddSingleton<IPackageRepository, PackageRepository>()
             .AddSingleton<IProjectRepository, ProjectRepository>()
             .AddSingleton<IEnvironmentProfileRepository, EnvironmentProfileRepository>()
+            .AddSingleton<IInventoryScanStateRepository, InventoryScanStateRepository>()
             // 环境修复明细存数据目录下的 JSON Lines 文件,不进数据库。
             .AddSingleton<IEnvironmentRepairLogRepository, EnvironmentRepairLogStore>()
             .AddSingleton<IDashboardSummaryReader, SummaryRepository>()
@@ -50,6 +51,8 @@ public static class ServiceCollectionExtensions
             .AddSingleton<IRuntimeProvider, VisualCppRedistributableProvider>()
             .AddSingleton<IRuntimeProvider, WindowsAppRuntimeProvider>()
             .AddSingleton<IRuntimeDiscoveryService, RuntimeDiscoveryService>()
+            // Cheap (no process spawn) environment probe backing the persisted-snapshot TTL gate.
+            .AddSingleton<IEnvironmentFingerprintProvider, EnvironmentFingerprintProvider>()
             .AddSingleton<EnvironmentInventoryService>()
             .AddSingleton<IRuntimeInventoryService>(provider => provider.GetRequiredService<EnvironmentInventoryService>())
 

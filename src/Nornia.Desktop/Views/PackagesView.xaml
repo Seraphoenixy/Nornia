@@ -31,6 +31,8 @@
     <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="*" /></Grid.RowDefinitions>
     <StackPanel>
       <TextBlock Text="软件包" Style="{StaticResource PageTitleStyle}" />
+      <TextBlock Text="{Binding LastScanDisplay}" Foreground="{DynamicResource MutedTextBrush}" FontSize="{DynamicResource TypeBadge}"
+                 TextTrimming="CharacterEllipsis" Visibility="{Binding LastScanDisplay, Converter={StaticResource StringEmptyToCollapsedConverter}}" />
     </StackPanel>
 
     <TabControl Grid.Row="1" SelectedIndex="{Binding SelectedWorkspaceTab}" Margin="{StaticResource GapMd}" VerticalContentAlignment="Stretch" Background="Transparent" BorderBrush="{DynamicResource BorderBrush}">

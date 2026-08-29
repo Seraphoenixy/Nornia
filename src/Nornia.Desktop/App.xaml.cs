@@ -41,6 +41,8 @@ public partial class App : Application
     protected override async void OnStartup(StartupEventArgs e)
     {
         ShutdownMode = ShutdownMode.OnMainWindowClose;
+        // Windows 右键菜单"Nornia 打开"传入的路径(目录或文件,取首个确实存在的参数)。
+        var contextArg = e.Args.FirstOrDefault(arg => Directory.Exists(arg) || File.Exists(arg));
         // 数据根目录(Roaming):最先创建,后续设置/状态/数据库/日志直接落此目录。
         Directory.CreateDirectory(NorniaPaths.DataDirectory);
         var logDirectory = Path.Combine(NorniaPaths.DataDirectory, "logs");
@@ -182,6 +184,29 @@ public partial class App : Application
         // 数据库失败已在 InitializeDatabaseAsync 内处理(写日志 + 弹错 + 退出)。
         await _services.GetRequiredService<AppearanceSettingsController>().StartAsync();
         await databaseReady;
+
+        // 右键菜单"Nornia 打开"传入的路径(窗口与数据库就绪后执行):目录作为项目打开
+        // (加载资源管理器/终端/Git,并在项目目录登记);文件不打开项目,仅在编辑器视图打开该文件。
+        if (contextArg is not null)
+        {
+            try
+            {
+                if (Directory.Exists(contextArg))
+                {
+                    var explorer = _services.GetRequiredService<ExplorerPageViewModel>();
+                    await explorer.OpenProjectPathAsync(contextArg);
+                }
+                else
+                {
+                    var editor = _services.GetRequiredService<EditorAreaViewModel>();
+                    await editor.OpenFileAsync(contextArg, permanent: true);
+                }
+            }
+            catch (Exception exception)
+            {
+                Log.Warning(exception, "Failed to open path from command line: {Path}", contextArg);
+            }
+        }
     }
 
     /// <summary>每次进程启动创建独立日志文件，避免同一天的多次启动继续追加到同一文件。

@@ -206,6 +206,27 @@ public sealed class ExplorerPageViewModelTests : IDisposable
     }
 
     [Fact]
+    public async Task ActiveEditorFile_IsSelectedAndRevealedInExplorerTree()
+    {
+        var (page, _, _, _, _) = Create();
+        var first = Path.Combine(_projectPath, "src", "A.cs");
+        var second = Path.Combine(_projectPath, "src", "nested", "B.cs");
+        Directory.CreateDirectory(Path.GetDirectoryName(second)!);
+        await File.WriteAllTextAsync(first, "first");
+        await File.WriteAllTextAsync(second, "second");
+        await page.OpenProjectPathAsync(_projectPath);
+
+        await page.Editor.OpenFileAsync(first, permanent: true);
+        await WaitUntilAsync(() => page.Explorer.SelectedTreeRow?.Node.Path == first);
+        Assert.Equal(first, page.Explorer.SelectedTreeRow?.Node.Path);
+
+        await page.Editor.OpenFileAsync(second, permanent: true);
+        await WaitUntilAsync(() => page.Explorer.SelectedTreeRow?.Node.Path == second);
+        Assert.Equal(second, page.Explorer.SelectedTreeRow?.Node.Path);
+        Assert.True(page.Explorer.RootNodes[0].Children.Single(node => node.Name == "src").IsExpanded);
+    }
+
+    [Fact]
     public async Task OpenProjectPathAsync_SyncsProjectWorkflowPath()
     {
         var (page, _, _, _, _) = Create();
@@ -234,5 +255,16 @@ public sealed class ExplorerPageViewModelTests : IDisposable
         Assert.NotNull(info);
         Assert.False(info!.Value.IsStaged);
         Assert.False(info.Value.IsUntracked);
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        var deadline = Environment.TickCount64 + 5_000;
+        while (!condition() && Environment.TickCount64 < deadline)
+        {
+            await Task.Delay(10);
+        }
+
+        Assert.True(condition(), "等待资源管理器同步活动文件超时。");
     }
 }

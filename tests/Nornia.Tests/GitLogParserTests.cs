@@ -27,6 +27,23 @@ public sealed class GitLogParserTests
     }
 
     [Fact]
+    public void Parse_PreservesRawMessageLineBreaksWhenGitSubjectFlattensAParagraph()
+    {
+        var rawMessage = "feat: improve git\n- render markdown\n- allow selection";
+        var output = string.Join('\x1f',
+        [
+            "a".PadRight(40, '0'), "aaaaaaa",
+            "feat: improve git - render markdown - allow selection",
+            "Alice", "alice@example.com", "2025-01-02T10:20:30+08:00",
+            "", "", "", rawMessage
+        ]) + "\x1e";
+
+        var commit = Assert.Single(GitLogParser.Parse(output));
+
+        Assert.Equal(rawMessage, commit.Message);
+    }
+
+    [Fact]
     public void Parse_EmptyOutputReturnsEmptyList()
     {
         Assert.Empty(GitLogParser.Parse(string.Empty));

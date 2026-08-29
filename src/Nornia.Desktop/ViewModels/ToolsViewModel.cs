@@ -21,13 +21,17 @@ public partial class ToolsViewModel(
     IConfirmationService confirmationService,
     IUiLogService logService,
     IClipboardService? clipboard = null,
-    IUiPerformanceMetrics? performanceMetrics = null) : PageViewModel("开发工具", logService), INavigationTarget
+    IUiPerformanceMetrics? performanceMetrics = null,
+    IInventoryScanStateRepository? scanStateRepository = null) : PageViewModel("开发工具", logService), INavigationTarget
 {
     private readonly IClipboardService _clipboard = clipboard ?? NullClipboardService.Instance;
 
     public BulkObservableCollection<ManagedComponentItem> Tools { get; } = [];
     public ObservableCollection<ManagedComponentItem> SelectedTools { get; } = [];
     public ICollectionView FilteredTools => CollectionViewSource.GetDefaultView(Tools);
+
+    /// <summary>页头新鲜度提示:快照何时扫描,由 scan_state 提供(空表示不可用/未注册仓库)。</summary>
+    [ObservableProperty] private string lastScanDisplay = string.Empty;
 
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(RemoveCommand))]
@@ -37,7 +41,7 @@ public partial class ToolsViewModel(
     [ObservableProperty] private string filterText = string.Empty;
     public string SelectedToolSummary => SelectedTool is null ? "选择开发工具查看版本、路径和可用操作。" : $"{SelectedTool.Name} {SelectedTool.Version} · {SelectedTool.Architecture} · {SelectedTool.InstallPath}";
 
-    protected override Task OnFirstActivatedAsync()
+    protected override async Task OnFirstActivatedAsync()
     {
         SelectedTools.CollectionChanged += (_, _) =>
         {
@@ -46,7 +50,27 @@ public partial class ToolsViewModel(
             NotifyCopyCommands();
         };
         FilteredTools.Filter = MatchesFilter;
-        return ScanAsync();
+        // 快照优先:先用持久化清单立即渲染首屏,再走 TTL 门控刷新;快照足够新且环境指纹
+        // 未变时,门控刷新直接返回库内数据,不派生任何进程。
+        await SeedPersistedAsync();
+        await LoadFromInventoryAsync();
+    }
+
+    /// <summary>从持久化快照立即填充列表,失败静默(门控刷新会落回全扫兜底)。</summary>
+    private async Task SeedPersistedAsync()
+    {
+        try
+        {
+            var tools = await inventoryService.GetPersistedAsync();
+            var packages = await packageInventoryService.GetPersistedAsync();
+            PublishTools(tools, packages);
+            LastScanDisplay = await InventoryScanAgeText.LoadAsync(
+                scanStateRepository, InventoryScanAgeText.RuntimeScanKind);
+        }
+        catch
+        {
+            // 持久化暂不可用(如表未建好):交给下面的门控刷新处理。
+        }
     }
 
     // ===== Copy commands (grid 复制选中 / 复制全部) =====
@@ -72,21 +96,31 @@ public partial class ToolsViewModel(
 
     private bool CanCopyAllTools() => Tools.Count > 0;
 
+    /// <summary>首激活的门控加载:快照新鲜时直接返回库内数据(零进程派生),否则全量扫描。</summary>
+    private Task LoadFromInventoryAsync() => RunAsync("读取开发工具", async cancellationToken =>
+    {
+        SetPageLoading();
+        try
+        {
+            await ReloadToolsAsync(forceRescan: false, cancellationToken);
+            PublishListState();
+        }
+        catch (Exception ex)
+        {
+            SetPageError($"读取失败：{ex.Message}");
+            throw;
+        }
+    }, "确认相关命令已加入 PATH，或查看 Problems。", canCancel: true);
+
+    /// <summary>用户显式发起的扫描:永远强制重扫并更新持久化快照与 scan_state。</summary>
     [RelayCommand]
     private Task ScanAsync() => RunAsync("扫描开发工具", async cancellationToken =>
     {
         SetPageLoading();
         try
         {
-            await ReloadToolsAsync(cancellationToken);
-            if (Tools.Count == 0)
-            {
-                SetPageEmpty("没有已扫描到的开发工具。点击「重新扫描」开始。");
-            }
-            else
-            {
-                SetPageReady();
-            }
+            await ReloadToolsAsync(forceRescan: true, cancellationToken);
+            PublishListState();
         }
         catch (Exception ex)
         {
@@ -94,6 +128,18 @@ public partial class ToolsViewModel(
             throw;
         }
     }, "确认相关命令已加入 PATH，或查看 Problems。", canCancel: true);
+
+    private void PublishListState()
+    {
+        if (Tools.Count == 0)
+        {
+            SetPageEmpty("没有已扫描到的开发工具。点击「重新扫描」开始。");
+        }
+        else
+        {
+            SetPageReady();
+        }
+    }
 
     [RelayCommand(CanExecute = nameof(CanRemoveSelected))]
     private Task RemoveAsync() => RunAsync("移除开发工具", async cancellationToken =>
@@ -129,7 +175,7 @@ public partial class ToolsViewModel(
                 await packageProvider.UninstallAsync(package.PackageId, null, OperationProgress, cancellationToken);
             }
         }
-        await ReloadToolsAsync(cancellationToken);
+        await ReloadToolsAsync(forceRescan: true, cancellationToken);
     }, "确认工具未被占用，再查看 Problems。", canCancel: true);
 
     [RelayCommand(CanExecute = nameof(CanUpgradeSelected))]
@@ -156,13 +202,26 @@ public partial class ToolsViewModel(
                 await packageProvider.UpgradeAsync(package.PackageId, OperationProgress, cancellationToken);
             }
         }
-        await ReloadToolsAsync(cancellationToken);
+        await ReloadToolsAsync(forceRescan: true, cancellationToken);
     }, "查看 Output 中的安装器诊断后重试。", canCancel: true);
 
-    private async Task ReloadToolsAsync(CancellationToken cancellationToken = default)
+    /// <summary>重载开发工具列表。forceRescan=true 用于显式扫描与移除/升级等变更后的重载
+    /// (两个清单都绕过合并缓存与持久化快照 TTL);false 用于页面首激活的门控加载。</summary>
+    private async Task ReloadToolsAsync(bool forceRescan, CancellationToken cancellationToken = default)
     {
-        var tools = await inventoryService.RefreshForcedAsync(cancellationToken);
-        var packages = await packageInventoryService.RefreshAsync(OperationProgress, cancellationToken);
+        var tools = forceRescan
+            ? await inventoryService.RefreshForcedAsync(cancellationToken)
+            : await inventoryService.RefreshAsync(cancellationToken);
+        var packages = forceRescan
+            ? await packageInventoryService.RefreshForcedAsync(OperationProgress, cancellationToken)
+            : await packageInventoryService.RefreshAsync(OperationProgress, cancellationToken);
+        PublishTools(tools, packages);
+        LastScanDisplay = await InventoryScanAgeText.LoadAsync(
+            scanStateRepository, InventoryScanAgeText.RuntimeScanKind, cancellationToken);
+    }
+
+    private void PublishTools(IReadOnlyList<CoreRuntime> tools, IReadOnlyList<PackageInfo> packages)
+    {
         var snapshot = tools
                      .Where(tool => EnvironmentComponentCatalog.Get(tool.Name)?.Category == EnvironmentComponentCategory.DevelopmentTool)
                      .OrderBy(tool => tool.Name).ThenByDescending(tool => tool.Version)

@@ -74,15 +74,21 @@ public sealed class SidebarConsistencyTests
 
             var host = new Window { Content = grid, Width = 420, Height = 140, ShowInTaskbar = false };
             host.Show();
-            host.UpdateLayout();
+            try
+            {
+                host.UpdateLayout();
 
-            var cell = FindVisualChild<DataGridCell>(grid);
-            var text = FindVisualChild<TextBlock>(cell);
+                var cell = FindVisualChild<DataGridCell>(grid);
+                var text = FindVisualChild<TextBlock>(cell);
 
-            Assert.Equal(VerticalAlignment.Center, cell.VerticalContentAlignment);
-            Assert.Equal(VerticalAlignment.Center, text.VerticalAlignment);
-
-            host.Close();
+                Assert.Equal(VerticalAlignment.Center, cell.VerticalContentAlignment);
+                Assert.Equal(VerticalAlignment.Center, text.VerticalAlignment);
+            }
+            finally
+            {
+                // 已加载视图持有 ThemeEvents 强订阅;断言失败也必须卸载,避免跨测试类泄漏。
+                host.Close();
+            }
         });
     }
 

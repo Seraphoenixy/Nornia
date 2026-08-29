@@ -236,6 +236,7 @@ public sealed record GitRefInfo(string Name, GitRefKind Kind, bool IsHead = fals
 /// <param name="Parents">Parent commit hashes (empty for roots); drives the commit-graph lanes.</param>
 /// <param name="Refs">指向该提交的引用(HEAD 已剔除;无引用时为空)。</param>
 /// <param name="Stats">文件/新增/删除行统计(<c>--shortstat</c>;未请求或缺失时为空)。</param>
+/// <param name="Message">未经 Git 的 <c>%s</c> 段落折叠处理的完整提交消息。</param>
 public sealed record GitCommitInfo(
     string Hash,
     string ShortHash,
@@ -246,7 +247,8 @@ public sealed record GitCommitInfo(
     DateTimeOffset AuthorDate,
     IReadOnlyList<string>? Parents = null,
     IReadOnlyList<GitRefInfo>? Refs = null,
-    GitCommitStats? Stats = null)
+    GitCommitStats? Stats = null,
+    string? Message = null)
 {
     /// <summary>非空父哈希视图(旧构造未传时为空)。</summary>
     public IReadOnlyList<string> ParentList => Parents ?? [];
@@ -267,6 +269,9 @@ public sealed record GitBranchInfo(
     int BehindCount = 0,
     bool IsRemote = false,
     string? TipHash = null);
+
+/// <summary>A git tag (<c>git for-each-ref refs/tags</c>).</summary>
+public sealed record GitTagInfo(string Name, string? TipHash = null, bool IsAnnotated = false);
 
 /// <summary>Configured pull strategy for <c>git pull</c>. Nornia does not accept credentials in-memory;
 /// authentication is delegated to Git Credential Manager (GCM) and the Windows Credential Manager vault.</summary>

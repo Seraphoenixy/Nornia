@@ -1032,11 +1032,11 @@ public partial class WorkspaceViewModel : PageViewModel
         return changed;
     }
 
-    /// <summary>Locates a file by its repository-relative path: expands ancestor folders and selects
-    /// the node so the user can see where the change lives. Called from source-control reveal.</summary>
-    public async Task<bool> RevealNodeAsync(string relativePath)
+    /// <summary>Locates a file by its workspace-relative path: expands ancestor folders and selects
+    /// the node so the user can see where the change lives. Used by source-control reveal and active-editor sync.</summary>
+    public async Task<bool> RevealNodeAsync(string relativePath, CancellationToken cancellationToken = default)
     {
-        if (string.IsNullOrWhiteSpace(relativePath) || RootNodes.Count == 0)
+        if (cancellationToken.IsCancellationRequested || string.IsNullOrWhiteSpace(relativePath) || RootNodes.Count == 0)
         {
             return false;
         }
@@ -1051,6 +1051,11 @@ public partial class WorkspaceViewModel : PageViewModel
         for (var index = 0; index < segments.Length; index++)
         {
             await current.LoadChildrenAsync();
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return false;
+            }
+
             var match = current.Children.FirstOrDefault(child =>
                 !child.IsPlaceholder && string.Equals(child.Name, segments[index], StringComparison.OrdinalIgnoreCase));
             if (match is null)

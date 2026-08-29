@@ -188,3 +188,12 @@ public sealed record CacheCleanupResult(
     CacheCleanupStatus Status,
     long ReclaimedBytes,
     string Message);
+
+/// <summary>Snapshot-level metadata for one persisted inventory scan (kind "runtimes" / "packages").
+/// The timestamp plus the cheap environment fingerprint let inventory services serve a fresh snapshot
+/// from the database without re-running any provider process or winget.</summary>
+public sealed record InventoryScanState(
+    string Kind,
+    long ScannedAt,
+    long DurationMs,
+    string Fingerprint);

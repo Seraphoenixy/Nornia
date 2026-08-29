@@ -219,7 +219,17 @@ public partial class DiffDocumentView : UserControl
         }
     }
 
-    private void OnThemeChanged(object? sender, AppTheme theme) => ApplyEditorTheme();
+    private void OnThemeChanged(object? sender, AppTheme theme)
+    {
+        // 与 CodeDocumentView.OnThemeChanged 相同:非宿主线程的广播归组回宿主 Dispatcher。
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.InvokeAsync(ApplyEditorTheme);
+            return;
+        }
+
+        ApplyEditorTheme();
+    }
 
     private void OnDataContextChanged(object sender, DependencyPropertyChangedEventArgs e)
     {

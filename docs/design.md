@@ -286,6 +286,7 @@ SQLite 是本机环境资产索引，使用 `Microsoft.Data.Sqlite.Core`、Windo
 - `projects`
 - `environment_profiles`
 - `environment_bindings`
+- `scan_state`（清单快照级扫描元数据：kind 主键 `runtimes`/`packages`、scanned_at、duration_ms、环境指纹）
 - `logs`
 - `environment_repair_logs`（环境修复批次步骤：correlation_id、sequence、组件、前后版本、包、Provider、成功标记、回滚策略、失败原因/提示）
 
@@ -293,7 +294,9 @@ SQLite 是本机环境资产索引，使用 `Microsoft.Data.Sqlite.Core`、Windo
 
 迁移现为三步：`InitialSchemaMigration`（1）、`PackageArchitectureMigration`（2）、`RepairLoggingMigration`（3）——为 `logs` 增列 `correlation_id`/`operation_kind`/`details_json`（按 `pragma_table_info` 幂等增列），并创建 `environment_repair_logs` 及其 `(correlation_id, sequence)`、`timestamp` 索引。
 
-`EnvironmentInventoryService` 在 Runtime 扫描后替换持久化快照：本次未发现的旧 Runtime 标记为 Missing，不直接删除。`PackageInventoryService` 在 Winget 已安装清单和包变更后写入 Package 快照。Package 使用 `Id + Provider + Architecture` 作为资产键：解析 `x86`、`x64`、`arm64` 标识后保留真实架构变体，只合并完全重复的 Winget 记录；无法识别时显示 `Unknown`。`ProjectCatalogService` 在 `project init`、`env check`、`project open` 与桌面端对应操作中登记项目，保存完整 YAML 内容及检查通过的 Runtime Binding。项目目录不可达时仅更新为 Missing；用户显式移除才删除项目、配置和绑定。
+`EnvironmentInventoryService` 在 Runtime 扫描后替换持久化快照：本次未发现的旧 Runtime 标记为 Missing，不直接删除；`GetAllAsync` 是"在场清单"读取，只返回非 Missing 记录，并把 `RuntimeStatus.Error` 无损推导回 `DetectionStatus.Broken`（持久化不存检测明细）。`PackageInventoryService` 在 Winget 已安装清单和包变更后写入 Package 快照（`status=0` 历史行同理不返回）。Package 使用 `Id + Provider + Architecture` 作为资产键：解析 `x86`、`x64`、`arm64` 标识后保留真实架构变体，只合并完全重复的 Winget 记录；无法识别时显示 `Unknown`。`ProjectCatalogService` 在 `project init`、`env check`、`project open` 与桌面端对应操作中登记项目，保存完整 YAML 内容及检查通过的 Runtime Binding。项目目录不可达时仅更新为 Missing；用户显式移除才删除项目、配置和绑定。
+
+**清单刷新的新鲜度分层。** 两个清单服务共用同一刷新语义：内存 30 秒合并 → `scan_state` 表（`kind` 主键 + `scanned_at`/`duration_ms`/`fingerprint`）驱动的持久化快照 TTL 门控（`NorniaSettings.PersistedScanTtlSeconds`）→ 全量扫描。Runtime 侧 TTL 门控还需 `EnvironmentFingerprintProvider` 的指纹一致：该 provider 零进程派生地哈希 PATH、五个命令行工具的候选路径（与 `CommandRuntimeProviderBase` 共享 `WindowsPathLocator`）与 VC++ 注册表版本，指纹无法计算（null）或已变化时 fail-open 回落全扫；Package 侧无廉价探针，仅 TTL 门控。快照与 `scan_state` 都提交成功才视为一次有效扫描，崩溃只会让时间戳偏旧、下次多扫一次（安全方向）。持久化读取抛异常（如首启建表竞态）同样回落全扫。显式动作（「重新扫描/刷新」按钮、CLI `env check`/`env fix`、安装/卸载/升级/修复后的清单重载）一律 `RefreshForcedAsync` 绕过全部门控；页面首激活先 `GetPersistedAsync` 秒出首屏、再门控刷新，并在页头显示「上次扫描：X 前」提示。
 
 Dashboard 从资产库分别统计 Runtime、开发工具、项目和需处理环境数；Projects 页面显示已登记项目，可加载、刷新、检查、打开和移除历史项目。日志通过单写入异步队列写入 SQLite，防止阻塞 WPF UI，并在退出时 flush；启动时清理超过 90 天的 SQLite 操作日志。Serilog 文件日志仍保存 14 天。
 

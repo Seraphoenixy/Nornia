@@ -27,7 +27,8 @@ public partial class PackagesViewModel(
     IUiLogService logService,
     CacheViewModel cache,
     IClipboardService? clipboard = null,
-    IUiPerformanceMetrics? performanceMetrics = null)
+    IUiPerformanceMetrics? performanceMetrics = null,
+    IInventoryScanStateRepository? scanStateRepository = null)
     : PageViewModel("软件包", logService), INavigationTarget
 {
     private readonly IClipboardService _clipboard = clipboard ?? NullClipboardService.Instance;
@@ -90,7 +91,10 @@ public partial class PackagesViewModel(
     [ObservableProperty]
     private bool isProviderColumnVisible;
 
-    protected override Task OnFirstActivatedAsync()
+    /// <summary>页头新鲜度提示:包清单快照何时扫描,由 scan_state 提供(空表示不可用/未注册仓库)。</summary>
+    [ObservableProperty] private string lastScanDisplay = string.Empty;
+
+    protected override async Task OnFirstActivatedAsync()
     {
         SelectedPackages.CollectionChanged += (_, _) =>
         {
@@ -102,8 +106,34 @@ public partial class PackagesViewModel(
         SearchView.Filter = MatchesSearch;
         // 不再预激活缓存页:首次激活曾触发全盘缓存扫描,启动/进页即静默扫盘;
         // 缓存数据改由“扫描缓存”按钮显式加载(缓存标签页自带空状态引导)。
-        return ListInstalledAsync();
+        // 快照优先:先用持久化包清单立即渲染首屏(winget list 可能长达数十秒),再走
+        // TTL 门控刷新;快照足够新时门控刷新直接返回库内数据,不运行 winget。
+        await SeedPersistedPackagesAsync();
+        await ListInstalledGatedAsync();
     }
+
+    /// <summary>从持久化包清单立即填充列表,失败静默(门控刷新会落回全扫兜底)。</summary>
+    private async Task SeedPersistedPackagesAsync()
+    {
+        try
+        {
+            ShowInstalledList(await inventoryService.GetPersistedAsync());
+            LastScanDisplay = await InventoryScanAgeText.LoadAsync(
+                scanStateRepository, InventoryScanAgeText.PackageScanKind);
+        }
+        catch
+        {
+            // 持久化暂不可用(如表未建好):交给下面的门控刷新处理。
+        }
+    }
+
+    /// <summary>首激活的门控加载:快照在 TTL 内时零 winget 进程;过期时全量扫描一次。</summary>
+    private Task ListInstalledGatedAsync() => RunAsync("读取已安装软件包", async cancellationToken =>
+    {
+        ShowInstalledList(await inventoryService.RefreshAsync(OperationProgress, cancellationToken));
+        LastScanDisplay = await InventoryScanAgeText.LoadAsync(
+            scanStateRepository, InventoryScanAgeText.PackageScanKind, cancellationToken);
+    }, "确认包管理器可用后重试。", canCancel: true);
 
     [RelayCommand(CanExecute = nameof(CanSearch))]
     private Task SearchAsync() => RunAsync("搜索软件包", async cancellationToken =>
@@ -112,9 +142,14 @@ public partial class PackagesViewModel(
         ShowSearchResults(packages, $"“{SearchQuery}” 的搜索结果");
     }, "检查包管理器是否可用，或更换关键词后重试。", canCancel: true);
 
+    /// <summary>「重新扫描」按钮:永远强制重跑 winget 并更新持久化快照与 scan_state。</summary>
     [RelayCommand]
     private Task ListInstalledAsync() => RunAsync("读取已安装软件包", async cancellationToken =>
-        ShowInstalledList(await inventoryService.RefreshAsync(OperationProgress, cancellationToken)), "确认包管理器可用后重试。", canCancel: true);
+    {
+        ShowInstalledList(await inventoryService.RefreshForcedAsync(OperationProgress, cancellationToken));
+        LastScanDisplay = await InventoryScanAgeText.LoadAsync(
+            scanStateRepository, InventoryScanAgeText.PackageScanKind, cancellationToken);
+    }, "确认包管理器可用后重试。", canCancel: true);
 
     [RelayCommand(CanExecute = nameof(CanInstallSelected))]
     private Task InstallSelectedAsync() => InstallPackageAsync(SelectedPackage!.Id, null);
@@ -221,8 +256,14 @@ public partial class PackagesViewModel(
 
     private bool CanCopyAllSearchResults() => SearchResults.Count > 0;
 
-    private async Task LoadInstalledPackagesAsync(CancellationToken cancellationToken = default) =>
-        ShowInstalledList(await inventoryService.RefreshAsync(OperationProgress, cancellationToken));
+    /// <summary>安装/卸载/升级之后的重载:必须强制刷新,绕过合并缓存与持久化快照 TTL,
+    /// 否则列表会展示变更前的旧数据。</summary>
+    private async Task LoadInstalledPackagesAsync(CancellationToken cancellationToken = default)
+    {
+        ShowInstalledList(await inventoryService.RefreshForcedAsync(OperationProgress, cancellationToken));
+        LastScanDisplay = await InventoryScanAgeText.LoadAsync(
+            scanStateRepository, InventoryScanAgeText.PackageScanKind, cancellationToken);
+    }
 
     private void ShowInstalledList(IEnumerable<PackageInfo> packages)
     {

@@ -857,6 +857,12 @@ public sealed class GitViewModelTests : IDisposable
         Assert.Contains("body line 1", text);
         Assert.Contains("body line 2", text);
 
+        // %s 会把没有空行分隔的标题和列表折叠为一行；悬浮窗应优先显示 %B 原文。
+        var rawMessage = "fix: subject\n- body line 1\n- body line 2";
+        var rawRow = new GitLogRow(commit with { Message = rawMessage }, null);
+        Assert.Equal(rawMessage, rawRow.FullMessage);
+        Assert.EndsWith(rawMessage, rawRow.ToolTipText);
+
         // 无 body 时提示不追加空行
         var withoutBody = new GitLogRow(commit with { Body = null }, null).ToolTipText;
         Assert.DoesNotContain("\n\n", withoutBody.TrimEnd('\n'));

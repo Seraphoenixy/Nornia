@@ -42,7 +42,17 @@ public sealed class MarkdownMessageView : FlowDocumentScrollViewer
     private static void OnMarkdownChanged(DependencyObject d, DependencyPropertyChangedEventArgs e) =>
         ((MarkdownMessageView)d).Rebuild();
 
-    private void OnThemeChanged(object? sender, AppTheme theme) => Rebuild();
+    private void OnThemeChanged(object? sender, AppTheme theme)
+    {
+        // 非宿主线程的广播归组回宿主 Dispatcher(见 CodeDocumentView.OnThemeChanged)。
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.InvokeAsync(Rebuild);
+            return;
+        }
+
+        Rebuild();
+    }
 
     private void Rebuild() => Document = CommitMessageRenderer.Render(Markdown);
 }

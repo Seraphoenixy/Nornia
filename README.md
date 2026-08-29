@@ -46,7 +46,7 @@ Desktop 的“终端”页会发现 PowerShell 7、Windows PowerShell、cmd、Gi
 
 `Nornia.yaml` 还可声明项目启动命令、所需架构/操作系统以及非敏感环境变量；`project export/import` 用于在团队间复制经验证的环境声明。导出的文件不包含本机已安装软件、令牌或其他凭据。
 
-扫描到的 Runtime 和已安装 Package、初始化/检查/打开过的项目、环境配置与检查绑定，以及操作日志会持久化到 `%LOCALAPPDATA%\Nornia\nornia.db`。Packages 会显示 Winget 可识别的 `X86`、`X64`、`ARM64` 架构，并仅合并完全重复的包记录；目录缺失的项目会保留为历史记录，可在 Projects 页面手动移除。
+扫描到的 Runtime 和已安装 Package、初始化/检查/打开过的项目、环境配置与检查绑定，以及操作日志会持久化到 `%LOCALAPPDATA%\Nornia\nornia.db`。环境清单采用"快照优先"刷新：页面打开先用持久化快照秒出首屏，快照在 TTL 内（默认 6 小时）且环境指纹（PATH、工具路径、VC++ 注册表）未变时不重跑任何扫描进程；TTL 过期、指纹变化或用户点「重新扫描/刷新」时才全量扫描。任何安装/卸载/升级之后都会强制重扫以保证列表反映变更，页头会显示「上次扫描」时间供参考。Packages 会显示 Winget 可识别的 `X86`、`X64`、`ARM64` 架构，并仅合并完全重复的包记录；目录缺失的项目会保留为历史记录，可在 Projects 页面手动移除。
 
 `env fix` 批次逐步骤追踪（correlation_id + 修复日志表），失败可生成回滚计划：能自动撤销的步骤自动执行，Winget 降级等步骤给出手动命令提示。软件包渠道除 Winget 外，本机装有 Scoop/Chocolatey 时按操作自动选择。
 

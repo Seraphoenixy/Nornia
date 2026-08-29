@@ -195,6 +195,28 @@ public interface IGitService
 
     Task SwitchBranchAsync(string repositoryPath, string branchName, CancellationToken cancellationToken = default);
 
+    /// <summary>Lists local tags (<c>git for-each-ref refs/tags</c>).</summary>
+    Task<IReadOnlyList<GitTagInfo>> GetTagsAsync(string repositoryPath, CancellationToken cancellationToken = default);
+
+    /// <summary>Creates a tag at <paramref name="targetRef"/> (defaults to HEAD). When
+    /// <paramref name="annotate"/> is true an annotated tag is created with the given message.</summary>
+    Task CreateTagAsync(string repositoryPath, string tagName, bool annotate = false, string? message = null, string? targetRef = null, CancellationToken cancellationToken = default);
+
+    /// <summary>Deletes a local tag (<c>git tag -d</c>).</summary>
+    Task DeleteTagAsync(string repositoryPath, string tagName, CancellationToken cancellationToken = default);
+
+    /// <summary>Pushes a single local tag to the remote (<c>git push origin &lt;tag&gt;</c>).</summary>
+    Task PushTagAsync(string repositoryPath, string tagName, CancellationToken cancellationToken = default);
+
+    /// <summary>Pushes all local tags to the remote (<c>git push origin --tags</c>).</summary>
+    Task PushAllTagsAsync(string repositoryPath, CancellationToken cancellationToken = default);
+
+    /// <summary>Fetches tags from the remote (<c>git fetch --tags</c>).</summary>
+    Task FetchTagsAsync(string repositoryPath, CancellationToken cancellationToken = default);
+
+    /// <summary>Checks out a tag into detached HEAD (<c>git checkout &lt;tag&gt;</c>).</summary>
+    Task CheckoutTagAsync(string repositoryPath, string tagName, CancellationToken cancellationToken = default);
+
     /// <summary>Downloads remote refs without modifying the current worktree.</summary>
     Task FetchAsync(string repositoryPath, CancellationToken cancellationToken = default);
 

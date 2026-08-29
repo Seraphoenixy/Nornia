@@ -59,10 +59,17 @@ public sealed class RuntimeRepository(ISqliteConnectionFactory database) : IRunt
         var rows = await connection.QueryAsync<RuntimeRow>(new CommandDefinition("""
             SELECT id AS Id, name AS Name, version AS Version, install_path AS InstallPath, architecture AS Architecture,
                    provider AS Provider, install_date AS InstallDate, status AS Status
-            FROM runtimes ORDER BY name, version DESC;
-            """, cancellationToken: cancellationToken));
-        return rows.Select(row => new Runtime(Guid.Parse(row.Id), row.Name, row.Version, row.InstallPath, row.Architecture,
-            row.Provider, row.InstallDate, (RuntimeStatus)row.Status)).ToArray();
+            FROM runtimes WHERE status <> $missingStatus ORDER BY name, version DESC;
+            """, new { missingStatus = (int)RuntimeStatus.Missing }, cancellationToken: cancellationToken));
+        return rows.Select(row =>
+        {
+            var status = (RuntimeStatus)row.Status;
+            // 持久化不存检测明细:RuntimeStatus.Error 只会由 Broken 检测写入,据此无损推导,
+            // 让"快照优先"路径与实时扫描在 IsBroken 展示上保持一致。
+            var detection = status == RuntimeStatus.Error ? DetectionStatus.Broken : DetectionStatus.Installed;
+            return new Runtime(Guid.Parse(row.Id), row.Name, row.Version, row.InstallPath, row.Architecture,
+                row.Provider, row.InstallDate, status, detection);
+        }).ToArray();
     }
 
     private sealed class RuntimeRow
@@ -129,7 +136,7 @@ public sealed class PackageRepository(ISqliteConnectionFactory database) : IPack
         var rows = await connection.QueryAsync<PackageRow>(new CommandDefinition("""
             SELECT id AS Id, name AS Name, version AS Version, available_version AS AvailableVersion,
                    provider AS Provider, architecture AS Architecture, status AS Status
-            FROM packages ORDER BY name;
+            FROM packages WHERE status <> 0 ORDER BY name;
             """, cancellationToken: cancellationToken));
         return rows.Select(row => new PackageInfo(row.Id, row.Name, row.Version, row.AvailableVersion, row.Provider, row.Status != 0, row.Architecture)).ToArray();
     }
@@ -200,5 +207,43 @@ public sealed class SummaryRepository(ISqliteConnectionFactory database) : IDash
         public string Name { get; init; } = string.Empty;
         public string Path { get; init; } = string.Empty;
         public int Status { get; init; }
+    }
+}
+
+/// <summary>Persists snapshot-level scan metadata (kind, timestamp, duration, environment fingerprint)
+/// in the scan_state table. Inventory services read it to decide whether the persisted snapshot can be
+/// served directly (TTL + unchanged fingerprint) or a full re-scan is required.</summary>
+public sealed class InventoryScanStateRepository(ISqliteConnectionFactory database) : IInventoryScanStateRepository
+{
+    public async Task<InventoryScanState?> GetAsync(string kind, CancellationToken cancellationToken = default)
+    {
+        using var _ = database.TrackOperation();
+        await using var connection = database.CreateConnection();
+        var row = await connection.QuerySingleOrDefaultAsync<ScanStateRow>(new CommandDefinition(
+            "SELECT kind AS Kind, scanned_at AS ScannedAt, duration_ms AS DurationMs, fingerprint AS Fingerprint " +
+            "FROM scan_state WHERE kind = $Kind;",
+            new { Kind = kind }, cancellationToken: cancellationToken));
+        return row is null ? null : new InventoryScanState(row.Kind, row.ScannedAt, row.DurationMs, row.Fingerprint);
+    }
+
+    public async Task UpsertAsync(InventoryScanState state, CancellationToken cancellationToken = default)
+    {
+        using var _ = database.TrackOperation();
+        await using var connection = database.CreateConnection();
+        await connection.ExecuteAsync(new CommandDefinition("""
+            INSERT INTO scan_state (kind, scanned_at, duration_ms, fingerprint)
+            VALUES ($Kind, $ScannedAt, $DurationMs, $Fingerprint)
+            ON CONFLICT(kind) DO UPDATE SET
+                scanned_at = excluded.scanned_at, duration_ms = excluded.duration_ms,
+                fingerprint = excluded.fingerprint;
+            """, new { state.Kind, state.ScannedAt, state.DurationMs, state.Fingerprint }, cancellationToken: cancellationToken));
+    }
+
+    private sealed class ScanStateRow
+    {
+        public string Kind { get; init; } = string.Empty;
+        public long ScannedAt { get; init; }
+        public long DurationMs { get; init; }
+        public string Fingerprint { get; init; } = string.Empty;
     }
 }

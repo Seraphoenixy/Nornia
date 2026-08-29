@@ -8,7 +8,11 @@
 
     <!-- Page title row: title left, primary action right -->
     <DockPanel LastChildFill="False">
-      <StackPanel><TextBlock Text="运行库" Style="{StaticResource PageTitleStyle}" /></StackPanel>
+      <StackPanel>
+        <TextBlock Text="运行库" Style="{StaticResource PageTitleStyle}" />
+        <TextBlock Text="{Binding LastScanDisplay}" Foreground="{DynamicResource MutedTextBrush}" FontSize="{DynamicResource TypeBadge}"
+                   TextTrimming="CharacterEllipsis" Visibility="{Binding LastScanDisplay, Converter={StaticResource StringEmptyToCollapsedConverter}}" />
+      </StackPanel>
       <Button Content="重新扫描" Command="{Binding ScanCommand}" Style="{StaticResource PrimaryButton}" DockPanel.Dock="Right" VerticalAlignment="Center" />
     </DockPanel>
 

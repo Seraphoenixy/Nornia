@@ -174,6 +174,14 @@ public sealed class TerminalSurfaceControl : FrameworkElement
 
     private void OnThemeChanged(object? sender, AppTheme theme)
     {
+        // 非宿主线程的广播归组回宿主 Dispatcher(见 CodeDocumentView.OnThemeChanged):
+        // 纪元与刷子缓存字段的写也必须落在宿主线程,RequestRender 依赖同线程状态。
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.InvokeAsync(() => OnThemeChanged(sender, theme));
+            return;
+        }
+
         // 主题纪元 +1:行缓存按纪元失效,主题刷延迟重新解析。
         _themeEpoch++;
         _backgroundBrush = null;

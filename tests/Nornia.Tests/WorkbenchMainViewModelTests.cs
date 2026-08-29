@@ -89,14 +89,16 @@ public sealed class WorkbenchMainViewModelTests
         return new Fixture(main, logs, navigation, terminal, terminalService, editor);
     }
 
-    // ===== Startup: no page tab is auto-opened =====
+    // ===== Startup: construction opens no page tab; the idle preload opens the default =====
 
     [Fact]
     public void Startup_OpensNoPageTab_ActivityBarStillDefaultsToEnvironment()
     {
         var fixture = Create();
 
-        // 启动不再自动打开环境管理页面标签:条带为空,主内容区呈空状态。
+        // 构造期不打开页面标签(壳先行,条带为空);默认页(环境管理)的标签由 PreloadPagesAsync
+        // 在首帧后的 ApplicationIdle 续延中补开——测试进程不泵空闲优先级,该续延不执行,
+        // 因此这里断言的仍是构造后的即时状态。
         Assert.Empty(fixture.Main.Workbench.Tabs);
         Assert.False(fixture.Main.Workbench.HasTabs);
         Assert.Null(fixture.Main.Workbench.SelectedTab);

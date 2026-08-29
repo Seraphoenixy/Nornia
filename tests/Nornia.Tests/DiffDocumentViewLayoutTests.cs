@@ -21,23 +21,29 @@ public sealed class DiffDocumentViewLayoutTests
             var view = new DiffDocumentView();
             var host = new Window { Content = view, Width = 720, Height = 420, ShowInTaskbar = false };
             host.Show();
-            host.UpdateLayout();
+            try
+            {
+                host.UpdateLayout();
 
-            Assert.Equal(new Thickness(0, 0, 16, 0), view.InlineEditor.Margin);
-            Assert.Equal(new Thickness(0, 0, 16, 0), view.OldEditor.Margin);
-            Assert.Equal(new Thickness(0, 0, 16, 0), view.NewEditor.Margin);
+                Assert.Equal(new Thickness(0, 0, 16, 0), view.InlineEditor.Margin);
+                Assert.Equal(new Thickness(0, 0, 16, 0), view.OldEditor.Margin);
+                Assert.Equal(new Thickness(0, 0, 16, 0), view.NewEditor.Margin);
 
-            // 轨道占用宽度(12px 宽 + 4px 右距)== 编辑器让出的右缘空间。
-            Assert.Equal(16, view.OverviewCanvas.Width + view.OverviewCanvas.Margin.Right);
-            Assert.Equal(16, view.OldOverviewCanvas.Width + view.OldOverviewCanvas.Margin.Right);
-            Assert.Equal(16, view.NewOverviewCanvas.Width + view.NewOverviewCanvas.Margin.Right);
+                // 轨道占用宽度(12px 宽 + 4px 右距)== 编辑器让出的右缘空间。
+                Assert.Equal(16, view.OverviewCanvas.Width + view.OverviewCanvas.Margin.Right);
+                Assert.Equal(16, view.OldOverviewCanvas.Width + view.OldOverviewCanvas.Margin.Right);
+                Assert.Equal(16, view.NewOverviewCanvas.Width + view.NewOverviewCanvas.Margin.Right);
 
-            // 轨道左缘与编辑器右缘贴合:滚动条(位于编辑器右缘内侧)不再被覆盖。
-            AssertFlush(view.InlinePane, view.InlineEditor, view.OverviewCanvas);
-            AssertFlush(view.SideBySidePane, view.OldEditor, view.OldOverviewCanvas);
-            AssertFlush(view.SideBySidePane, view.NewEditor, view.NewOverviewCanvas);
-
-            host.Close();
+                // 轨道左缘与编辑器右缘贴合:滚动条(位于编辑器右缘内侧)不再被覆盖。
+                AssertFlush(view.InlinePane, view.InlineEditor, view.OverviewCanvas);
+                AssertFlush(view.SideBySidePane, view.OldEditor, view.OldOverviewCanvas);
+                AssertFlush(view.SideBySidePane, view.NewEditor, view.NewOverviewCanvas);
+            }
+            finally
+            {
+                // 已加载视图持有 ThemeEvents 强订阅;断言失败也必须卸载,避免跨测试类泄漏。
+                host.Close();
+            }
         });
     }
 
@@ -49,28 +55,33 @@ public sealed class DiffDocumentViewLayoutTests
             var view = new DiffDocumentView();
             var host = new Window { Content = view, Width = 720, Height = 420, ShowInTaskbar = false };
             host.Show();
-
-            // 足够多的内容让垂直滚动条真正出现。
-            var lines = new string[400];
-            for (var i = 0; i < lines.Length; i++)
+            try
             {
-                lines[i] = $"line {i}";
+                // 足够多的内容让垂直滚动条真正出现。
+                var lines = new string[400];
+                for (var i = 0; i < lines.Length; i++)
+                {
+                    lines[i] = $"line {i}";
+                }
+
+                view.InlineEditor.Document = new TextDocument(string.Join('\n', lines));
+                host.UpdateLayout();
+
+                var bar = FindVerticalScrollBar(view.InlineEditor);
+                Assert.NotNull(bar);
+                Assert.True(bar!.ActualHeight > 0, "单栏编辑器应显示垂直滚动条");
+
+                var mid = bar.TransformToVisual(view.InlinePane).Transform(new Point(bar.ActualWidth / 2, bar.ActualHeight / 2));
+                var hit = view.InlinePane.InputHitTest(mid) as DependencyObject;
+                Assert.NotNull(hit);
+                Assert.False(IsAncestorOrSelf(view.OverviewCanvas, hit), "概览轨道不得覆盖滚动条命中区");
+                Assert.True(IsAncestorOrSelf(bar, hit), "滚动条命中区应落在滚动条自身");
             }
-
-            view.InlineEditor.Document = new TextDocument(string.Join('\n', lines));
-            host.UpdateLayout();
-
-            var bar = FindVerticalScrollBar(view.InlineEditor);
-            Assert.NotNull(bar);
-            Assert.True(bar!.ActualHeight > 0, "单栏编辑器应显示垂直滚动条");
-
-            var mid = bar.TransformToVisual(view.InlinePane).Transform(new Point(bar.ActualWidth / 2, bar.ActualHeight / 2));
-            var hit = view.InlinePane.InputHitTest(mid) as DependencyObject;
-            Assert.NotNull(hit);
-            Assert.False(IsAncestorOrSelf(view.OverviewCanvas, hit), "概览轨道不得覆盖滚动条命中区");
-            Assert.True(IsAncestorOrSelf(bar, hit), "滚动条命中区应落在滚动条自身");
-
-            host.Close();
+            finally
+            {
+                // 已加载视图持有 ThemeEvents 强订阅;断言失败也必须卸载,避免跨测试类泄漏。
+                host.Close();
+            }
         });
     }
 

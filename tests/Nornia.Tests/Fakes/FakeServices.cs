@@ -255,10 +255,17 @@ internal sealed class FakePackageProvider : IPackageProvider
 internal sealed class FakePackageInventory(IReadOnlyList<PackageInfo> packages) : IPackageInventoryService
 {
     public int RefreshCalls { get; private set; }
+    public int ForcedRefreshCalls { get; private set; }
 
     public Task<IReadOnlyList<PackageInfo>> RefreshAsync(IProgress<ProcessOutput>? progress = null, CancellationToken cancellationToken = default)
     {
         RefreshCalls++;
+        return Task.FromResult(packages);
+    }
+
+    public Task<IReadOnlyList<PackageInfo>> RefreshForcedAsync(IProgress<ProcessOutput>? progress = null, CancellationToken cancellationToken = default)
+    {
+        ForcedRefreshCalls++;
         return Task.FromResult(packages);
     }
 
@@ -592,6 +599,27 @@ internal sealed class FakeGitService : IGitService
 
     public Task<IReadOnlyList<GitBranchInfo>> GetRemoteBranchesAsync(string repositoryPath, CancellationToken cancellationToken = default) =>
         Task.FromResult(RemoteBranches);
+
+    public Task<IReadOnlyList<GitTagInfo>> GetTagsAsync(string repositoryPath, CancellationToken cancellationToken = default) =>
+        Task.FromResult<IReadOnlyList<GitTagInfo>>([]);
+
+    public Task CreateTagAsync(string repositoryPath, string tagName, bool annotate = false, string? message = null, string? targetRef = null, CancellationToken cancellationToken = default) =>
+        Task.CompletedTask;
+
+    public Task DeleteTagAsync(string repositoryPath, string tagName, CancellationToken cancellationToken = default) =>
+        Task.CompletedTask;
+
+    public Task PushTagAsync(string repositoryPath, string tagName, CancellationToken cancellationToken = default) =>
+        Task.CompletedTask;
+
+    public Task PushAllTagsAsync(string repositoryPath, CancellationToken cancellationToken = default) =>
+        Task.CompletedTask;
+
+    public Task FetchTagsAsync(string repositoryPath, CancellationToken cancellationToken = default) =>
+        Task.CompletedTask;
+
+    public Task CheckoutTagAsync(string repositoryPath, string tagName, CancellationToken cancellationToken = default) =>
+        Task.CompletedTask;
 
     public Task CreateBranchAsync(string repositoryPath, string branchName, CancellationToken cancellationToken = default)
     {
