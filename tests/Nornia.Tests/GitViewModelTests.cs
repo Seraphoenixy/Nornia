@@ -369,6 +369,26 @@ public sealed class GitViewModelTests : IDisposable
         Assert.Equal(2, git.BranchCalls);
     }
 
+    [Fact]
+    public async Task SilentRefresh_RemoteRefMoved_EscalatesToFullReloadWhenHeadIsUnchanged()
+    {
+        var (viewModel, git, _, _, _) = Create();
+        viewModel.RepositoryPath = _repoPath;
+        git.Logs = [new GitCommitInfo("a".PadRight(40, '0'), "aaaaaaa", "initial", null, "A", "a@x", DateTimeOffset.UtcNow)];
+        await viewModel.RefreshCommand.ExecuteAsync(null);
+        Assert.Equal(1, git.LogCalls);
+        Assert.Equal(2, git.OutgoingCommitsCalls + git.IncomingCommitsCalls);
+
+        // A successful `git push --force-with-lease` moves refs/remotes/<remote>/<branch>, while
+        // local HEAD remains unchanged. The graph still needs a full reload to remove the old
+        // outgoing/incoming branch and redraw its synchronization boundary.
+        Watcher.RaiseChangesDetected(headOrRefsChanged: true);
+
+        Assert.Equal(2, git.LogCalls);
+        Assert.Equal(2, git.BranchCalls);
+        Assert.Equal(4, git.OutgoingCommitsCalls + git.IncomingCommitsCalls);
+    }
+
     // ===== G7: 折叠区段不发 git 进程,展开后懒加载补齐 =====
 
     private static async Task WaitUntilAsync(Func<bool> condition, string failure, int timeoutMs = 10_000)
@@ -916,8 +936,8 @@ public sealed class GitViewModelTests : IDisposable
         viewModel.CopyBranchNamesCommand.Execute(null);
         Assert.Equal("main", clipboard.LastText);
 
-        // LogRows 顶部还有 传入/传出的更改 两行同步折叠栏;提交行取最后一行
-        viewModel.SelectedCommits.Add(viewModel.LogRows[^1]);
+        // 同步边界分列在历史两端；按普通提交行选择，不依赖其在列表中的固定索引。
+        viewModel.SelectedCommits.Add(Assert.Single(viewModel.LogRows, row => !row.IsSyncBoundary));
         viewModel.CopyCommitHashesCommand.Execute(null);
         Assert.Equal("a".PadRight(40, '0'), clipboard.LastText);
 
@@ -925,7 +945,8 @@ public sealed class GitViewModelTests : IDisposable
         Assert.Equal("initial", clipboard.LastText);
 
         // 展开行内文件:复制单个文件路径
-        viewModel.CopyLogFilePathCommand.Execute(new LogFileRow(viewModel.LogRows[^1], git.CommitFiles[0]));
+        viewModel.CopyLogFilePathCommand.Execute(new LogFileRow(
+            Assert.Single(viewModel.LogRows, row => !row.IsSyncBoundary), git.CommitFiles[0]));
         Assert.Equal("src/A.cs", clipboard.LastText);
     }
 
@@ -1607,7 +1628,7 @@ public sealed class GitViewModelTests : IDisposable
         await viewModel.RefreshCommand.ExecuteAsync(null);
 
         Assert.Equal(30, viewModel.Logs.Count);
-        // 顶部两行是 传入/传出的更改 同步折叠栏(SampleStatus: ahead 2 / behind 1)
+        // ahead / behind 各生成一个同步边界，分列在本地历史的两端。
         Assert.Equal(32, viewModel.LogRows.Count);
         Assert.True(viewModel.CanLoadMoreCommits);
 
@@ -1645,7 +1666,7 @@ public sealed class GitViewModelTests : IDisposable
     }
 
     [Fact]
-    public async Task Refresh_BuildsSyncGroupRowsAtBranchTop()
+    public async Task Refresh_BuildsSyncBoundariesAroundRealLocalAndRemoteCommits()
     {
         var (viewModel, git, _, _, _) = Create();
         git.Logs = [new GitCommitInfo("h1".PadRight(40, '0'), "h1", "local tip", null, "A", "a@x", DateTimeOffset.UtcNow)];
@@ -1654,24 +1675,87 @@ public sealed class GitViewModelTests : IDisposable
         viewModel.RepositoryPath = _repoPath;
         await viewModel.RefreshCommand.ExecuteAsync(null);
 
-        // 顶部两行与提交行同集合同模板:传入的更改(远端色空心圆点,分支顶端)、传出的更改(本地色)
-        Assert.Equal(3, viewModel.LogRows.Count);
-        Assert.Equal("传入的更改 1", viewModel.LogRows[0].Commit.Subject);
-        Assert.Equal("HEAD...origin/main", viewModel.LogRows[0].Commit.Hash);
+        // 传出边界 → 真实本地提交 → 本地历史 → 传入边界 → 真实远端提交。
+        Assert.Equal(5, viewModel.LogRows.Count);
+        Assert.Equal("传出的更改", viewModel.LogRows[0].Commit.Subject);
+        Assert.Equal("main", viewModel.LogRows[0].SyncTarget);
+        Assert.Equal("origin/main...HEAD", viewModel.LogRows[0].Commit.Hash);
         Assert.True(viewModel.LogRows[0].Graph!.DotHollow);
+        Assert.True(viewModel.LogRows[0].Graph!.DotDashed);
         Assert.False(viewModel.LogRows[0].Graph!.DotLaneContinuesFromAbove);
 
-        Assert.Equal("传出的更改 2", viewModel.LogRows[1].Commit.Subject);
-        Assert.Equal("origin/main...HEAD", viewModel.LogRows[1].Commit.Hash);
-        Assert.True(viewModel.LogRows[1].Graph!.DotHollow);
-        Assert.True(viewModel.LogRows[1].Graph!.DotLaneContinuesFromAbove);
-        Assert.Equal("GraphCurrentBranchBrush", viewModel.LogRows[1].Graph!.LaneColorKeys![0]);
+        Assert.Equal("outgoing", viewModel.LogRows[1].Commit.Subject);
+        Assert.False(viewModel.LogRows[1].IsSyncBoundary);
+        Assert.Equal("local tip", viewModel.LogRows[2].Commit.Subject);
 
-        // 首提交从上方接入同步行:上段竖线入色取最下方同步行的色键(本地色),连线全程单色
-        var firstCommit = viewModel.LogRows[2];
-        Assert.Equal("local tip", firstCommit.Commit.Subject);
+        var firstCommit = viewModel.LogRows[1];
         Assert.True(firstCommit.Graph!.DotLaneContinuesFromAbove);
         Assert.Equal(["GraphCurrentBranchBrush"], firstCommit.Graph.LaneIncomingColorKeys!);
+
+        Assert.Equal("incoming", viewModel.LogRows[3].Commit.Subject);
+        Assert.Equal("传入的更改", viewModel.LogRows[4].Commit.Subject);
+        Assert.Equal("origin/main", viewModel.LogRows[4].SyncTarget);
+        Assert.Equal("HEAD...origin/main", viewModel.LogRows[4].Commit.Hash);
+        Assert.True(viewModel.LogRows[4].Graph!.DotDashed);
+        Assert.True(viewModel.LogRows[4].Graph!.DotLaneContinuesFromAbove);
+    }
+
+    [Fact]
+    public async Task SyncGraph_StillShowsRealCommitsWhenTheLocalLogIsEmpty()
+    {
+        var (viewModel, git, _, _, _) = Create();
+        git.Logs = [];
+        git.OutgoingCommits =
+        [
+            new GitCommitInfo("o2".PadRight(40, '0'), "o2", "outgoing two", null, "A", "a@x", DateTimeOffset.UtcNow),
+            new GitCommitInfo("o1".PadRight(40, '0'), "o1", "outgoing one", null, "A", "a@x", DateTimeOffset.UtcNow),
+        ];
+        git.IncomingCommits =
+        [
+            new GitCommitInfo("i1".PadRight(40, '0'), "i1", "incoming one", null, "A", "a@x", DateTimeOffset.UtcNow),
+        ];
+        viewModel.RepositoryPath = _repoPath;
+
+        await viewModel.RefreshCommand.ExecuteAsync(null);
+
+        Assert.Equal(
+            ["传出的更改", "outgoing two", "outgoing one", "incoming one", "传入的更改"],
+            viewModel.LogRows.Select(row => row.Commit.Subject));
+        Assert.All(viewModel.LogRows.Where(row => !row.IsSyncBoundary), row => Assert.NotNull(row.Graph));
+    }
+
+    [Fact]
+    public async Task SyncGraph_DrawsIncomingAndOutgoingAsTwoBranchesThatJoinAtCommonHistory()
+    {
+        var common = new GitCommitInfo("c1", "c1", "common", null, "A", "a@x", DateTimeOffset.UtcNow);
+        var outgoing = new GitCommitInfo("o1", "o1", "outgoing", null, "A", "a@x", DateTimeOffset.UtcNow, ["c1"]);
+        var incoming = new GitCommitInfo("i1", "i1", "incoming", null, "A", "a@x", DateTimeOffset.UtcNow, ["c1"]);
+        var git = new FakeGitService
+        {
+            Status = SampleStatus() with { AheadCount = 1, BehindCount = 1 },
+            DiffResult = SampleDiff(),
+            Logs = [outgoing, common],
+            OutgoingCommits = [outgoing],
+            IncomingCommits = [incoming],
+            Branches = [new GitBranchInfo("main", true, "origin/main", 1, 1, TipHash: "o1")],
+            RemoteBranches = [new GitBranchInfo("origin/main", false, IsRemote: true, TipHash: "i1")],
+        };
+        var (viewModel, _, _, _, _) = Create(git);
+        viewModel.RepositoryPath = _repoPath;
+
+        await viewModel.RefreshCommand.ExecuteAsync(null);
+
+        Assert.Equal(
+            ["传出的更改", "outgoing", "incoming", "传入的更改", "common"],
+            viewModel.LogRows.Select(row => row.Commit.Subject));
+        var outgoingBoundary = viewModel.LogRows[0].Graph!;
+        var incomingBoundary = viewModel.LogRows[3].Graph!;
+        Assert.Equal(0, outgoingBoundary.DotLane);
+        Assert.Equal(1, incomingBoundary.DotLane);
+        Assert.True(incomingBoundary.DotLaneContinuesFromAbove);
+        Assert.Contains(0, incomingBoundary.PassLanes);
+        Assert.Contains(new GitGraphLink(1, 0), incomingBoundary.Links);
+        Assert.Equal(0, viewModel.LogRows[4].Graph!.DotLane);
     }
 
     [Fact]
@@ -1703,8 +1787,7 @@ public sealed class GitViewModelTests : IDisposable
 
         // 单击「传入的更改」行:与提交行同一展开机制,懒加载 diff 范围(HEAD...origin/main)
         // 的合并文件影响;收起再展开不重复请求
-        var incomingRow = viewModel.LogRows[0];
-        Assert.Equal("传入的更改 1", incomingRow.Commit.Subject);
+        var incomingRow = Assert.Single(viewModel.LogRows, row => row.Commit.Subject == "传入的更改");
 
         viewModel.ToggleLogRowCommand.Execute(incomingRow);
         Assert.True(incomingRow.IsExpanded);
@@ -1741,5 +1824,74 @@ public sealed class GitViewModelTests : IDisposable
         Assert.True(viewModel.StashAllChangesCommand.CanExecute(null));
         await viewModel.StashAllChangesCommand.ExecuteAsync(null);
         Assert.Equal(1, git.StashPushCalls);
+    }
+
+    // ===== Git 标签右键菜单:操作项携带标签名 + 选中变化联动通知 =====
+
+    private static GitLogRow TaggedRow(string tagName) => new(
+        new GitCommitInfo("a".PadRight(40, '0'), "aaaaaaa", "tagged", null, "A", "a@x", DateTimeOffset.UtcNow,
+            Refs: [new GitRefInfo(tagName, GitRefKind.Tag)]), null);
+
+    [Fact]
+    public void TagMenuNodes_CarryTagNameOnEveryAction()
+    {
+        var (viewModel, _, _, _, _) = Create();
+        var row = TaggedRow("v1.0");
+        viewModel.LogRows.Add(row);
+        viewModel.SelectedLogRow = row;
+
+        var tagNode = Assert.Single(viewModel.SelectedLogRowTagMenus);
+        Assert.Equal("v1.0", tagNode.TagName);
+        // 参数随条目携带:嵌套弹出层内 AncestorType 查找不跨 Popup 边界(会解析为 null,
+        // 命令静默无操作——删除标签点击无反应的根因)。
+        Assert.All(tagNode.Actions, item =>
+        {
+            Assert.Equal("v1.0", item.TagName);
+            Assert.True(item.Command.CanExecute(item.TagName));
+        });
+    }
+
+    [Fact]
+    public void SelectedLogRowChange_NotifiesDerivedTagMenuProperties()
+    {
+        var (viewModel, _, _, _, _) = Create();
+        viewModel.LogRows.Add(TaggedRow("v1.0"));
+        viewModel.LogRows.Add(TaggedRow("v2.0"));
+        viewModel.SelectedLogRow = viewModel.LogRows[0];
+
+        var notified = new List<string?>();
+        viewModel.PropertyChanged += (_, e) => notified.Add(e.PropertyName);
+        viewModel.SelectedLogRow = viewModel.LogRows[1];
+
+        // 缺少联动通知时,ContextMenu 子树绑定只在首次打开时求值,子菜单永远停留在
+        // 首次快照(过期标签/空菜单)。
+        Assert.Contains(nameof(GitViewModel.SelectedLogRowTags), notified);
+        Assert.Contains(nameof(GitViewModel.SelectedLogRowTagMenus), notified);
+        Assert.Equal("v2.0", Assert.Single(viewModel.SelectedLogRowTagMenus).TagName);
+    }
+
+    [Fact]
+    public async Task DeleteTagCommand_DeletesThroughGitServiceAfterConfirmation()
+    {
+        var (viewModel, git, _, confirmation, _) = Create();
+        confirmation.Result = true;
+        viewModel.RepositoryPath = _repoPath;
+
+        await viewModel.DeleteTagCommand.ExecuteAsync("v1.0");
+
+        Assert.Equal(1, confirmation.Calls);
+        Assert.Equal(["v1.0"], git.DeletedTags);
+    }
+
+    [Fact]
+    public async Task DeleteTagCommand_WithoutTagName_IsSilentlyIgnored()
+    {
+        var (viewModel, git, _, confirmation, _) = Create();
+
+        await viewModel.DeleteTagCommand.ExecuteAsync(null);
+
+        // CommandParameter 绑定失败的旧缺陷形态:参数为 null → 静默返回(无确认、无删除)。
+        Assert.Equal(0, confirmation.Calls);
+        Assert.Empty(git.DeletedTags);
     }
 }

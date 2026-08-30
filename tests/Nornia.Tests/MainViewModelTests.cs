@@ -49,12 +49,11 @@ public sealed class MainViewModelTests
         var cache = new CacheViewModel(
             new FakeCacheInventory([]),
             new FakeCacheCleanup(),
-            new FakePackageRepository(),
-            new CachePackageAssociationService(),
+            new CacheClassificationService(),
             confirmation,
             logService,
             new FakeUiDispatcher());
-        var packages = new PackagesViewModel(packageProvider, packageInventory, confirmation, logService, cache);
+        var packages = new PackagesViewModel(packageProvider, packageInventory, confirmation, logService);
         var settingsService = new FakeSettingsService();
         var workspaceService = new FakeProjectWorkspaceService();
         var projects = new ProjectsViewModel(

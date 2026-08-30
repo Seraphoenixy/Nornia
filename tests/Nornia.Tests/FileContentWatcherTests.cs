@@ -63,6 +63,17 @@ public sealed class FileContentWatcherTests : IDisposable
     public void DefaultDebounceInterval_Is200Milliseconds() =>
         Assert.Equal(TimeSpan.FromMilliseconds(200), FileContentWatcher.DefaultDebounceInterval);
 
+    /// <summary>去抖计时器回调在线程池上排队,2 核 CI 满负载下会显著晚到;
+    /// "睡眠固定时长后断言已触发"会稳定误报,统一用截止时间轮询等待。</summary>
+    private static void WaitUntil(Func<bool> condition, int timeoutMs = 5000)
+    {
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        while (!condition() && DateTime.UtcNow < deadline)
+        {
+            Thread.Sleep(15);
+        }
+    }
+
     [Fact]
     public void Watch_TargetedFile_IgnoresOtherFilesInSameDirectory()
     {
@@ -81,7 +92,7 @@ public sealed class FileContentWatcherTests : IDisposable
 
         watcher.HandleFileSystemEvent(target);
         Assert.Equal(0, count); // still inside the debounce window
-        Thread.Sleep(200);
+        WaitUntil(() => Volatile.Read(ref count) >= 1);
         Assert.Equal(1, count);
     }
 
@@ -100,7 +111,7 @@ public sealed class FileContentWatcherTests : IDisposable
         }
 
         Assert.Equal(0, count); // still inside the debounce window
-        Thread.Sleep(400);
+        WaitUntil(() => Volatile.Read(ref count) >= 1);
         Assert.Equal(1, count); // the whole burst collapsed into one notification
     }
 
@@ -200,7 +211,7 @@ public sealed class FileContentWatcherTests : IDisposable
         watcher.Watch(target);
 
         watcher.HandleFileSystemEvent(target);
-        Thread.Sleep(400); // debounce elapsed
+        WaitUntil(() => dispatcher.Invoked.Count >= 1); // 去抖回调在线程池上排队,满负载下晚到
         Assert.Equal(0, raised); // queued, not executed inline
 
         foreach (var action in dispatcher.Invoked)
@@ -230,7 +241,7 @@ public sealed class FileContentWatcherTests : IDisposable
         // Re-watch after unwatch must work again.
         watcher.Watch(target);
         watcher.HandleFileSystemEvent(target);
-        Thread.Sleep(300);
+        WaitUntil(() => Volatile.Read(ref count) >= 1);
         Assert.Equal(1, count);
     }
 
@@ -274,7 +285,7 @@ public sealed class FileContentWatcherTests : IDisposable
 
         watcher.HandleFileSystemEvent(targetA);
         watcher.HandleFileSystemEvent(targetB);
-        Thread.Sleep(300);
+        WaitUntil(() => raised.Count >= 2);
 
         lock (raised)
         {

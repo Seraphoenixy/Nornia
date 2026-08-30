@@ -98,7 +98,8 @@ public sealed class PackageCacheScanCommand(CliServices services) : ICommand
 
     public async Task<int> ExecuteAsync(IReadOnlyList<string> args, CancellationToken cancellationToken)
     {
-        CliOutput.PrintCaches(await services.CacheInventory.ScanForcedAsync(services.CacheProgress, cancellationToken));
+        var candidates = await services.CacheInventory.ScanForcedAsync(progress: null, cancellationToken);
+        CliOutput.PrintCaches(services.CacheClassification.Classify(candidates));
         return 0;
     }
 }
@@ -136,7 +137,8 @@ public sealed class PackageCacheCleanCommand(CliServices services) : ICommand
             throw new ArgumentException(CliText.Get("Cache_Clean_RequiresId"));
         }
 
-        var candidates = await services.CacheInventory.ScanAsync(services.CacheProgress, cancellationToken);
+        var candidates = services.CacheClassification.Classify(
+            await services.CacheInventory.ScanAsync(progress: null, cancellationToken));
         CliOutput.PrintCaches(candidates.Where(candidate => ids.Contains(candidate.Id, StringComparer.OrdinalIgnoreCase)));
         if (!apply)
         {
@@ -144,7 +146,7 @@ public sealed class PackageCacheCleanCommand(CliServices services) : ICommand
             return 0;
         }
 
-        foreach (var result in await services.CacheCleanup.CleanAsync(ids, services.CacheProgress, cancellationToken))
+        foreach (var result in await services.CacheCleanup.CleanAsync(ids, progress: null, cancellationToken))
         {
             Console.WriteLine($"{result.Status}\t{result.ReclaimedBytes}\t{result.Path}\t{result.Message}");
         }

@@ -72,7 +72,7 @@ public static class ServiceCollectionExtensions
             .AddSingleton<IRuntimePackageResolver>(provider => provider.GetRequiredService<RuntimePackageResolver>())
             .AddSingleton<PackageInventoryService>()
             .AddSingleton<IPackageInventoryService>(provider => provider.GetRequiredService<PackageInventoryService>())
-            .AddSingleton<CachePackageAssociationService>()
+            .AddSingleton<CacheClassificationService>()
             // Resolve AppDataCacheService through an explicit factory: its parameterized constructor
             // (IEnumerable<string> roots) would otherwise be chosen by the DI container's
             // "most parameters" rule, which injects an EMPTY list for IEnumerable<string>, leaving the

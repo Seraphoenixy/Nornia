@@ -40,7 +40,7 @@ Git 集成（仿 VS Code 源码管理，只读 diff、不提供编辑）：Deskt
 
 Desktop 的“终端”页会发现 PowerShell 7、Windows PowerShell、cmd、Git Bash 和 WSL；可添加本机自定义 Shell 路径，并以项目工作目录启动多个会话。终端输出最多保留 200,000 个字符，关闭标签或退出应用会终止对应子进程。
 
-缓存管理会扫描 `%LOCALAPPDATA%`、`%APPDATA%` 和用户根目录中的应用及开发工具缓存；用户根目录下的 `.cache`、`.npm`、NuGet、Gradle、Maven、Cargo、Yarn、Bun 与 Go 缓存可被识别，同时跳过 Documents、Downloads、OneDrive 等用户数据树。清理只删除候选目录内容并保留目录本身。
+缓存管理会扫描 `%LOCALAPPDATA%`、`%APPDATA%` 和用户根目录中的应用及开发工具缓存；它不读取或关联已安装软件包，而是根据目录名称推测 Google Chrome、Microsoft Edge、npm、NuGet、Gradle、Maven、Cargo、Yarn、Bun、Go Modules 等应用或生态分类，将同类缓存汇总以便审查。扫描会跳过 Documents、Downloads、OneDrive 等用户数据树；清理只删除候选目录内容并保留目录本身。
 
 环境版本可使用前缀（如 `10`、`3.13`）或比较器范围（如 `>=22 <23`）。`env plan` 只生成修复建议；只有 `env fix --apply` 或 Desktop 中确认“应用修复”后才会调用 Winget。
 

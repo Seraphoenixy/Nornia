@@ -46,8 +46,8 @@ public sealed class WorkbenchMainViewModelTests
         var runtime = new RuntimeViewModel(runtimeInventory, packageProvider, packageInventory, resolver, confirmation, logs);
         var tools = new ToolsViewModel(runtimeInventory, packageProvider, packageInventory, resolver, confirmation, logs);
         var cache = new CacheViewModel(new FakeCacheInventory([]), new FakeCacheCleanup(),
-            new FakePackageRepository(), new CachePackageAssociationService(), confirmation, logs, new FakeUiDispatcher());
-        var packages = new PackagesViewModel(packageProvider, packageInventory, confirmation, logs, cache);
+            new CacheClassificationService(), confirmation, logs, new FakeUiDispatcher());
+        var packages = new PackagesViewModel(packageProvider, packageInventory, confirmation, logs);
         var environment = new EnvironmentManagementViewModel(dashboard, runtime, tools, packages, cache, logs, clipboard);
 
         var settingsService = new FakeSettingsService();
@@ -444,9 +444,10 @@ public sealed class WorkbenchMainViewModelTests
 
         // 默认配置已切换并持久化(写入用户作用域);已有会话保持不变(仍用创建时的 Shell)。
         // PersistDefaultShellAsync 在后台异步写入(真实 jsonc 文件读改写);轮询直到设置落盘。
-        // 预算给到 5 秒:并行测试负载下本地文件 IO 偶发超过 1 秒(此前因此偶发 flake)。
+        // 预算给到 30 秒:并行测试负载下本地文件 IO 偶发超过 1 秒(此前因此偶发 flake),
+        // 2 核 CI 全量套件下实测会超过 5 秒。
         var persisted = false;
-        for (var i = 0; i < 100; i++)
+        for (var i = 0; i < 600; i++)
         {
             var snapshot = await settingsService.GetSnapshotAsync(new SettingsContext());
             if (string.Equals("cmd", snapshot.Effective(BuiltInSettingsCatalog.TerminalDefaultProfile), StringComparison.Ordinal))

@@ -192,9 +192,9 @@ public sealed class ReadingOptionsPersistenceTests : IDisposable
         tab.FontSize = 19;
 
         var persisted = false;
-        // 预算 10 秒:并行测试负载下线程池饥饿偶发延长提交(此前 300×5ms 偶发 flake),
-        // 单次提交实际在毫秒级,10s 预算不影响测试灵敏度。
-        for (var i = 0; i < 2000; i++)
+        // 预算 30 秒:并行测试负载下线程池饥饿偶发延长提交(此前 300×5ms 偶发 flake),
+        // 2 核 CI 全量套件下实测会超过 10s;单次提交实际在毫秒级,大预算不影响测试灵敏度。
+        for (var i = 0; i < 6000; i++)
         {
             var snapshot = await settings.GetSnapshotAsync(new SettingsContext { LanguageId = languageId });
             if (snapshot.Effective(BuiltInSettingsCatalog.EditorWordWrap) != "off"

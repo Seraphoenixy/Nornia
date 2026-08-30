@@ -274,18 +274,29 @@ public sealed class DesignSystemResourceTests
         // 泳道几何与视图列宽同源:模板列宽注释引用 GitGraphLayout.CellWidth,二者不得漂移。
         var gitView = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
         Assert.Contains("GitGraphLayout.CellWidth", gitView);
+        Assert.Contains("row.DotDashed ? DashStyles.Dash : DashStyles.Solid", cell);
+        Assert.Contains("<Run Text=\"{Binding SyncTarget, Mode=OneWay}\"", gitView);
+        Assert.Contains("分界位于远端提交之后、共同/本地历史之前", gitView);
     }
 
     [Fact]
     public void ButtonOpenedContextMenus_ToggleClosedOnSecondClick()
     {
         var code = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml.cs"));
+        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
 
         Assert.Equal(2, Regex.Matches(code, "ToggleButtonContextMenu\\(button, menu\\);").Count);
-        Assert.Contains("_suppressMenuOpenButtons.Remove(button)", code);
-        Assert.Contains("button.IsMouseOver", code);
-        Assert.Contains("Mouse.LeftButton == MouseButtonState.Pressed", code);
-        Assert.Contains("menu.IsOpen = false", code);
+        // Toggle 必须在 Preview 阶段完成:下压时菜单仍开着,此刻关闭并吞掉事件。若放行到
+        // Click,ButtonBase 在 MouseDown 捕获鼠标时已顺带关闭菜单(Closed 路由事件在该
+        // 路径不触发),Click 只能看到一个已关闭的菜单而立即重开(再次点击关不掉)。
+        Assert.Equal(5, Regex.Matches(view, "PreviewMouseLeftButtonDown=\"MenuToggleButton_PreviewMouseLeftButtonDown\"").Count);
+        Assert.Contains("IsOpen: true } menu", code);
+        // 双保险:Click 侧以 IsOpen 变化记录的"刚关闭时刻"兜底(关闭与 Click 的竞态、
+        // 或预览阶段被外部关闭处理器抢先时,靠 400ms 时间窗识别"这次按压就是关闭手势")。
+        Assert.Contains("DependencyPropertyDescriptor.FromProperty(ContextMenu.IsOpenProperty", code);
+        Assert.Contains("Environment.TickCount64 - closedAt < 400", code);
+        Assert.DoesNotContain("_suppressMenuOpenButtons", code);
+        Assert.DoesNotContain("button.IsMouseOver", code);
     }
 
     [Fact]
@@ -1694,6 +1705,26 @@ public sealed class DesignSystemResourceTests
         Assert.Contains("MouseLeftButtonUp=\"CommitBar_MouseLeftButtonUp\"", view);
         Assert.DoesNotContain("Gesture=\"LeftClick\"\n                          Command=\"{Binding DataContext.ToggleLogRowCommand", view);
         Assert.Contains("ToggleLogRowCommand.Execute(row)", code);
+        Assert.Contains("VirtualizingPanel.ScrollUnit=\"Pixel\"", view);
+    }
+
+    [Fact]
+    public void GitTagContextMenu_ActionsCarryTagNameAndInheritThemedMenuItemStyle()
+    {
+        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
+        var model = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/ViewModels/GitViewModel.cs"));
+
+        // 操作项参数必须取条目自带 TagName:操作项位于标签 MenuItem 的嵌套弹出层内,
+        // RelativeSource AncestorType 不跨 Popup 边界,祖先查找恒为 null → 删除/推送/检出
+        // 等命令静默无操作("删除标签点击没反应"的根因)。
+        Assert.DoesNotContain("AncestorType=MenuItem", view);
+        Assert.Contains("<Setter Property=\"CommandParameter\" Value=\"{Binding TagName}\" />", view);
+        Assert.Contains("record GitMenuCommandItem(string Header, System.Windows.Input.ICommand Command, string TagName)", model);
+
+        // 嵌套菜单三层样式 + RecentCommitMessages/分支菜单的 ItemContainerStyle 必须以
+        // 主题隐式 MenuItem 样式为基,否则弹出层回落系统默认模板(丢失主题)。
+        var basedOnCount = view.Split("BasedOn=\"{StaticResource {x:Type MenuItem}}\"").Length - 1;
+        Assert.True(basedOnCount >= 5, $"GitView 菜单样式应至少 5 处 BasedOn 主题 MenuItem 样式,实际 {basedOnCount}");
     }
 
     [Fact]
@@ -1728,6 +1759,30 @@ public sealed class DesignSystemResourceTests
         Assert.Contains("CellStyle=\"{StaticResource EnvironmentDataGridCellStyle}\"", tools);
         Assert.Equal(2, CountOccurrences(packages, "CellStyle=\"{StaticResource EnvironmentDataGridCellStyle}\""));
         Assert.Equal(2, CountOccurrences(cache, "CellStyle=\"{StaticResource EnvironmentDataGridCellStyle}\""));
+    }
+
+    [Fact]
+    public void CachePage_UsesResizableSummaryAndDetailTables()
+    {
+        var cache = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/CacheView.xaml"));
+
+        Assert.Contains("Height=\"2*\" MinHeight=\"120\"", cache);
+        Assert.Contains("Height=\"3*\" MinHeight=\"160\"", cache);
+        Assert.Contains("Style=\"{StaticResource HorizontalSashStyle}\"", cache);
+        Assert.Contains("ResizeBehavior=\"PreviousAndNext\"", cache);
+        Assert.Contains("SelectionMode=\"Single\"", cache);
+        Assert.Contains("Header=\"已选/总计\"", cache);
+        Assert.Contains("Header=\"清理空间/总空间\"", cache);
+        Assert.Contains("Header=\"类型\"", cache);
+        Assert.Contains("Header=\"占用空间\"", cache);
+        Assert.Contains("DataGridTemplateColumn Header=\"清理\"", cache);
+        Assert.Contains("CellStyle=\"{StaticResource CacheSelectionCellStyle}\"", cache);
+        Assert.Contains("HorizontalAlignment=\"Stretch\" VerticalAlignment=\"Stretch\"", cache);
+        Assert.Contains("HorizontalContentAlignment=\"Center\" VerticalContentAlignment=\"Center\"", cache);
+        Assert.Contains("Background=\"Transparent\"", cache);
+        Assert.Contains("Content=\"全选\" Command=\"{Binding SelectAllInCategoryCommand}\"", cache);
+        Assert.Contains("Content=\"全不选\" Command=\"{Binding ClearCategorySelectionCommand}\"", cache);
+        Assert.DoesNotContain("b:MultiSelectorBinding.SelectedItems=\"{Binding SelectedCategorySummaries}\"", cache);
     }
 
     [Fact]

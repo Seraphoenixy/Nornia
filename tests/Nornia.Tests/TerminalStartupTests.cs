@@ -4,6 +4,12 @@ using System.IO;
 
 namespace Nornia.Tests;
 
+/// <summary>真实进程集成测试(ConPTY + 实际 pwsh)不与其它测试集并行:2 核 CI 上与
+/// 全量套件并行争用时,这些测试的真实 shell 启动会占满两个核心,拖垮其它测试的
+/// 异步投递链(如 SettingsLiveEffect 的 watch 通道),造成大面积超时误报。</summary>
+[CollectionDefinition("TerminalStartupSequential", DisableParallelization = true)]
+public sealed class TerminalStartupSequentialCollection;
+
 /// <summary>
 /// Regression coverage for the reported "启动 PowerShell 7失败：NullReferenceException" on repeated
 /// 新建终端 clicks. The crash lived in the WPF binding layer (Session re-bind with a fallback
@@ -11,6 +17,7 @@ namespace Nornia.Tests;
 /// session-creation side stays safe in BOTH modes (ConPTY interactive or redirected fallback).
 /// Real shell processes are spawned; machines without PowerShell 7 skip.
 /// </summary>
+[Collection("TerminalStartupSequential")]
 public sealed class TerminalStartupTests
 {
     [Fact]

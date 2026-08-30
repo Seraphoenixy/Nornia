@@ -153,8 +153,8 @@ public sealed partial class MainViewModelQuickInputTests
         var runtime = new RuntimeViewModel(runtimeInventory, packageProvider, packageInventory, resolver, confirmation, logs);
         var tools = new ToolsViewModel(runtimeInventory, packageProvider, packageInventory, resolver, confirmation, logs);
         var cache = new CacheViewModel(new FakeCacheInventory([]), new FakeCacheCleanup(),
-            new FakePackageRepository(), new CachePackageAssociationService(), confirmation, logs, new FakeUiDispatcher());
-        var packages = new PackagesViewModel(packageProvider, packageInventory, confirmation, logs, cache);
+            new CacheClassificationService(), confirmation, logs, new FakeUiDispatcher());
+        var packages = new PackagesViewModel(packageProvider, packageInventory, confirmation, logs);
         return new Nornia.Desktop.ViewModels.MainViewModel(
             dashboard, runtime, tools, packages, new ProjectsViewModel(
                 new FakeProfileService(), new FakeCheckEngine([]), new FakeRepairPlanner(new EnvironmentRepairPlan([])),

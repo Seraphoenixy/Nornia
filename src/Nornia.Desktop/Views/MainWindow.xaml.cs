@@ -1022,8 +1022,8 @@ public partial class MainWindow : Window
             PackagesViewModel packages when ReferenceEquals(dataGrid.ItemsSource, packages.FilteredPackages)
                 || ReferenceEquals(dataGrid.ItemsSource, packages.SearchView)
                 => TryExecute(packages.CopySelectedPackagesCommand),
-            CacheViewModel cache when ReferenceEquals(dataGrid.ItemsSource, cache.PackageSummaries)
-                => TryExecute(cache.CopySelectedPackageSummariesCommand),
+            CacheViewModel cache when ReferenceEquals(dataGrid.ItemsSource, cache.CategorySummaries)
+                => TryExecute(cache.CopySelectedCategorySummariesCommand),
             CacheViewModel cache when ReferenceEquals(dataGrid.ItemsSource, cache.FilteredCandidates)
                 => TryExecute(cache.CopySelectedCandidatesCommand),
             _ => false

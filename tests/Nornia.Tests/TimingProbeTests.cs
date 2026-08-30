@@ -48,10 +48,10 @@ public sealed class TimingProbeTests
         Step("runtime", sw);
         var tools = new ToolsViewModel(runtimeInventory, packageProvider, packageInventory, resolver, confirmation, logService);
         Step("tools", sw);
-        var cache = new CacheViewModel(new FakeCacheInventory([]), new FakeCacheCleanup(), new FakePackageRepository(),
-            new CachePackageAssociationService(), confirmation, logService, new FakeUiDispatcher());
+        var cache = new CacheViewModel(new FakeCacheInventory([]), new FakeCacheCleanup(),
+            new CacheClassificationService(), confirmation, logService, new FakeUiDispatcher());
         Step("cache", sw);
-        var packages = new PackagesViewModel(packageProvider, packageInventory, confirmation, logService, cache);
+        var packages = new PackagesViewModel(packageProvider, packageInventory, confirmation, logService);
         Step("packages", sw);
         var settingsService = new FakeSettingsService();
         var workspaceService = new FakeProjectWorkspaceService();

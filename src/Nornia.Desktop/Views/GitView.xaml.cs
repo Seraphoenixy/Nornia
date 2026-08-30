@@ -42,9 +42,10 @@ public partial class GitView : UserControl
     private GitViewModel? _layoutViewModel;
     private GitChangeItem? _flatChangeReopenCandidate;
     private ListBox? _flatChangeReopenList;
-    // ContextMenu 在点击其 PlacementTarget 时会先自动关闭、随后才触发 Button.Click。
-    // 记录这种关闭，避免 Click 处理器立即把同一个菜单重新打开。
-    private readonly HashSet<Button> _suppressMenuOpenButtons = [];
+    // 按钮下拉菜单的"刚关闭"时刻:Click 相对关闭的先后决定它属于打开还是关闭手势
+    // (ButtonBase 捕获导致的菜单关闭不触发 Closed 路由事件,只能从 IsOpen 变化捕获)。
+    private readonly HashSet<Button> _menuCloseWatched = [];
+    private readonly Dictionary<Button, long> _menuClosedAtTicks = [];
 
     public GitView()
     {
@@ -229,10 +230,39 @@ public partial class GitView : UserControl
         }
     }
 
+    /// <summary>下压瞬间菜单还开着 → 在此关闭并吞掉事件,实现"再次点击按钮关闭下拉菜单"。
+    /// 必须用 Preview 而非 Click:ButtonBase 在 MouseLeftButtonDown 捕获鼠标时顺带抢走
+    /// 打开中菜单的捕获,菜单经捕获丢失路径关闭且 <c>ContextMenu.Closed</c> 不触发,
+    /// 随后的 Click 只能看到一个已关闭的菜单而立即把它重新打开(菜单"关不掉")。</summary>
+    private void MenuToggleButton_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (sender is Button { ContextMenu: { IsOpen: true } menu })
+        {
+            menu.IsOpen = false;
+            e.Handled = true;
+        }
+    }
+
     private void ToggleButtonContextMenu(Button button, ContextMenu menu)
     {
-        if (_suppressMenuOpenButtons.Remove(button))
+        if (_menuCloseWatched.Add(button))
         {
+            // ButtonBase 在 MouseDown 捕获鼠标会顺带关掉打开中的菜单,该路径不触发
+            // ContextMenu.Closed 路由事件;改挂 IsOpen 依赖属性,任何关闭都记录时刻,
+            // 供 Click 判定"这次按压是否就是关闭手势本身"。
+            DependencyPropertyDescriptor.FromProperty(ContextMenu.IsOpenProperty, typeof(ContextMenu))
+                .AddValueChanged(menu, (_, _) =>
+                {
+                    if (!menu.IsOpen) _menuClosedAtTicks[button] = Environment.TickCount64;
+                });
+        }
+
+        // 下压时菜单已被本次按压顺带关闭(见 Preview 处理器;或关闭与 Click 的竞态):
+        // 这次 Click 就是"关闭"手势本身,不得重开。400ms 覆盖单次按压的全程。
+        if (_menuClosedAtTicks.TryGetValue(button, out var closedAt)
+            && Environment.TickCount64 - closedAt < 400)
+        {
+            _menuClosedAtTicks.Remove(button);
             return;
         }
 
@@ -244,19 +274,7 @@ public partial class GitView : UserControl
 
         menu.PlacementTarget = button;
         menu.Placement = PlacementMode.Bottom;
-        menu.Closed -= ButtonContextMenu_Closed;
-        menu.Closed += ButtonContextMenu_Closed;
         menu.IsOpen = true;
-    }
-
-    private void ButtonContextMenu_Closed(object sender, RoutedEventArgs e)
-    {
-        if (sender is ContextMenu { PlacementTarget: Button button }
-            && button.IsMouseOver
-            && Mouse.LeftButton == MouseButtonState.Pressed)
-        {
-            _suppressMenuOpenButtons.Add(button);
-        }
     }
 
     private void FolderRow_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)

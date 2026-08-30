@@ -38,9 +38,11 @@ public sealed class SettingsLiveEffectTests : IDisposable
         return path;
     }
 
-    // 15s:全量套件并行(1000+ 测试)下 CPU 争用会把"设置保存 → 工作台应用"的异步跳变
-    // 拉长,5s 预算偶发误报(条件最终都会成立,只是晚到)。
-    private static async Task WaitUntilAsync(Func<bool> condition, string failure, int timeoutMs = 15_000)
+    // 60s:设置变更经 ScopedSettingsService 的 watch 通道多跳异步投递(提交 → 通道 →
+    // watch 续延 → 重读快照 → Changed → 应用),每跳都依赖线程池线程。2 核 CI 上全量
+    // 套件并行(1000+ 测试 + 真实 shell 进程)会把链路拉长到远超短预算——实测 15s 在
+    // 满负载下必然超时(条件本身最终都成立,只是晚到),60s 提供足量余量。
+    private static async Task WaitUntilAsync(Func<bool> condition, string failure, int timeoutMs = 60_000)
     {
         var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
         while (!condition() && DateTime.UtcNow < deadline)
@@ -54,7 +56,11 @@ public sealed class SettingsLiveEffectTests : IDisposable
     private static async Task SetAsync<T>(FakeSettingsService settings, SettingKey<T> key, T value)
     {
         var baseline = await settings.GetSnapshotAsync(new SettingsContext());
-        await settings.CommitAsync(SettingsTransaction.Set(baseline, SettingScope.User, key, value));
+        var result = await settings.CommitAsync(SettingsTransaction.Set(baseline, SettingScope.User, key, value));
+        // 提交失败(如瞬时文件锁导致 FileError)必须在此可见,否则订阅者收不到变更,
+        // 失败会被错误地表现为下游"设置未应用"的超时。
+        Assert.True(result.Status == SettingsCommitStatus.Success,
+            $"设置提交失败: {result.Status} {result.ErrorMessage} (key={key.Id})");
     }
 
     private static GitFileDiff SampleDiff() => new("src/A.cs", null, false, false, false,
@@ -119,8 +125,7 @@ public sealed class SettingsLiveEffectTests : IDisposable
         await SetAsync(settings, BuiltInSettingsCatalog.EditorLimitValue, 10);
 
         // 全部为常驻标签:上限降低只回收预览标签,常驻标签一个也不关闭。
-        await Task.Delay(300);
-        Assert.Equal(3, editor.Groups.AllTabs.Count());
+        await WaitUntilAsync(() => editor.Groups.AllTabs.Count() == 3, "上限降低误关闭了常驻标签");
     }
 
     [Fact]
@@ -271,14 +276,11 @@ public sealed class SettingsLiveEffectTests : IDisposable
         Assert.NotNull(service.Current);
 
         await SetAsync(settings, BuiltInSettingsCatalog.RestoreLastWorkspace, false);
-        await Task.Delay(300);
+        await WaitUntilAsync(() => service.Current?.ProjectPath == _tempDir, "关闭开关不应关闭已打开的工作区");
 
-        Assert.NotNull(service.Current); // 关闭开关不关闭已打开的工作区
-        Assert.Equal(_tempDir, service.Current.ProjectPath);
         // 再次打开开关:已有工作区 → 不重复恢复(不产生新上下文)。
         var before = service.Current;
         await SetAsync(settings, BuiltInSettingsCatalog.RestoreLastWorkspace, true);
-        await Task.Delay(300);
-        Assert.Same(before, service.Current);
+        await WaitUntilAsync(() => ReferenceEquals(before, service.Current), "重新打开开关不应产生新工作区上下文");
     }
 }

@@ -57,7 +57,8 @@ public abstract partial class PageViewModel(string title, IUiLogService logServi
         string operation,
         Func<CancellationToken, Task> action,
         string recommendedNextStep = "",
-        bool canCancel = true)
+        bool canCancel = true,
+        Func<string>? successMessageFactory = null)
     {
         if (IsBusy)
         {
@@ -81,7 +82,7 @@ public abstract partial class PageViewModel(string title, IUiLogService logServi
         try
         {
             await action(_operationCancellation.Token);
-            StatusMessage = $"{operation}完成";
+            StatusMessage = successMessageFactory?.Invoke() ?? $"{operation}完成";
             CurrentOperation.Phase = OperationPhase.Succeeded;
             CurrentOperation.Detail = StatusMessage;
             LastOperationResult = new(correlationId, operation, OperationPhase.Succeeded, StatusMessage, recommendedNextStep);

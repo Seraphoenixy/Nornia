@@ -17,10 +17,10 @@ public static class CliOutput
 
     public static void PrintCaches(IEnumerable<CacheCandidate> caches)
     {
-        Console.WriteLine("ID\tCONFIDENCE\tTYPE\tSOURCE\tUSERDIR\tSIZE\tPATH\tREASON");
+        Console.WriteLine("ID\tCONFIDENCE\tCATEGORY\tTYPE\tSOURCE\tUSERDIR\tSIZE\tPATH\tREASON");
         foreach (var cache in caches)
         {
-            Console.WriteLine($"{cache.Id}\t{cache.Confidence}\t{cache.CacheTypeDisplay}\t{cache.Source}\t{cache.UserDirectory}\t{cache.SizeBytes}\t{cache.Path}\t{cache.Reason}");
+            Console.WriteLine($"{cache.Id}\t{cache.Confidence}\t{cache.CategoryDisplayName}\t{cache.CacheTypeDisplay}\t{cache.Source}\t{cache.UserDirectory}\t{cache.SizeBytes}\t{cache.Path}\t{cache.ClassificationReason ?? cache.Reason}");
         }
     }
 

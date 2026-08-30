@@ -25,7 +25,6 @@ public partial class PackagesViewModel(
     IPackageInventoryService inventoryService,
     IConfirmationService confirmationService,
     IUiLogService logService,
-    CacheViewModel cache,
     IClipboardService? clipboard = null,
     IUiPerformanceMetrics? performanceMetrics = null,
     IInventoryScanStateRepository? scanStateRepository = null)
@@ -41,14 +40,6 @@ public partial class PackagesViewModel(
     public ObservableCollection<PackageInfo> SelectedPackages { get; } = [];
     public ICollectionView FilteredPackages => CollectionViewSource.GetDefaultView(Packages);
     public ICollectionView SearchView => CollectionViewSource.GetDefaultView(SearchResults);
-
-    /// <summary>Cache workspace exposed to the packages page's "缓存" tab. Cache management is part of
-    /// the package management page rather than a standalone module, sharing the page lifecycle so a
-    /// single navigation entry drives both the package list and its cache review.</summary>
-    public CacheViewModel Cache { get; } = cache;
-
-    [ObservableProperty]
-    private int selectedWorkspaceTab;
 
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(InstallSelectedCommand))]
@@ -104,8 +95,6 @@ public partial class PackagesViewModel(
         };
         FilteredPackages.Filter = MatchesFilter;
         SearchView.Filter = MatchesSearch;
-        // 不再预激活缓存页:首次激活曾触发全盘缓存扫描,启动/进页即静默扫盘;
-        // 缓存数据改由“扫描缓存”按钮显式加载(缓存标签页自带空状态引导)。
         // 快照优先:先用持久化包清单立即渲染首屏(winget list 可能长达数十秒),再走
         // TTL 门控刷新;快照足够新时门控刷新直接返回库内数据,不运行 winget。
         await SeedPersistedPackagesAsync();
@@ -340,20 +329,10 @@ public partial class PackagesViewModel(
     {
         switch (context)
         {
-            case NavigationContext.CacheHighConfidence:
-                SelectedWorkspaceTab = 1;
-                Cache.ApplyNavigationContext(new NavigationContext.CacheHighConfidence());
-                break;
-            case NavigationContext.CacheByPackage(var id, var name, var provider):
-                SelectedWorkspaceTab = 1;
-                Cache.ApplyNavigationContext(new NavigationContext.CacheByPackage(id, name, provider));
-                break;
             case NavigationContext.Updates:
-                SelectedWorkspaceTab = 0;
                 ListMode = PackageListMode.Updates;
                 break;
             default:
-                SelectedWorkspaceTab = 0;
                 ListMode = PackageListMode.Installed;
                 break;
         }

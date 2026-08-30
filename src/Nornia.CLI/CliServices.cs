@@ -18,6 +18,7 @@ public sealed class CliServices(
     IPackageInventoryService packageInventory,
     ICacheInventoryService cacheInventory,
     ICacheCleanupService cacheCleanup,
+    CacheClassificationService cacheClassification,
     IEnvironmentProfileService profileService,
     IEnvironmentCheckEngine checkEngine,
     IEnvironmentRepairPlanner repairPlanner,
@@ -31,6 +32,7 @@ public sealed class CliServices(
     public IPackageInventoryService PackageInventory { get; } = packageInventory;
     public ICacheInventoryService CacheInventory { get; } = cacheInventory;
     public ICacheCleanupService CacheCleanup { get; } = cacheCleanup;
+    public CacheClassificationService CacheClassification { get; } = cacheClassification;
     public IEnvironmentProfileService ProfileService { get; } = profileService;
     public IEnvironmentCheckEngine CheckEngine { get; } = checkEngine;
     public IEnvironmentRepairPlanner RepairPlanner { get; } = repairPlanner;
@@ -39,7 +41,6 @@ public sealed class CliServices(
     public IProjectLauncher ProjectLauncher { get; } = projectLauncher;
 
     public IProgress<ProcessOutput> ProcessProgress { get; } = new CliProcessProgress();
-    public IProgress<string> CacheProgress { get; } = new CliCacheProgress();
 
     public static bool IsRuntime(CoreRuntime runtime) =>
         EnvironmentComponentCatalog.Get(runtime.Name)?.Category == EnvironmentComponentCategory.Runtime;
@@ -97,7 +98,6 @@ public sealed class CliServices(
         return (profile, installed, results);
     }
 }
-
 /// <summary>Streams process output to the console as it arrives.</summary>
 public sealed class CliProcessProgress : IProgress<ProcessOutput>
 {
@@ -112,10 +112,4 @@ public sealed class CliProcessProgress : IProgress<ProcessOutput>
             Console.WriteLine(value.Text);
         }
     }
-}
-
-/// <summary>Streams cache-scan progress to the console.</summary>
-public sealed class CliCacheProgress : IProgress<string>
-{
-    public void Report(string value) => Console.WriteLine(value);
 }

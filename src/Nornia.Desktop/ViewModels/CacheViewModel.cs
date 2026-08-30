@@ -17,16 +17,16 @@ public partial class CacheViewModel : PageViewModel, INavigationTarget
     private readonly ICacheInventoryService _inventoryService;
     private readonly ICacheCleanupService _cleanupService;
     private readonly IConfirmationService _confirmationService;
-    private readonly IPackageRepository _packageRepository;
-    private readonly CachePackageAssociationService _associationService;
+    private readonly CacheClassificationService _classificationService;
     private readonly IUiDispatcher _dispatcher;
     private readonly IClipboardService _clipboard;
+    private TimeSpan _lastScanElapsed;
+    private bool _suspendSelectionRefresh;
 
     public ObservableCollection<CacheCandidateItem> Candidates { get; } = [];
-    public ObservableCollection<CachePackageSummaryItem> PackageSummaries { get; } = [];
+    public ObservableCollection<CacheCategorySummaryItem> CategorySummaries { get; } = [];
 
-    /// <summary>Multi-selection for the package-summary grid and the candidate grid (Ctrl+C / 复制选中).</summary>
-    public ObservableCollection<CachePackageSummaryItem> SelectedPackageSummaries { get; } = [];
+    /// <summary>Multi-selection for the candidate grid (Ctrl+C / 复制选中).</summary>
     public ObservableCollection<CacheCandidateItem> SelectedCandidates { get; } = [];
     public ObservableCollection<string> SourceFilters { get; } = ["全部"];
     public ObservableCollection<string> TypeFilters { get; } = ["全部"];
@@ -43,7 +43,7 @@ public partial class CacheViewModel : PageViewModel, INavigationTarget
     private string typeFilter = "全部";
 
     [ObservableProperty]
-    private CachePackageSummaryItem? selectedPackageSummary;
+    private CacheCategorySummaryItem? selectedCategorySummary;
 
     [ObservableProperty]
     private CacheCandidateItem? selectedCandidate;
@@ -64,8 +64,7 @@ public partial class CacheViewModel : PageViewModel, INavigationTarget
     public CacheViewModel(
         ICacheInventoryService inventoryService,
         ICacheCleanupService cleanupService,
-        IPackageRepository packageRepository,
-        CachePackageAssociationService associationService,
+        CacheClassificationService classificationService,
         IConfirmationService confirmationService,
         IUiLogService logService,
         IUiDispatcher? dispatcher = null,
@@ -73,12 +72,10 @@ public partial class CacheViewModel : PageViewModel, INavigationTarget
     {
         _inventoryService = inventoryService;
         _cleanupService = cleanupService;
-        _packageRepository = packageRepository;
-        _associationService = associationService;
+        _classificationService = classificationService;
         _confirmationService = confirmationService;
         _dispatcher = dispatcher ?? new WpfUiDispatcher();
         _clipboard = clipboard ?? NullClipboardService.Instance;
-        SelectedPackageSummaries.CollectionChanged += (_, _) => NotifyCopyCommands();
         SelectedCandidates.CollectionChanged += (_, _) => NotifyCopyCommands();
         FilteredCandidates = CollectionViewSource.GetDefaultView(Candidates);
         FilteredCandidates.Filter = MatchesFilter;
@@ -95,54 +92,54 @@ public partial class CacheViewModel : PageViewModel, INavigationTarget
 
     [RelayCommand(CanExecute = nameof(CanScan))]
     private Task ScanAsync() => RunAsync("扫描应用缓存", async cancellationToken =>
-        await LoadCandidatesAsync(cancellationToken), "检查筛选条件或查看 Problems 后重试。", canCancel: true);
+        await LoadCandidatesAsync(cancellationToken), "检查筛选条件或查看 Problems 后重试。", canCancel: true,
+        successMessageFactory: BuildScanCompletionMessage);
 
     private bool CanScan() => !IsBusy;
 
     private async Task LoadCandidatesAsync(CancellationToken cancellationToken)
     {
-        // 过程信息降噪:不再打印“开始加载缓存清单(服务=…)”这类纯诊断行,保留扫描进度与终态汇总。
-        var progress = new Progress<string>(message => LogService.Write("INFO", message));
-        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
-        var rawCandidates = await _inventoryService.ScanForcedAsync(progress, cancellationToken);
+        var stopwatch = Stopwatch.StartNew();
+        var rawCandidates = await _inventoryService.ScanForcedAsync(progress: null, cancellationToken);
         stopwatch.Stop();
-        LogService.Write("INFO", $"缓存扫描完成：发现 {rawCandidates.Count} 个候选，耗时 {stopwatch.Elapsed.TotalSeconds:F1}s");
-        var packages = await _packageRepository.GetAllAsync(cancellationToken);
-        var associatedCandidates = _associationService.Associate(rawCandidates, packages);
-        var summaries = _associationService.Summarize(associatedCandidates);
-        LogService.Write("INFO", $"缓存关联汇总：{associatedCandidates.Count} 个候选归属 {summaries.Count} 个软件包分组");
+        _lastScanElapsed = stopwatch.Elapsed;
+        var classifiedCandidates = _classificationService.Classify(rawCandidates);
+        var summaries = _classificationService.Summarize(classifiedCandidates);
 
         await RunOnDispatcherAsync(() =>
         {
+            SelectedCandidates.Clear();
             foreach (var existing in Candidates) existing.PropertyChanged -= OnCandidatePropertyChanged;
             Candidates.Clear();
-            foreach (var candidate in associatedCandidates)
+            foreach (var candidate in classifiedCandidates)
             {
                 var item = new CacheCandidateItem(candidate);
                 item.PropertyChanged += OnCandidatePropertyChanged;
                 Candidates.Add(item);
             }
 
-            PackageSummaries.Clear();
+            CategorySummaries.Clear();
             foreach (var summary in summaries)
             {
-                PackageSummaries.Add(new CachePackageSummaryItem(summary));
+                CategorySummaries.Add(new CacheCategorySummaryItem(summary));
             }
 
-            SelectedPackageSummary = null;
+            RefreshSelectionState();
+            SelectedCategorySummary = CategorySummaries.FirstOrDefault();
             RebuildFilter(SourceFilters, SourceFilter, candidate => candidate.Source, value => SourceFilter = value);
             RebuildFilter(TypeFilters, TypeFilter, candidate => candidate.CacheType, value => TypeFilter = value);
             FilteredCandidates.Refresh();
-            RefreshSelectionSummary();
             NotifyCopyCommands();
             OnPropertyChanged(nameof(TotalSizeBytes));
             OnPropertyChanged(nameof(TotalSizeSummary));
             OnPropertyChanged(nameof(IsCandidateListEmpty));
         });
 
-        LogService.Write("INFO", $"缓存清单已刷新：{Candidates.Count} 个候选，{PackageSummaries.Count} 个软件包分组，可审查空间 {FormatSize(TotalSizeBytes)}");
-        StatusMessage = Candidates.Count == 0 ? "未发现可管理的缓存目录" : $"发现 {Candidates.Count} 个缓存候选，已按 {PackageSummaries.Count} 个软件包归类";
+        StatusMessage = Candidates.Count == 0 ? "未发现可管理的缓存目录" : $"发现 {Candidates.Count} 个缓存候选，已归为 {CategorySummaries.Count} 个推测分类";
     }
+
+    private string BuildScanCompletionMessage() =>
+        $"缓存扫描完成：{Candidates.Count} 个候选，{CategorySummaries.Count} 个分类，可审查空间 {FormatSize(TotalSizeBytes)}，耗时 {_lastScanElapsed.TotalSeconds:F1}s";
 
     /// <summary>Runs <paramref name="action"/> on the dispatcher (UI) thread, or inline when already
     /// there (or when no WPF application is running, e.g. under unit tests).</summary>
@@ -181,27 +178,31 @@ public partial class CacheViewModel : PageViewModel, INavigationTarget
         if (selected.Length > 12) summary += $"{Environment.NewLine}…以及 {selected.Length - 12} 项";
         if (!_confirmationService.Confirm("确认清理缓存", $"将清理所选缓存目录的内容，并保留目录本身：{Environment.NewLine}{Environment.NewLine}{summary}{Environment.NewLine}{Environment.NewLine}{SelectedSummary}{Environment.NewLine}{Environment.NewLine}已删除内容无法由 Nornia 撤销。选择“否”可安全取消。"))
         {
-            LogService.Write("INFO", "用户取消了缓存清理。");
+            CleanupResultSummary = "已取消缓存清理。";
             return;
         }
 
         var before = selected.Sum(candidate => candidate.SizeBytes);
-        var results = await _cleanupService.CleanAsync(selected.Select(candidate => candidate.Id).ToArray(), new Progress<string>(message => LogService.Write("INFO", message)), cancellationToken);
+        var results = await _cleanupService.CleanAsync(selected.Select(candidate => candidate.Id).ToArray(), progress: null, cancellationToken);
         foreach (var result in results)
         {
-            LogService.Write(result.Status == CacheCleanupStatus.Cleaned ? "INFO" : "WARNING", $"{result.Status}: {result.Path} {result.Message}");
+            if (result.Status != CacheCleanupStatus.Cleaned)
+            {
+                LogService.Write("WARNING", $"{result.Status}: {result.Path} {result.Message}");
+            }
         }
         var reclaimed = results.Where(result => result.Status == CacheCleanupStatus.Cleaned).Sum(result => result.ReclaimedBytes);
         CleanupResultSummary = $"清理完成：预计 {FormatSize(before)}，实际释放 {FormatSize(reclaimed)}。";
         await LoadCandidatesAsync(cancellationToken);
-    }, "仍有失败项时，可打开目录或查看 Problems。", canCancel: true);
+    }, "仍有失败项时，可打开目录或查看 Problems。", canCancel: true,
+        successMessageFactory: () => CleanupResultSummary);
 
-    [RelayCommand(CanExecute = nameof(CanCleanPackage))]
-    private Task CleanPackageAsync(CachePackageSummaryItem? summary) => RunAsync("清理软件包缓存", async cancellationToken =>
+    [RelayCommand(CanExecute = nameof(CanCleanCategory))]
+    private Task CleanCategoryAsync(CacheCategorySummaryItem? summary) => RunAsync("清理分类缓存", async cancellationToken =>
     {
         if (summary is null) return;
-        var selected = Candidates.Where(candidate => MatchesPackage(candidate, summary)).ToArray();
-        if (selected.Length == 0) throw new InvalidOperationException("该软件包没有可清理的缓存。");
+        var selected = Candidates.Where(candidate => candidate.IsSelected && MatchesCategory(candidate, summary)).ToArray();
+        if (selected.Length == 0) throw new InvalidOperationException("该分类没有已勾选的缓存项。");
         var reviewCount = selected.Count(candidate => candidate.Confidence == CacheConfidence.Review);
         var lines = string.Join(Environment.NewLine, selected.Take(12).Select(candidate =>
             $"• {(candidate.Confidence == CacheConfidence.Review ? "[需审查] " : string.Empty)}{candidate.Path} ({candidate.SizeDisplay})"));
@@ -210,23 +211,27 @@ public partial class CacheViewModel : PageViewModel, INavigationTarget
             ? $"{Environment.NewLine}{Environment.NewLine}注意：其中 {reviewCount} 项为「需审查」置信度，清理后无法恢复，请确认路径后再继续。"
             : string.Empty;
         if (!_confirmationService.Confirm(
-                "确认清理软件包缓存",
-                $"将清理软件包“{summary.PackageName}”的 {selected.Length} 个缓存目录内容，并保留目录本身：{Environment.NewLine}{Environment.NewLine}{lines}{Environment.NewLine}{Environment.NewLine}预计释放 {FormatSize(selected.Sum(candidate => candidate.SizeBytes))}。已删除内容无法由 Nornia 撤销。{reviewWarning}"))
+                "确认清理分类缓存",
+                $"“{summary.CategoryName}”是根据目录名称推测的分类。将清理该分类的 {selected.Length} 个缓存目录内容，并保留目录本身：{Environment.NewLine}{Environment.NewLine}{lines}{Environment.NewLine}{Environment.NewLine}预计释放 {FormatSize(selected.Sum(candidate => candidate.SizeBytes))}。已删除内容无法由 Nornia 撤销。{reviewWarning}"))
         {
-            LogService.Write("INFO", $"用户取消了软件包“{summary.PackageName}”的缓存清理。");
+            CleanupResultSummary = $"已取消分类“{summary.CategoryName}”的缓存清理。";
             return;
         }
 
         var before = selected.Sum(candidate => candidate.SizeBytes);
-        var results = await _cleanupService.CleanAsync(selected.Select(candidate => candidate.Id).ToArray(), new Progress<string>(message => LogService.Write("INFO", message)), cancellationToken);
+        var results = await _cleanupService.CleanAsync(selected.Select(candidate => candidate.Id).ToArray(), progress: null, cancellationToken);
         foreach (var result in results)
         {
-            LogService.Write(result.Status == CacheCleanupStatus.Cleaned ? "INFO" : "WARNING", $"{result.Status}: {result.Path} {result.Message}");
+            if (result.Status != CacheCleanupStatus.Cleaned)
+            {
+                LogService.Write("WARNING", $"{result.Status}: {result.Path} {result.Message}");
+            }
         }
         var reclaimed = results.Where(result => result.Status == CacheCleanupStatus.Cleaned).Sum(result => result.ReclaimedBytes);
-        CleanupResultSummary = $"软件包“{summary.PackageName}”清理完成：预计 {FormatSize(before)}，实际释放 {FormatSize(reclaimed)}。";
+        CleanupResultSummary = $"分类“{summary.CategoryName}”清理完成：预计 {FormatSize(before)}，实际释放 {FormatSize(reclaimed)}。";
         await LoadCandidatesAsync(cancellationToken);
-    }, "仍有失败项时，可打开目录或查看 Problems。", canCancel: true);
+    }, "仍有失败项时，可打开目录或查看 Problems。", canCancel: true,
+        successMessageFactory: () => CleanupResultSummary);
 
     [RelayCommand(CanExecute = nameof(CanOpenSelected))]
     private void OpenSelected()
@@ -237,14 +242,26 @@ public partial class CacheViewModel : PageViewModel, INavigationTarget
     [RelayCommand]
     private void SelectHighConfidence()
     {
-        foreach (var candidate in Candidates) candidate.IsSelected = candidate.Confidence == CacheConfidence.High;
+        SetCandidateSelection(candidate => candidate.Confidence == CacheConfidence.High);
         ConfidenceFilter = "高置信";
     }
 
     [RelayCommand]
     private void ClearSelection()
     {
-        foreach (var candidate in Candidates) candidate.IsSelected = false;
+        SetCandidateSelection(_ => false);
+    }
+
+    [RelayCommand(CanExecute = nameof(CanChangeCurrentCategorySelection))]
+    private void SelectAllInCategory()
+    {
+        SetCurrentCategorySelection(true);
+    }
+
+    [RelayCommand(CanExecute = nameof(CanChangeCurrentCategorySelection))]
+    private void ClearCategorySelection()
+    {
+        SetCurrentCategorySelection(false);
     }
 
     public void ApplyNavigationContext(NavigationContext? context)
@@ -255,43 +272,41 @@ public partial class CacheViewModel : PageViewModel, INavigationTarget
                 ConfidenceFilter = "高置信";
                 SelectHighConfidence();
                 break;
-            case NavigationContext.CacheByPackage(var id, var name, var provider):
-                ConfidenceFilter = "全部";
-                break;
         }
     }
 
     private bool CanClean() => Candidates.Any(candidate => candidate.IsSelected);
     private bool CanOpenSelected() => SelectedCandidate is not null && Directory.Exists(SelectedCandidate.Path);
-    private bool CanCleanPackage(CachePackageSummaryItem? summary) => summary is not null;
+    private bool CanCleanCategory(CacheCategorySummaryItem? summary) => summary is { SelectedCandidateCount: > 0 };
+    private bool CanChangeCurrentCategorySelection() => SelectedCategorySummary is not null;
 
     // ===== Copy commands (网格 复制选中 / 复制全部) =====
 
     private void NotifyCopyCommands()
     {
-        CopySelectedPackageSummariesCommand.NotifyCanExecuteChanged();
-        CopyAllPackageSummariesCommand.NotifyCanExecuteChanged();
+        CopySelectedCategorySummariesCommand.NotifyCanExecuteChanged();
+        CopyAllCategorySummariesCommand.NotifyCanExecuteChanged();
         CopySelectedCandidatesCommand.NotifyCanExecuteChanged();
         CopyAllCandidatesCommand.NotifyCanExecuteChanged();
     }
 
-    private static string FormatPackageSummary(CachePackageSummaryItem summary) =>
-        $"{summary.PackageName}\t{summary.PackageId}\t{summary.Provider}\t{summary.CandidateCount}\t{summary.SizeDisplay}";
+    private static string FormatCategorySummary(CacheCategorySummaryItem summary) =>
+        $"{summary.CategoryName}\t{summary.TypeDisplay}\t{summary.SelectionCountDisplay}\t{summary.SelectionSizeDisplay}";
 
     private static string FormatCandidate(CacheCandidateItem candidate) =>
-        $"{candidate.Confidence}\t{candidate.Source}\t{candidate.PackageName}\t{candidate.SizeDisplay}\t{candidate.Path}";
+        $"{(candidate.IsSelected ? "已勾选" : "未勾选")}\t{candidate.CacheType}\t{candidate.Confidence}\t{candidate.Path}\t{candidate.SizeDisplay}";
 
-    [RelayCommand(CanExecute = nameof(CanCopySelectedPackageSummaries))]
-    private void CopySelectedPackageSummaries() =>
-        _clipboard.SetText(string.Join(Environment.NewLine, SelectedPackageSummaries.Select(FormatPackageSummary)));
+    [RelayCommand(CanExecute = nameof(CanCopySelectedCategorySummaries))]
+    private void CopySelectedCategorySummaries() =>
+        _clipboard.SetText(FormatCategorySummary(SelectedCategorySummary!));
 
-    private bool CanCopySelectedPackageSummaries() => SelectedPackageSummaries.Count > 0;
+    private bool CanCopySelectedCategorySummaries() => SelectedCategorySummary is not null;
 
-    [RelayCommand(CanExecute = nameof(CanCopyAllPackageSummaries))]
-    private void CopyAllPackageSummaries() =>
-        _clipboard.SetText(string.Join(Environment.NewLine, PackageSummaries.Select(FormatPackageSummary)));
+    [RelayCommand(CanExecute = nameof(CanCopyAllCategorySummaries))]
+    private void CopyAllCategorySummaries() =>
+        _clipboard.SetText(string.Join(Environment.NewLine, CategorySummaries.Select(FormatCategorySummary)));
 
-    private bool CanCopyAllPackageSummaries() => PackageSummaries.Count > 0;
+    private bool CanCopyAllCategorySummaries() => CategorySummaries.Count > 0;
 
     [RelayCommand(CanExecute = nameof(CanCopySelectedCandidates))]
     private void CopySelectedCandidates() =>
@@ -308,12 +323,34 @@ public partial class CacheViewModel : PageViewModel, INavigationTarget
     partial void OnConfidenceFilterChanged(string value) => FilteredCandidates.Refresh();
     partial void OnSourceFilterChanged(string value) => FilteredCandidates.Refresh();
     partial void OnTypeFilterChanged(string value) => FilteredCandidates.Refresh();
-    partial void OnSelectedPackageSummaryChanged(CachePackageSummaryItem? value) => FilteredCandidates.Refresh();
+    partial void OnSelectedCategorySummaryChanged(CacheCategorySummaryItem? value)
+    {
+        if (value is null && CategorySummaries.Count > 0)
+        {
+            SelectedCategorySummary = CategorySummaries[0];
+            return;
+        }
+
+        // Category navigation is the primary detail selector. Reset secondary filters so selecting
+        // a valid category can never leave the detail grid blank because of a filter chosen for the
+        // previous category (for example, "nuget" followed by "Google Chrome").
+        if (value is not null)
+        {
+            TypeFilter = "全部";
+            ConfidenceFilter = "全部";
+            SourceFilter = "全部";
+        }
+
+        FilteredCandidates.Refresh();
+        CopySelectedCategorySummariesCommand.NotifyCanExecuteChanged();
+        SelectAllInCategoryCommand.NotifyCanExecuteChanged();
+        ClearCategorySelectionCommand.NotifyCanExecuteChanged();
+    }
 
     partial void OnSelectedCandidateChanged(CacheCandidateItem? value) => OpenSelectedCommand.NotifyCanExecuteChanged();
 
     private bool MatchesFilter(object value) => value is CacheCandidateItem candidate
-        && (SelectedPackageSummary is null || MatchesPackage(candidate, SelectedPackageSummary))
+        && (SelectedCategorySummary is null || MatchesCategory(candidate, SelectedCategorySummary))
         && (TypeFilter == "全部" || string.Equals(candidate.CacheType, TypeFilter, StringComparison.OrdinalIgnoreCase))
         && (SourceFilter == "全部" || string.Equals(candidate.Source, SourceFilter, StringComparison.OrdinalIgnoreCase))
         && ConfidenceFilter switch
@@ -323,22 +360,72 @@ public partial class CacheViewModel : PageViewModel, INavigationTarget
             _ => true
         };
 
-    private static bool MatchesPackage(CacheCandidateItem candidate, CachePackageSummaryItem summary) =>
-        string.Equals(candidate.PackageId, summary.PackageId, StringComparison.OrdinalIgnoreCase)
-        && string.Equals(candidate.PackageName, summary.PackageName, StringComparison.OrdinalIgnoreCase)
-        && string.Equals(candidate.Provider, summary.Provider, StringComparison.OrdinalIgnoreCase);
+    private static bool MatchesCategory(CacheCandidateItem candidate, CacheCategorySummaryItem summary) =>
+        string.Equals(candidate.CategoryKey, summary.CategoryKey, StringComparison.OrdinalIgnoreCase);
 
     private void OnCandidatePropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
-        if (e.PropertyName == nameof(CacheCandidateItem.IsSelected)) RefreshSelectionSummary();
+        if (e.PropertyName == nameof(CacheCandidateItem.IsSelected) && !_suspendSelectionRefresh)
+        {
+            RefreshSelectionState();
+        }
     }
 
-    private void RefreshSelectionSummary()
+    private void SetCandidateSelection(Func<CacheCandidateItem, bool> selector)
     {
+        _suspendSelectionRefresh = true;
+        try
+        {
+            foreach (var candidate in Candidates)
+            {
+                candidate.IsSelected = selector(candidate);
+            }
+        }
+        finally
+        {
+            _suspendSelectionRefresh = false;
+        }
+
+        RefreshSelectionState();
+    }
+
+    private void SetCurrentCategorySelection(bool isSelected)
+    {
+        var summary = SelectedCategorySummary;
+        if (summary is null)
+        {
+            return;
+        }
+
+        _suspendSelectionRefresh = true;
+        try
+        {
+            foreach (var candidate in Candidates.Where(candidate => MatchesCategory(candidate, summary)))
+            {
+                candidate.IsSelected = isSelected;
+            }
+        }
+        finally
+        {
+            _suspendSelectionRefresh = false;
+        }
+
+        RefreshSelectionState();
+    }
+
+    private void RefreshSelectionState()
+    {
+        foreach (var summary in CategorySummaries)
+        {
+            var selected = Candidates.Where(candidate => candidate.IsSelected && MatchesCategory(candidate, summary)).ToArray();
+            summary.UpdateSelection(selected.Length, selected.Sum(candidate => candidate.SizeBytes));
+        }
+
         OnPropertyChanged(nameof(SelectedCount));
         OnPropertyChanged(nameof(SelectedSizeBytes));
         OnPropertyChanged(nameof(SelectedSummary));
         CleanCommand.NotifyCanExecuteChanged();
+        CleanCategoryCommand.NotifyCanExecuteChanged();
     }
 
     private static string FormatSize(long size) => new CacheCandidateItem(new("", "", "", size, CacheConfidence.High, "")).SizeDisplay;
@@ -352,10 +439,10 @@ public partial class CacheCandidateItem(CacheCandidate candidate) : ObservableOb
     public long SizeBytes { get; } = candidate.SizeBytes;
     public CacheConfidence Confidence { get; } = candidate.Confidence;
     public string Reason { get; } = candidate.Reason;
-    public string PackageName { get; } = candidate.PackageDisplayName;
-    public string PackageId { get; } = candidate.PackageId ?? string.Empty;
+    public string CategoryKey { get; } = candidate.CategoryKey ?? string.Empty;
+    public string CategoryName { get; } = candidate.CategoryDisplayName;
+    public string ClassificationReason { get; } = candidate.ClassificationReason ?? string.Empty;
     public string CacheType { get; } = candidate.CacheTypeDisplay;
-    public string Provider { get; } = candidate.PackageProvider ?? string.Empty;
     public string UserDirectory { get; } = candidate.UserDirectory ?? string.Empty;
     public string SizeDisplay => SizeBytes switch
     {
@@ -388,22 +475,46 @@ public partial class CacheCandidateItem(CacheCandidate candidate) : ObservableOb
     private bool isSelected = candidate.IsRecommended;
 }
 
-public sealed class CachePackageSummaryItem(CachePackageSummary summary)
+public sealed class CacheCategorySummaryItem(CacheCategorySummary summary) : ObservableObject
 {
-    public string PackageName { get; } = summary.PackageName;
-    public string PackageId { get; } = summary.PackageId ?? string.Empty;
-    public string Provider { get; } = summary.Provider ?? string.Empty;
+    private int _selectedCandidateCount;
+    private long _selectedSizeBytes;
+
+    public string CategoryKey { get; } = summary.CategoryKey;
+    public string CategoryName { get; } = summary.CategoryName;
     public long SizeBytes { get; } = summary.SizeBytes;
     public int CandidateCount { get; } = summary.CandidateCount;
     public IReadOnlyList<CacheTypeCount> CacheTypes { get; } = summary.CacheTypes;
     public string TypeDisplay => CacheTypes.Count == 0
         ? "其他"
         : string.Join(" · ", CacheTypes.Select(type => $"{type.Type}({type.Count})"));
-    public string SizeDisplay => SizeBytes switch
+    public int SelectedCandidateCount => _selectedCandidateCount;
+    public long SelectedSizeBytes => _selectedSizeBytes;
+    public string SelectionCountDisplay => $"{SelectedCandidateCount}/{CandidateCount}";
+    public string SelectionSizeDisplay => $"{FormatSize(SelectedSizeBytes)} / {FormatSize(SizeBytes)}";
+
+    public void UpdateSelection(int count, long sizeBytes)
     {
-        < 1024 => $"{SizeBytes} B",
-        < 1024 * 1024 => $"{SizeBytes / 1024d:F1} KB",
-        < 1024 * 1024 * 1024 => $"{SizeBytes / 1024d / 1024d:F1} MB",
-        _ => $"{SizeBytes / 1024d / 1024d / 1024d:F2} GB"
+        if (_selectedCandidateCount != count)
+        {
+            _selectedCandidateCount = count;
+            OnPropertyChanged(nameof(SelectedCandidateCount));
+            OnPropertyChanged(nameof(SelectionCountDisplay));
+        }
+
+        if (_selectedSizeBytes != sizeBytes)
+        {
+            _selectedSizeBytes = sizeBytes;
+            OnPropertyChanged(nameof(SelectedSizeBytes));
+            OnPropertyChanged(nameof(SelectionSizeDisplay));
+        }
+    }
+
+    private static string FormatSize(long size) => size switch
+    {
+        < 1024 => $"{size} B",
+        < 1024 * 1024 => $"{size / 1024d:F1} KB",
+        < 1024 * 1024 * 1024 => $"{size / 1024d / 1024d:F1} MB",
+        _ => $"{size / 1024d / 1024d / 1024d:F2} GB"
     };
 }

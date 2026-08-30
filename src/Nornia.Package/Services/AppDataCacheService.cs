@@ -77,13 +77,8 @@ public sealed class AppDataCacheService : ICacheInventoryService, ICacheCleanupS
             }
         }
 
-        progress?.Report($"缓存扫描开始：根目录数={_roots.Count}，强制重扫={forceRescan}");
         if (_roots.Count == 0)
         {
-            progress?.Report(
-                $"缓存扫描根目录为空。探测：LocalAppData='{Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData)}'（env LOCALAPPDATA='{Environment.GetEnvironmentVariable("LOCALAPPDATA")}'），" +
-                $"AppData='{Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData)}'（env APPDATA='{Environment.GetEnvironmentVariable("APPDATA")}'），" +
-                $"UserProfile='{Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)}'（env USERPROFILE='{Environment.GetEnvironmentVariable("USERPROFILE")}'）");
             return [];
         }
 
@@ -93,17 +88,11 @@ public sealed class AppDataCacheService : ICacheInventoryService, ICacheCleanupS
             cancellationToken.ThrowIfCancellationRequested();
             if (!Directory.Exists(root))
             {
-                progress?.Report($"跳过缓存扫描根目录（不存在）：{root}");
                 continue;
             }
 
-            var before = candidates.Count;
-            progress?.Report($"扫描缓存根目录：{root}");
-            await Task.Run(() => ScanRoot(root, candidates, progress, cancellationToken), cancellationToken);
-            progress?.Report($"根目录扫描完成：{root}，新增 {candidates.Count - before} 个候选");
+            await Task.Run(() => ScanRoot(root, candidates, cancellationToken), cancellationToken);
         }
-
-        progress?.Report($"缓存扫描完成：共 {candidates.Count} 个候选");
 
         var result = candidates
             .OrderByDescending(candidate => candidate.Confidence)
@@ -146,7 +135,6 @@ public sealed class AppDataCacheService : ICacheInventoryService, ICacheCleanupS
                     continue;
                 }
 
-                progress?.Report($"清理缓存：{candidate.Path}");
                 try
                 {
                     var reclaimed = await Task.Run(() => ClearContents(candidate.Path, cancellationToken), cancellationToken);
@@ -175,7 +163,7 @@ public sealed class AppDataCacheService : ICacheInventoryService, ICacheCleanupS
         }
     }
 
-    private static void ScanRoot(string root, List<CacheCandidate> candidates, IProgress<string>? progress, CancellationToken cancellationToken)
+    private static void ScanRoot(string root, List<CacheCandidate> candidates, CancellationToken cancellationToken)
     {
         var normalizedRoot = Path.GetFullPath(root);
         var pending = new Stack<string>();
@@ -203,7 +191,6 @@ public sealed class AppDataCacheService : ICacheInventoryService, ICacheCleanupS
                 if (TryCreateCandidate(normalizedRoot, child, out var candidate))
                 {
                     candidates.Add(candidate);
-                    progress?.Report($"发现 {candidate.Confidence} 置信缓存：{candidate.Path}");
                     continue;
                 }
 
@@ -260,7 +247,7 @@ public sealed class AppDataCacheService : ICacheInventoryService, ICacheCleanupS
             GetDirectorySize(path),
             confidence,
             reason,
-            CacheType: CachePackageAssociationService.ResolveCacheType(normalizedRelative),
+            CacheType: CacheClassificationService.ResolveCacheType(normalizedRelative),
             UserDirectory: root);
         return true;
     }

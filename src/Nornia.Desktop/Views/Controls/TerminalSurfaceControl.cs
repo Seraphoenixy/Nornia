@@ -397,17 +397,13 @@ public sealed class TerminalSurfaceControl : FrameworkElement
                 var segmentColor = 0;
                 for (var column = 0; column <= text.Length; column++)
                 {
-                    var drawable = column < text.Length && line[column].Char != '\0';
-                    var color = column < text.Length ? line[column].Foreground : 0;
-                    var boundary = column == text.Length
-                        || !drawable
+                    var atEnd = column == text.Length;
+                    var drawable = !atEnd && line[column].Char != '\0';
+                    var color = !atEnd ? line[column].Foreground : 0;
+                    var boundary = atEnd || !drawable
                         || (segmentStart >= 0 && (color != segmentColor || line[column].Width == 2));
-                    if (!boundary)
-                    {
-                        continue;
-                    }
 
-                    if (segmentStart >= 0)
+                    if (segmentStart >= 0 && boundary)
                     {
                         var segment = text[segmentStart..column];
                         var brush = segmentColor != 0 ? ColorBrush(segmentColor) : foreground;
@@ -415,10 +411,17 @@ public sealed class TerminalSurfaceControl : FrameworkElement
                             segment, CultureInfo.CurrentUICulture, FlowDirection.LeftToRight, typeface,
                             TerminalFontSize, brush, dpi);
                         context.DrawText(formatted, new Point(segmentStart * _cellWidth, 0));
+                        segmentStart = -1;
                     }
 
-                    segmentStart = drawable ? column : -1;
-                    segmentColor = color;
+                    // 首个普通字符本身不是边界，但必须在这里开启段。旧逻辑仅在边界后
+                    // 赋 segmentStart，导致纯 ASCII/同色输出永远保持 -1，屏幕有内容却
+                    // 没有任何 DrawText 调用，表现为整个终端只有背景、看不到文字。
+                    if (drawable && segmentStart < 0)
+                    {
+                        segmentStart = column;
+                        segmentColor = color;
+                    }
                 }
             }
         }

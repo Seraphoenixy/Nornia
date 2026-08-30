@@ -188,6 +188,7 @@ public sealed class GitGraphCell : FrameworkElement
                 StartLineCap = PenLineCap.Round,
                 EndLineCap = PenLineCap.Round,
                 LineJoin = PenLineJoin.Round,
+                DashStyle = row.DotDashed ? DashStyles.Dash : DashStyles.Solid,
             };
             dotPen.Freeze();
             drawingContext.DrawEllipse(null, dotPen, new Point(dotX, centerY), GitGraphLayout.DotRadius, GitGraphLayout.DotRadius);

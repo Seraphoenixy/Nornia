@@ -36,7 +36,9 @@ public sealed class TrackedEnvironmentRepairExecutorTests
         Assert.Contains("provider detail", failure.DiagnosticOutput);
         Assert.Equal(2, repairLogs.Entries.Count);
         Assert.Contains(progress.Outputs, output => output.IsError && output.Text.Contains("Node.js") && output.Text.Contains("Fail.Package"));
-        Assert.Contains(progress.Outputs, output => output.IsError && output.Text.Contains("退出码：0x8A15010C"));
+        // 只断言十六进制退出码本身:文案随 CI/本机的 UI 文化走不同资源(en-US → "Exit code:",
+        // zh-Hans → "退出码:"),断言本地化标签会在英文 runner 上稳定误报。
+        Assert.Contains(progress.Outputs, output => output.IsError && output.Text.Contains("0x8A15010C"));
     }
 
     private sealed class FailingPackageProvider : IPackageProvider

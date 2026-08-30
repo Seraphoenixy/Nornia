@@ -325,7 +325,7 @@ Desktop 采用统一的 VS Code 外壳（`MainWindow`）：[48px Activity Bar | 
 - **分支/同步状态**：提交框上方显示当前分支、上游短名与 ↑/↓ 领先落后计数（结构化 `CurrentBranch`/`AheadCount`/`BehindCount`，不再解析摘要字符串）；有待拉取/待推送时同步按钮高亮（`NeedsSync`）。
 - **更改列表树状/平铺布局**：`ScmLayout` 列表/树状切换（VS Code 标题栏视图按钮）。树状布局把更改按目录分组为文件夹行 + 缩进文件行（`ScmFolderNode`/`ScmFileNode`），目录折叠态会话级保存；平铺与树状共用同一套多选（Ctrl/Shift）与批量暂存/取消暂存/丢弃命令，未暂存列表另支持把文件行**拖入已暂存分区**执行 `git add`。
 - **提交与同步**：提交按钮为拆分菜单——提交 / 提交并推送（提交后直接推送，不要求工作区干净）/ 提交并同步（提交后先快进拉取再推送）；独立命令 获取（`fetch`，不动工作树）/ 拉取 / 推送 / 安全同步（拒绝脏工作区，快进拉取成功后才推送）。认证策略：Nornia 永不接受或存储凭据，push/pull 依赖 Git Credential Manager 读取 Windows 凭据管理器。
-- **传入/传出更改**：有上游时侧栏历史上方生成「传入更改（↓）」/「传出更改（↑）」同步折叠栏行（空心圆点 + 方向字形），展开懒加载该范围的**净文件影响**（`git diff --name-status HEAD...upstream` / `upstream...HEAD`——自合并基到上游/本地的净变化，同一文件被多个提交修改只计一次）；行集合按「上游|ahead|behind」签名变化才重建，静默刷新不清空、不闪烁、不丢展开态。
+- **传入/传出更改**：有上游时，最近提交图以虚线空心节点标出同步范围：「传出的更改 + 当前分支」位于本地 tip；远端独有提交占据独立泳道并先行绘制，「传入的更改 + 上游分支」分界位于远端独有提交之后、共同/本地历史之前，远端泳道在该节点处汇入共同历史。不再将上游线性追加到底部，也不再压缩成顶部计数行。边界行仍可展开并懒加载该范围的**净文件影响**（`git diff --name-status HEAD...upstream` / `upstream...HEAD`——自合并基到上游/本地的净变化，同一文件被多个提交修改只计一次）；提交集合或「上游|ahead|behind」签名变化时重建，静默刷新不清空、不闪烁。
 - **贮藏（Stash）**：侧栏「贮藏」分区列出 `git stash list`，支持贮藏全部更改（含未跟踪）、应用并移除（pop）、丢弃（二次确认）。
 - **自动刷新**：`GitRepositoryWatcher`（递归 `FileSystemWatcher`，200ms 尾部去抖、UI 线程派发）监听工作树变化静默刷新 SCM 状态（受 `git.autorefresh` 设置控制）。`.git` 目录只放行影响可见状态的路径（`index`、`HEAD`、`packed-refs`、`FETCH_HEAD`、`ORIG_HEAD`、`MERGE_HEAD`、`CHERRY_PICK_HEAD`、`refs\`、`rebase-*`），忽略 object/lock/log 抖动；git 读写操作前后打开 250ms 抑制窗口，`.git\index` 事件在窗口内丢弃（git 自身回写 index stat cache 不会触发刷新循环），而外部的 HEAD/refs 切换仍能立即捕获。监视器错误（缓冲区溢出/目录移除）时停止监听并发一次通知，视图进入降级态，目录恢复后下次刷新重新附着。
 - **历史增强**：分页加载（每页 30 条，「加载更多」）、复制变更路径/分支名/提交哈希/提交主题（多选）、复制 git 日志文件路径；选中提交文件在共享编辑器打开提交 diff（`diff:<hash>:<path>` 标签键去重）。
@@ -343,17 +343,17 @@ Desktop 采用统一的 VS Code 外壳（`MainWindow`）：[48px Activity Bar | 
 | Runtime | 扫描 .NET SDK、.NET Desktop Runtime、Node.js、Python、Java、Visual C++ Redistributable、Windows App Runtime（含损坏态检测）；安装/移除/升级经软件包 Provider，升级按架构对齐，「更新不适用」降级为警告跳过 |
 | 开发工具 | 扫描、安装、移除和升级 .NET SDK、Git |
 | Packages | 软件包搜索、已安装清单、安装、卸载、升级（默认 Winget，可选 Scoop/Chocolatey 自动选择） |
-| 缓存管理 | 扫描 AppData 与用户根目录中的应用/开发工具缓存，按来源和置信度筛选，确认后清理所选内容 |
+| 缓存管理 | 扫描 AppData 与用户根目录中的应用/开发工具缓存；不关联软件包，按目录名称推测应用/生态分类并汇总。分类表与缓存明细表通过可拖动水平分隔条布局，单击分类只显示其明细；整格可点击的居中复选框实时决定分类行的清理数量与空间，并支持对当前分类全选/全不选，确认后仅清理勾选内容 |
 | Projects | 已登记项目、选择目录、初始化 `Nornia.yaml`、环境检查、修复计划、确认后应用修复（含批次追踪/回滚）、打开、刷新、移除项目记录 |
 | Settings | 设置编辑器（搜索/分类/作用域/语言覆盖/重置/冲突处理）+ 键盘快捷方式编辑器，并打开本地资产库和诊断日志目录 |
 
-所有页面共享 `UiLogService`。外部进程的 stdout 和 stderr 经由 `IProgress<ProcessOutput>` 写入底部 Output 面板；页面操作状态和异常也写入同一日志流。导航只切换 Page ViewModel，首次进入页面时触发必要的加载，后续可以通过页面刷新命令显式重新读取。
+所有页面共享 `UiLogService`。外部进程的 stdout 和 stderr 经由 `IProgress<ProcessOutput>` 写入底部 Output 面板；页面操作状态和异常也写入同一日志流。缓存扫描与分类不写逐目录、逐候选日志，成功时只写一条含候选数、分类数、空间与耗时的终态摘要，跳过、失败和异常仍保留诊断。导航只切换 Page ViewModel，首次进入页面时触发必要的加载，后续可以通过页面刷新命令显式重新读取。
 
 **底部面板三页签与 Problems。** 底部面板是 VS Code 式三页签结构：输出（完整日志流）/ 问题（Problems）/ 终端（多会话）。Problems 页签是 `UiLogService` 条目的**派生视图**——实时过滤 WARNING/ERROR 条目（不额外存储），支持级别过滤（全部/信息/警告/错误）与文本过滤、单条/全选/复制消息与复制全部；出现新的 ERROR 时面板自动切到 Problems 页签并展开。问题计数驱动：活动栏环境管理徽标、状态栏「N 个问题」与环境健康字形。异常日志经 `UiLogService.WriteException` 结构化落盘：`ExceptionDiagnosticFormatter` 生成人类可读多行诊断（异常类型/原因/内部原因/建议；`EnvironmentRepairException` 追加「失败步骤 n（correlation_id=…）」与逐条失败原因），`details_json`（类型、消息、堆栈、内部异常、修复失败列表）写入 `operation_log.details_json`，Serilog 文件日志同步写入（级别映射 ERROR/WARNING/DEBUG/VERBOSE）。
 
 Desktop 同时配置了按日滚动的 Serilog 文件日志，保留 14 天，位置为 `%LOCALAPPDATA%\Nornia\logs`。应用注册 Dispatcher、AppDomain 和未观察任务异常处理：可恢复的 UI 异常会显示提示并写入 Output，其他异常会写入诊断日志。
 
-Dashboard 同时承担任务中心职责：根据持久化的项目健康状态、软件包更新、缓存候选和最近操作生成按优先级排序的下一步建议，并可携带筛选上下文跳转到专业页面。Desktop 长任务使用统一操作状态，提供取消、关联日志编号、成功/失败结果和恢复建议；运行期间仅禁用当前页面的冲突按钮，导航、表格查看和 Output 面板保持可用。卸载、环境修复和缓存清理必须二次确认，安装与升级直接执行并保留完整日志。
+Dashboard 同时承担任务中心职责：根据持久化的项目健康状态、软件包更新、缓存候选和最近操作生成按优先级排序的下一步建议，并可携带筛选上下文跳转到专业页面。Desktop 长任务使用统一操作状态，提供取消、关联日志编号、成功/失败结果和恢复建议；运行期间仅禁用当前页面的冲突按钮，导航、表格查看和 Output 面板保持可用。卸载、环境修复和缓存清理必须二次确认；安装与升级保留完整日志，缓存扫描与清理只保留终态摘要和异常诊断。
 
 ## 10. 测试策略
 

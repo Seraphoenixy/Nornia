@@ -783,18 +783,25 @@
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="CheckBox">
-            <StackPanel Orientation="Horizontal" Background="Transparent">
-              <Border x:Name="Box" Width="16" Height="16" CornerRadius="{StaticResource RadiusSm}"
-                      Background="{DynamicResource InputBrush}" BorderBrush="{DynamicResource BorderBrush}"
-                      BorderThickness="1" VerticalAlignment="Center" SnapsToDevicePixels="True">
-                <Path x:Name="Check" Data="M3.2 8.4 L6.8 11.8 L12.8 4.6"
-                      Stroke="{DynamicResource BrightTextBrush}" StrokeThickness="1.8"
-                      StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"
-                      HorizontalAlignment="Center" VerticalAlignment="Center" Visibility="Collapsed" />
-              </Border>
-              <ContentPresenter Margin="6,0,0,0" VerticalAlignment="Center" RecognizesAccessKey="True" />
-            </StackPanel>
+            <Grid Background="{TemplateBinding Background}">
+              <StackPanel Orientation="Horizontal"
+                          HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                          VerticalAlignment="{TemplateBinding VerticalContentAlignment}">
+                <Border x:Name="Box" Width="16" Height="16" CornerRadius="{StaticResource RadiusSm}"
+                        Background="{DynamicResource InputBrush}" BorderBrush="{DynamicResource BorderBrush}"
+                        BorderThickness="1" VerticalAlignment="Center" SnapsToDevicePixels="True">
+                  <Path x:Name="Check" Data="M3.2 8.4 L6.8 11.8 L12.8 4.6"
+                        Stroke="{DynamicResource BrightTextBrush}" StrokeThickness="1.8"
+                        StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"
+                        HorizontalAlignment="Center" VerticalAlignment="Center" Visibility="Collapsed" />
+                </Border>
+                <ContentPresenter x:Name="Label" Margin="6,0,0,0" VerticalAlignment="Center" RecognizesAccessKey="True" />
+              </StackPanel>
+            </Grid>
             <ControlTemplate.Triggers>
+              <Trigger Property="Content" Value="{x:Null}">
+                <Setter TargetName="Label" Property="Visibility" Value="Collapsed" />
+              </Trigger>
               <Trigger Property="IsChecked" Value="True">
                 <Setter TargetName="Box" Property="Background" Value="{DynamicResource AccentBrush}" />
                 <Setter TargetName="Box" Property="BorderBrush" Value="{DynamicResource AccentBrush}" />

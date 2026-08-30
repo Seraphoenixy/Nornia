@@ -43,6 +43,10 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     // int taken with CAS because the retry timer can re-enter from a thread-pool thread.
     private int _quietRefreshInFlight; // 0 = idle, 1 = a refresh is in flight
     private int _quietRefreshPending;
+    // A remote-tracking ref can move without moving local HEAD (for example after
+    // `git push --force-with-lease`). Preserve that signal across debounce/busy merging so the
+    // next quiet refresh reloads branches, incoming/outgoing commits and the commit graph.
+    private int _quietRefreshRequiresFullLoad;
     private bool _enableScmAutoRefresh = true;
     private readonly RevisionGate _settingsRevisionGate = new();
 
@@ -647,7 +651,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         _uiContext = SynchronizationContext.Current;
         _stateStore = stateStore;
         _scopedSettings = settingsService;
-        _repositoryWatcher.ChangesDetected += (_, _) => HandleWatcherChanges();
+        _repositoryWatcher.ChangesDetected += (_, changes) => HandleWatcherChanges(changes);
         _workspaceService.ContextChanged += ApplyWorkspaceContextAsync;
         DiffOpenRequested += (_, request) => _ = _editor.OpenDiffAsync(request);
         _editor.DiffMutationCompleted += OnEditorDiffMutationCompleted;
@@ -1357,10 +1361,13 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             .Select(badge => new GitTagMenuNode(
                 badge.Name,
                 [
-                    new GitMenuCommandItem("复制标签名", CopyTagNameCommand),
-                    new GitMenuCommandItem("推送标签", PushTagCommand),
-                    new GitMenuCommandItem("检出标签", CheckoutTagCommand),
-                    new GitMenuCommandItem("删除标签", DeleteTagCommand),
+                    // TagName 随条目携带:子菜单操作项位于嵌套弹出层,RelativeSource AncestorType
+                    // 不跨越 Popup 边界,靠祖先查找取标签名会解析为 null → 命令静默无操作
+                    // (删除标签点击无反应的根因)。
+                    new GitMenuCommandItem("复制标签名", CopyTagNameCommand, badge.Name),
+                    new GitMenuCommandItem("推送标签", PushTagCommand, badge.Name),
+                    new GitMenuCommandItem("检出标签", CheckoutTagCommand, badge.Name),
+                    new GitMenuCommandItem("删除标签", DeleteTagCommand, badge.Name),
                 ]))
             .ToArray();
 
@@ -1622,6 +1629,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         _repositoryWatcher.Detach();
         _hasFullStateLoad = false;
         _lastHeadSignature = null;
+        Interlocked.Exchange(ref _quietRefreshRequiresFullLoad, 0);
         _graphCollapsedForNoRepository = true;
         IsGraphViewExpanded = false;
         IsRepository = false;
@@ -1649,7 +1657,15 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     /// <summary>Watcher-driven silent refresh entry point (single flight + merged pending + minimum
     /// interval). Runs outside <see cref="PageViewModel.RunAsync"/> on purpose: no status banner,
     /// no operation log entry, no cancel button (VS Code auto-refresh is invisible).</summary>
-    private void HandleWatcherChanges() => StartQuietRefresh(immediate: false);
+    private void HandleWatcherChanges(GitRepositoryChangesDetectedEventArgs? changes = null)
+    {
+        if (changes is { HeadOrRefsChanged: true } or { IsUnknown: true })
+        {
+            Interlocked.Exchange(ref _quietRefreshRequiresFullLoad, 1);
+        }
+
+        StartQuietRefresh(immediate: false);
+    }
 
     /// <summary>Attempts to start the silent refresh. The in-flight flag is taken atomically so
     /// concurrent callers (watcher thread, retry timer, property-changed path) can never start two
@@ -1731,8 +1747,9 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             // git may write back the index stat cache during/after the read pass; arm the
             // suppression window so those .git\index events do not retrigger a refresh.
             _repositoryWatcher.BeginSuppressionWindow();
+            var requiresFullLoad = Interlocked.Exchange(ref _quietRefreshRequiresFullLoad, 0) == 1;
             var signature = ReadHeadSignature(RepositoryPath);
-            if (_hasFullStateLoad && string.Equals(signature, _lastHeadSignature, StringComparison.Ordinal))
+            if (!requiresFullLoad && _hasFullStateLoad && string.Equals(signature, _lastHeadSignature, StringComparison.Ordinal))
             {
                 // HEAD did not move: edits cannot change branches / history / stashes, a single
                 // git status call keeps the view current without the full subprocess fan-out.
@@ -1952,10 +1969,12 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             {
                 OnPropertyChanged(nameof(HasOutgoing));
                 OnPropertyChanged(nameof(HasIncoming));
+                // 最近提交图直接包含传入/传出的真实提交；即使 ahead/behind 数量未变，
+                // 提交集合变化也必须重建，否则边界下面仍显示上一轮内容。
+                RebuildLogRows();
             }
 
-            // 同步折叠栏行(传入/传出)由 上游与 ahead/behind 计数驱动:签名变化才重建行集合,
-            // 其余静默刷新不重建(避免清空/重填闪烁与展开态丢失)。
+            // 同步边界由上游与 ahead/behind 计数驱动；签名变化时更新边界位置与标签。
             var syncSignature = $"{status.Upstream}|{status.AheadCount}|{status.BehindCount}";
             if (syncSignature != _lastSyncSignature)
             {
@@ -2215,7 +2234,11 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     /// <summary>历史列表行 = 提交 + 左缘图形泳道(折叠栏;ListBox SelectedItem 仅用于行高亮与多选)。</summary>
     public BulkObservableCollection<GitLogRow> LogRows { get; } = [];
 
-    [ObservableProperty] private GitLogRow? selectedLogRow;
+    /// <summary>选中行变化必须联动通知标签菜单的两个派生属性:ContextMenu 子树的绑定只在
+    /// 打开时求值一次,缺少通知会让子菜单永远停留在首次打开时的快照(过期标签/空菜单)。</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(SelectedLogRowTags), nameof(SelectedLogRowTagMenus))]
+    private GitLogRow? selectedLogRow;
 
     public bool CanLoadMoreCommits => IsRepository && !_logsExhausted && Logs.Count > 0;
 
@@ -2241,38 +2264,87 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
 
     internal void RebuildLogRows()
     {
-        var graph = BuildCommitGraph(Logs, GraphBranchRefs).ToList();
-        var rows = new List<GitLogRow>(Logs.Count + 2);
-
-        // 分支顶端的两个同步折叠栏行(与提交行同一模板,单击展开合并文件影响):
-        // 传入的更改 = 远端色空心圆点(上游 tip 位置),传出的更改 = 本地色空心圆点。
-        var remoteKey = UpstreamColorKey(UpstreamName, GraphBranchRefs);
-        if (HasUpstream && BehindCount > 0)
+        // 同时把本地 HEAD 与上游 tip 放入一张拓扑图：两个同步边界先各自占据一条泳道，
+        // 传出/传入提交沿各自的父链向下，最后在共同历史汇合。不能先画完整本地历史再把
+        // “传入的更改”追加到底部——那会把上游误画成一条线性历史，而非第二条分支。
+        var outgoing = OutgoingCommits.Select(row => row.Commit).DistinctBy(commit => commit.Hash, StringComparer.OrdinalIgnoreCase).ToList();
+        var outgoingHashes = outgoing.Select(commit => commit.Hash).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (outgoing.Count < AheadCount)
         {
-            rows.Add(SyncGroupRow(
-                $"HEAD...{UpstreamName}", Codicons.ArrowDown, $"传入的更改 {BehindCount}", UpstreamName,
-                remoteKey, continuesFromAbove: false, incomingKey: null,
-                IncomingCommits.FirstOrDefault()?.Commit.AuthorDate));
+            foreach (var commit in Logs.Where(commit => !outgoingHashes.Contains(commit.Hash)).Take(AheadCount - outgoing.Count))
+            {
+                outgoing.Add(commit);
+                outgoingHashes.Add(commit.Hash);
+            }
         }
+
+        var common = Logs.Where(commit => !outgoingHashes.Contains(commit.Hash)).ToArray();
+        var occupiedHashes = Logs.Select(commit => commit.Hash).Concat(outgoingHashes).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var incoming = IncomingCommits.Select(row => row.Commit)
+            .Where(commit => occupiedHashes.Add(commit.Hash))
+            .DistinctBy(commit => commit.Hash, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        const string outgoingBoundaryHash = "refs/nornia/sync/outgoing";
+        const string incomingBoundaryHash = "refs/nornia/sync/incoming";
+        var commonTip = common.FirstOrDefault()?.Hash;
+        var outgoingGraphCommits = ConnectGraphSequence(outgoing, commonTip);
+        // 远端独有提交先沿上游泳道向下，最后接到“传入的更改”边界；该边界再汇入
+        // 共同历史。因此分界行视觉上位于远端提交与本地/共同提交之间。
+        var incomingGraphCommits = ConnectGraphSequence(
+            incoming,
+            HasUpstream && BehindCount > 0 ? incomingBoundaryHash : commonTip,
+            forceTailParent: HasUpstream && BehindCount > 0);
+        var commonGraphCommits = ConnectGraphSequence(common, null);
+
+        var graphCommits = new List<GitCommitInfo>();
+        var displayCommits = new List<GitCommitInfo?>();
+        var outgoingBoundaryIndex = -1;
+        var incomingBoundaryIndex = -1;
 
         if (HasUpstream && AheadCount > 0)
         {
-            var hasIncomingRow = BehindCount > 0;
-            rows.Add(SyncGroupRow(
-                $"{UpstreamName}...HEAD", Codicons.ArrowUp, $"传出的更改 {AheadCount}", UpstreamName,
-                LocalColorKey, continuesFromAbove: hasIncomingRow, incomingKey: hasIncomingRow ? remoteKey : null,
-                OutgoingCommits.FirstOrDefault()?.Commit.AuthorDate));
+            outgoingBoundaryIndex = graphCommits.Count;
+            graphCommits.Add(GraphBoundaryCommit(outgoingBoundaryHash, outgoingGraphCommits.FirstOrDefault()?.Hash ?? commonTip));
+            displayCommits.Add(null);
         }
 
-        if (graph.Count > 0 && rows.Count > 0)
+        AppendGraphCommits(outgoingGraphCommits, outgoing, graphCommits, displayCommits);
+
+        AppendGraphCommits(incomingGraphCommits, incoming, graphCommits, displayCommits);
+
+        if (HasUpstream && BehindCount > 0)
         {
-            // 首提交从上方接入同步栏:上段竖线入色取最下方同步栏的色键,连线全程单色。
-            graph[0] = graph[0] with { DotLaneContinuesFromAbove = true, LaneIncomingColorKeys = rows[^1].Graph!.LaneColorKeys };
+            incomingBoundaryIndex = graphCommits.Count;
+            graphCommits.Add(GraphBoundaryCommit(incomingBoundaryHash, commonTip));
+            displayCommits.Add(null);
         }
 
-        for (var i = 0; i < Logs.Count; i++)
+        AppendGraphCommits(commonGraphCommits, common, graphCommits, displayCommits);
+
+        var graphBranches = GraphBranchRefs.ToList();
+        if (outgoingBoundaryIndex >= 0)
+            graphBranches.Add(new GitBranchInfo(CurrentBranch, true, TipHash: outgoingBoundaryHash));
+        if (incomingBoundaryIndex >= 0)
+            graphBranches.Add(new GitBranchInfo(UpstreamName, false, IsRemote: true, TipHash: incomingBoundaryHash));
+
+        var graph = BuildCommitGraph(graphCommits, graphBranches);
+        var rows = new List<GitLogRow>(graph.Count);
+        for (var i = 0; i < graph.Count; i++)
         {
-            rows.Add(new GitLogRow(Logs[i], graph[i]));
+            if (i == outgoingBoundaryIndex)
+            {
+                rows.Add(SyncGroupRow($"{UpstreamName}...HEAD", "传出的更改", CurrentBranch,
+                    graph[i], OutgoingCommits.FirstOrDefault()?.Commit.AuthorDate));
+            }
+            else if (i == incomingBoundaryIndex)
+            {
+                rows.Add(SyncGroupRow($"HEAD...{UpstreamName}", "传入的更改", UpstreamName,
+                    graph[i], IncomingCommits.FirstOrDefault()?.Commit.AuthorDate));
+            }
+            else
+            {
+                rows.Add(new GitLogRow(displayCommits[i]!, graph[i]));
+            }
         }
 
         // 一次 Replace(单条 Reset)取代 Clear()+逐行 Add:行对象按快照整体重建(图形泳道 /
@@ -2280,28 +2352,63 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         LogRows.ReplaceRange(rows);
     }
 
-    /// <summary>同步折叠栏行:空心圆点 + 下段竖线;Commit.Hash 为 diff 范围
+    /// <summary>同步边界行:虚线空心圆点 + 下段竖线;Commit.Hash 为 diff 范围
     /// (HEAD...upstream / upstream...HEAD),展开懒加载的正是该范围的合并文件影响。</summary>
     private static GitLogRow SyncGroupRow(
         string rangeHash,
-        string directionGlyph,
         string subject,
-        string meta,
-        string colorKey,
-        bool continuesFromAbove,
-        string? incomingKey,
+        string target,
+        GitGraphRow graph,
         DateTimeOffset? date)
     {
-        var graph = new GitGraphRow(
-            0, [], [new GitGraphLink(0, 0)], 1,
-            DotLaneContinuesFromAbove: continuesFromAbove,
-            LaneColorKeys: [colorKey],
-            LaneIncomingColorKeys: incomingKey is null ? null : [incomingKey],
-            DotHollow: true);
         return new GitLogRow(
-            new GitCommitInfo(rangeHash, directionGlyph, subject, null, meta, "-", date ?? DateTimeOffset.MinValue),
-            graph,
-            directionGlyph);
+            new GitCommitInfo(rangeHash, "", subject, null, target, "-", date ?? DateTimeOffset.MinValue),
+            graph with { DotHollow = true, DotDashed = true },
+            syncTarget: target);
+    }
+
+    private static GitCommitInfo GraphBoundaryCommit(string hash, string? parent) =>
+        new(hash, hash, hash, null, "Nornia", "-", DateTimeOffset.MinValue,
+            string.IsNullOrWhiteSpace(parent) ? [] : [parent]);
+
+    private static IReadOnlyList<GitCommitInfo> ConnectGraphSequence(
+        IReadOnlyList<GitCommitInfo> commits,
+        string? tailParent,
+        bool forceTailParent = false)
+    {
+        var result = commits.ToArray();
+        for (var i = 0; i < result.Length; i++)
+        {
+            if (forceTailParent && i == result.Length - 1 && !string.IsNullOrWhiteSpace(tailParent))
+            {
+                // 在远端独有段与其原首父(共同历史)之间插入可见的同步边界节点。
+                // 保留合并提交的其它父边，只替换首父链上的这一段。
+                result[i] = result[i] with { Parents = [tailParent, .. result[i].ParentList.Skip(1)] };
+                continue;
+            }
+
+            if (result[i].ParentList.Count > 0)
+                continue;
+
+            var inferredParent = i + 1 < result.Length ? result[i + 1].Hash : tailParent;
+            if (!string.IsNullOrWhiteSpace(inferredParent))
+                result[i] = result[i] with { Parents = [inferredParent] };
+        }
+
+        return result;
+    }
+
+    private static void AppendGraphCommits(
+        IReadOnlyList<GitCommitInfo> graphSource,
+        IReadOnlyList<GitCommitInfo> displaySource,
+        ICollection<GitCommitInfo> graphTarget,
+        ICollection<GitCommitInfo?> displayTarget)
+    {
+        for (var i = 0; i < graphSource.Count; i++)
+        {
+            graphTarget.Add(graphSource[i]);
+            displayTarget.Add(displaySource[i]);
+        }
     }
 
     /// <summary>上游分支的语义色键(上游通常是远端分支 → GraphRemote*;分支列表里找不到时
@@ -2323,7 +2430,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         return key;
     }
 
-    // ===== 传入 / 传出更改提交集(数据;同步折叠栏行由 RebuildLogRows 按计数生成) =====
+    // ===== 传入 / 传出真实提交集（由 RebuildLogRows 排到对应同步边界之后） =====
 
     public BulkObservableCollection<GitLogRow> OutgoingCommits { get; } = [];
 
@@ -2449,7 +2556,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     /// <summary>当前分支是否有上游。</summary>
     [ObservableProperty] private bool hasUpstream;
 
-    /// <summary>上游短名(如 origin/main),显示在同步折叠栏行的元信息。</summary>
+    /// <summary>上游短名(如 origin/main),显示在传入同步边界旁。</summary>
     [ObservableProperty] private string upstreamName = string.Empty;
 
     /// <summary>上次重建行集合时的同步签名(上游|ahead|behind):变化才重建,避免静默刷新闪烁。</summary>
@@ -2710,11 +2817,12 @@ public sealed record ScmFileNode(GitChangeItem Change, int Depth) : ScmRowNode(D
 /// 展开状态与已加载文件随之存活。Graph 为 null 表示该列表不带泳道图(传入/传出)。</summary>
 public sealed partial class GitLogRow : ObservableObject
 {
-    public GitLogRow(GitCommitInfo commit, GitGraphRow? graph, string? directionGlyph = null)
+    public GitLogRow(GitCommitInfo commit, GitGraphRow? graph, string? directionGlyph = null, string? syncTarget = null)
     {
         Commit = commit;
         Graph = graph;
         DirectionGlyph = directionGlyph;
+        SyncTarget = syncTarget;
 
         // 提交引用转成徽标(名称 + 图标字形 + 分支色键):本地分支用 git-branch、远端分支用
         // cloud、标签用 pin,三类引用在提交折叠栏和悬浮窗中共用同一套徽标模板。
@@ -2748,6 +2856,11 @@ public sealed partial class GitLogRow : ObservableObject
 
     /// <summary>Codicon direction marker used by incoming/outgoing synchronization rows.</summary>
     public string? DirectionGlyph { get; }
+
+    /// <summary>同步边界对应的本地/上游分支名；普通提交行为 null。</summary>
+    public string? SyncTarget { get; }
+
+    public bool IsSyncBoundary => !string.IsNullOrWhiteSpace(SyncTarget);
 
     /// <summary>折叠栏是否展开(展开后显示该提交的更改文件)。</summary>
     [ObservableProperty] private bool isExpanded;
@@ -2843,8 +2956,10 @@ public sealed record GitLogRefBadge(string Name, string Glyph, string ColorKey, 
     public bool IsTag => Kind == GitRefKind.Tag;
 }
 
-/// <summary>右键子菜单里一项可执行操作(标题 + 命令)。</summary>
-public sealed record GitMenuCommandItem(string Header, System.Windows.Input.ICommand Command);
+/// <summary>右键子菜单里一项可执行操作(标题 + 命令 + 目标标签名)。TagName 随条目携带:
+/// 嵌套弹出层内的项无法用 RelativeSource AncestorType 跨 Popup 查找父项取参,祖先查找
+/// 解析为 null 会让命令静默无操作。</summary>
+public sealed record GitMenuCommandItem(string Header, System.Windows.Input.ICommand Command, string TagName);
 
 /// <summary>「选中提交的标签」子菜单中的一个标签节点(标签名 + 它的全部操作)。</summary>
 public sealed record GitTagMenuNode(string TagName, IReadOnlyList<GitMenuCommandItem> Actions);
@@ -2881,7 +2996,8 @@ public sealed record GitGraphRow(
     IReadOnlyList<int>? MergeFromLanes = null,
     IReadOnlyList<string>? LaneColorKeys = null,
     IReadOnlyList<string>? LaneIncomingColorKeys = null,
-    bool DotHollow = false);
+    bool DotHollow = false,
+    bool DotDashed = false);
 
 /// <summary>圆点泳道到父提交泳道的连线(同泳道为直线,异泳道为分叉曲线)。</summary>
 public sealed record GitGraphLink(int FromLane, int ToLane);

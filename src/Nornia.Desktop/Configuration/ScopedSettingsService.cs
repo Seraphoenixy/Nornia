@@ -176,22 +176,30 @@ public sealed class ScopedSettingsService : ISettingsService, IDisposable, IAsyn
         {
             await foreach (var path in _coordinator.WatchAsync(cancellationToken))
             {
-                SettingsContext[] contexts;
-                lock (_gate) contexts = _contexts.Values.Where(context =>
-                    string.Equals(path, _userPath, StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(path, GetWorkspaceSettingsPath(context), StringComparison.OrdinalIgnoreCase)).ToArray();
-                if (contexts.Length == 0) continue;
-                var disk = await _documents.ReadAsync(path, cancellationToken);
-                if (_coordinator.ConsumeSelfWrite(path, disk.Revision)) continue;
-                foreach (var context in contexts)
+                try
                 {
-                    SettingsSnapshot? previous;
-                    lock (_gate) _snapshots.TryGetValue(ContextKey(context), out previous);
-                    var next = await LoadSnapshotAsync(context, cancellationToken);
-                    Track(context, next);
-                    if (previous is null) continue;
-                    var changes = BuildChanges(previous, next);
-                    if (changes.Count > 0) Publish(new(next.Revision, "External", context, changes));
+                    SettingsContext[] contexts;
+                    lock (_gate) contexts = _contexts.Values.Where(context =>
+                        string.Equals(path, _userPath, StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(path, GetWorkspaceSettingsPath(context), StringComparison.OrdinalIgnoreCase)).ToArray();
+                    if (contexts.Length == 0) continue;
+                    var disk = await _documents.ReadAsync(path, cancellationToken);
+                    if (_coordinator.ConsumeSelfWrite(path, disk.Revision)) continue;
+                    foreach (var context in contexts)
+                    {
+                        SettingsSnapshot? previous;
+                        lock (_gate) _snapshots.TryGetValue(ContextKey(context), out previous);
+                        var next = await LoadSnapshotAsync(context, cancellationToken);
+                        Track(context, next);
+                        if (previous is null) continue;
+                        var changes = BuildChanges(previous, next);
+                        if (changes.Count > 0) Publish(new(next.Revision, "External", context, changes));
+                    }
+                }
+                catch (Exception exception) when (exception is not OperationCanceledException)
+                {
+                    // 单次外部变更处理失败(瞬时锁/IO)不得终止外部监视——否则此后其它
+                    // 实例/编辑器对设置文件的修改永远不再同步。
                 }
             }
         }
@@ -346,10 +354,28 @@ public sealed class SettingsSession : ISettingsSession
         {
             await foreach (var change in _service.WatchAsync(Context, _lifetime.Token))
             {
-                var filtered = SubscribedKeys is null ? change.Changes :
-                    change.Changes.Where(item => SubscribedKeys.Contains(item.Key)).ToArray();
+                // 过滤是纯内存运算,放在守护之外;唯一可能抛异常的是快照重读(瞬时文件锁/IO)。
+                var filtered = SubscribedKeys is null ? [.. change.Changes] :
+                    change.Changes.Where(item => SubscribedKeys.Contains(item.Key)).ToList();
                 if (filtered.Count == 0) continue;
-                Current = await _service.GetSnapshotAsync(Context, _lifetime.Token);
+                try
+                {
+                    Current = await _service.GetSnapshotAsync(Context, _lifetime.Token);
+                }
+                catch (Exception exception) when (exception is not OperationCanceledException)
+                {
+                    // 瞬时文件锁/IO 不得杀死 watch 循环:循环一死,该会话后续所有设置变更
+                    // 都收不到(表现为"设置不再实时生效")。稍候重读一次;仍失败则跳过本次
+                    // 投递,下一次变更携带新快照自然自愈。
+                    try
+                    {
+                        await Task.Delay(50, _lifetime.Token);
+                        Current = await _service.GetSnapshotAsync(Context, _lifetime.Token);
+                    }
+                    catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { throw; }
+                    catch { continue; }
+                }
+
                 Changed?.Invoke(this, change with { Changes = filtered });
             }
         }

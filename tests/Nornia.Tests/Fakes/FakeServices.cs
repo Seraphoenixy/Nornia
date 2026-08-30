@@ -606,8 +606,13 @@ internal sealed class FakeGitService : IGitService
     public Task CreateTagAsync(string repositoryPath, string tagName, bool annotate = false, string? message = null, string? targetRef = null, CancellationToken cancellationToken = default) =>
         Task.CompletedTask;
 
-    public Task DeleteTagAsync(string repositoryPath, string tagName, CancellationToken cancellationToken = default) =>
-        Task.CompletedTask;
+    public List<string> DeletedTags { get; } = [];
+
+    public Task DeleteTagAsync(string repositoryPath, string tagName, CancellationToken cancellationToken = default)
+    {
+        DeletedTags.Add(tagName);
+        return Task.CompletedTask;
+    }
 
     public Task PushTagAsync(string repositoryPath, string tagName, CancellationToken cancellationToken = default) =>
         Task.CompletedTask;

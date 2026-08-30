@@ -21,7 +21,7 @@
 - **工作台与代码编辑器**：统一标签条（内容页标签 + 文档标签投影、关闭族/固定/预览转正/拖拽重排，design.md §13.1）；TextMate 语法高亮（30 语言、后台分析、LRU 缓存、快照版本门控，代码与 Diff 共用 `CodeToken*` 主题调色板）；折叠/大纲/迷你地图/Ctrl+滚轮缩放/查找与转到行/阅读态持久化（`state.json` 按工作区）。
 - SQLite 位于 `%LOCALAPPDATA%\Nornia\nornia.db`。schema 演进使用版本化 `IDatabaseMigration`（`InitialSchemaMigration`=1、`PackageArchitectureMigration`=2、`RepairLoggingMigration`=3：logs 增列 + `environment_repair_logs`），由 `MigrationRunner` 在事务中按版本顺序执行并记录到 `schema_migrations`；迁移逻辑与执行机制分离，新增 schema 变更只需新增迁移类。仓库依赖 `ISqliteConnectionFactory` 抽象，可用任意连接源替换（文件、共享内存等）以便测试。
 - Runtime/Package 扫描使用 upsert 快照：已存在的记录按主键更新，未再次发现的 Runtime 标记为 Missing（`GetAllAsync` 只返回在场记录，Missing 历史仅存于库内）。清单刷新分三层新鲜度：内存 30 秒合并（`InventoryScanCacheSeconds`）→ 持久化快照 TTL 门控（`PersistedScanTtlSeconds`，默认 6 小时；`scan_state` 表记录各 kind 的扫描时间/耗时/环境指纹，Runtime 侧指纹由 `EnvironmentFingerprintProvider` 零进程派生计算 PATH + 五个命令行工具候选路径 + VC++ 注册表版本，指纹缺失或变化时 fail-open 全扫）→ 全量扫描后重写快照与 `scan_state`。**显式动作（页面「重新扫描/刷新」按钮、CLI `env check`/`env fix`、任何安装/卸载/升级/修复之后的清单重载）一律走 `RefreshForcedAsync` 绕过全部门控**；页面首激活先 `GetPersistedAsync` 秒出首屏再走门控刷新，并在页头显示「上次扫描」。
-- Dashboard 的计数由 `SummaryRepository` 一条聚合 SQL 提供；文件系统缓存扫描结果缓存 60 秒，`CleanAsync` 总是使用强制刷新并在清理后失效缓存。
+- Dashboard 的计数由 `SummaryRepository` 一条聚合 SQL 提供；文件系统缓存扫描结果缓存 60 秒，`CleanAsync` 总是使用强制刷新并在清理后失效缓存。缓存候选不关联已安装软件包，由 `CacheClassificationService` 仅根据目录名称推测应用/生态分类；扫描和分类正常过程只写一条终态摘要。
 - Output 日志仍实时显示，并经异步单写入队列落入 SQLite；启动时自动清理 90 天前的 SQLite 操作日志。Serilog 文件日志保留 14 天。这些数值集中在 `Nornia.Core.NorniaSettings`。异常经 `UiLogService.WriteException` 结构化落盘（`ExceptionDiagnosticFormatter` 多行诊断 + `details_json` + Serilog 级别映射）。
 
 ## 语言策略
