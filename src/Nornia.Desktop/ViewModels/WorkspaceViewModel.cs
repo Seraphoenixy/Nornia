@@ -22,6 +22,9 @@ public partial class WorkspaceViewModel : PageViewModel
     private readonly ISettingsService _scopedSettings;
     private readonly IProjectWorkspaceService _workspaceService;
     private readonly IWorkspaceFileWatcher _fileWatcher;
+    // View models belong to the context on which they are composed. Application.Current can
+    // point at an unrelated, idle WPF dispatcher in tests or secondary hosts.
+    private readonly SynchronizationContext? _uiContext;
     private ISettingsSession? _settingsSession;
     private readonly WorkspaceStatusSource _statusSource = new();
     private bool _suppressSelectionOpen;
@@ -105,6 +108,7 @@ public partial class WorkspaceViewModel : PageViewModel
         _workspaceService = workspaceService;
         _clipboard = clipboard;
         _fileWatcher = fileWatcher ?? NullWorkspaceFileWatcher.Instance;
+        _uiContext = SynchronizationContext.Current;
         _fileWatcher.FilesChanged += OnWorkspaceFilesChanged;
         _workspaceService.ContextChanged += OnWorkspaceSettingsChangedAsync;
         _selectionOpenScheduler.Action = RunPendingSelectionOpen;
@@ -149,8 +153,14 @@ public partial class WorkspaceViewModel : PageViewModel
                 SyncTreeRows();
             }
         }
-        var dispatcher = Application.Current?.Dispatcher;
-        if (dispatcher is null || dispatcher.CheckAccess()) Apply(); else _ = dispatcher.BeginInvoke(Apply);
+        if (_uiContext is null || ReferenceEquals(SynchronizationContext.Current, _uiContext))
+        {
+            Apply();
+        }
+        else
+        {
+            _uiContext.Post(_ => Apply(), null);
+        }
     }
 
     private Task OnWorkspaceSettingsChangedAsync(ProjectWorkspaceContext? context) => BindSettingsAsync();

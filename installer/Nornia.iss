@@ -16,6 +16,9 @@
 #ifndef IconPath
   #error IconPath must point to the Nornia application icon.
 #endif
+#ifndef ChineseMessagesFile
+  #define ChineseMessagesFile "compiler:Languages\ChineseSimplified.isl"
+#endif
 
 [Setup]
 AppId={{B9B0D0C7-8A9B-4F10-ABDE-619215C91031}
@@ -41,7 +44,7 @@ CloseApplications=yes
 RestartApplications=no
 
 [Languages]
-Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+Name: "chinesesimp"; MessagesFile: "{#ChineseMessagesFile}"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]

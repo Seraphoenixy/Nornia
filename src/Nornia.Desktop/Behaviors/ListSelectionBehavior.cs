@@ -1,5 +1,6 @@
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Media;
 
@@ -80,7 +81,10 @@ public static class ListSelectionBehavior
         }
     }
 
-    private static T? FindAncestor<T>(DependencyObject? current) where T : DependencyObject
+    /// <summary>Finds a row container from either a visual hit-test source or an inline text
+    /// content source. TextBlock mouse events can originate from a <see cref="Run"/>, which must
+    /// be traversed through the content tree before entering the visual tree.</summary>
+    internal static T? FindAncestor<T>(DependencyObject? current) where T : DependencyObject
     {
         while (current is not null)
         {
@@ -89,7 +93,14 @@ public static class ListSelectionBehavior
                 return match;
             }
 
-            current = VisualTreeHelper.GetParent(current) ?? LogicalTreeHelper.GetParent(current);
+            current = current switch
+            {
+                FrameworkContentElement content => content.Parent ?? ContentOperations.GetParent(content),
+                ContentElement content => ContentOperations.GetParent(content),
+                Visual or System.Windows.Media.Media3D.Visual3D =>
+                    VisualTreeHelper.GetParent(current) ?? LogicalTreeHelper.GetParent(current),
+                _ => LogicalTreeHelper.GetParent(current),
+            };
         }
 
         return null;

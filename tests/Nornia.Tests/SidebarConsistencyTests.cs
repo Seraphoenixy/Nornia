@@ -2,6 +2,7 @@ using Nornia.Desktop.Views.Controls;
 using Nornia.Desktop.Converters;
 using Nornia.Desktop.Views;
 using Nornia.Desktop.ViewModels;
+using Nornia.Desktop.Behaviors;
 using Nornia.Core.Models;
 using System.Globalization;
 using System.Windows;
@@ -146,6 +147,19 @@ public sealed class SidebarConsistencyTests
             text.Inlines.Add(run);
 
             Assert.Same(text, GitView.FindAncestor<TextBlock>(run));
+        });
+    }
+
+    [Fact]
+    public void RightClickSelectionAncestorLookup_AcceptsInlineRunEventSources()
+    {
+        WpfStaContext.Run(() =>
+        {
+            var text = new TextBlock();
+            var run = new Run("Example.cs");
+            text.Inlines.Add(run);
+
+            Assert.Same(text, ListSelectionBehavior.FindAncestor<TextBlock>(run));
         });
     }
 

@@ -91,6 +91,11 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
     private readonly HashSet<EditorGroupViewModel> _wiredGroups = [];
     private readonly RevisionGate _settingsRevisionGate = new();
     private readonly SemaphoreSlim _previewOptionsGate = new(1, 1);
+    private readonly object _pendingPreviewOptionsGate = new();
+    private readonly Dictionary<FilePreviewTab, int> _pendingPreviewOptionWrites = new(ReferenceEqualityComparer.Instance);
+    // Use the context that owns this view model. A process-global WPF Application may belong to
+    // another dispatcher (notably the shared STA test host) whose queue is currently idle.
+    private readonly SynchronizationContext? _uiContext;
 
     /// <summary>外部文件监听(源代码视图自动刷新):按目录复用的 FileSystemWatcher 只报告已打开
     /// 的 <see cref="FilePreviewTab"/> 目标文件;关闭/预览槽替换/LRU 驱逐时经差量同步取消监听。</summary>
@@ -171,6 +176,7 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
         _outlineParser = outlineParser;
         _searchService = searchService;
         _projectLauncher = projectLauncher;
+        _uiContext = SynchronizationContext.Current;
         _fileContentWatcher = fileContentWatcher ?? NullFileContentWatcher.Instance;
         _repositoryWatcher = repositoryWatcher ?? NullGitRepositoryWatcher.Instance;
         _fileContentWatcher.FileChanged += OnFileChanged;
@@ -471,34 +477,63 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
             return;
         }
 
-        _ = PersistPreviewOptionsAsync(tab);
+        // Capture the complete option set at the event boundary. Persistence is serialized and
+        // settings notifications from an earlier write may update the live tab before a queued
+        // write starts; reading the tab inside that queued write would then persist stale values
+        // over a newer user choice.
+        var options = new PreviewOptionsSnapshot(
+            tab.FileType.LanguageId,
+            tab.WordWrap,
+            tab.ShowMinimap,
+            tab.FontSize,
+            tab.ShowLineNumbers,
+            tab.ShowIndentGuides,
+            tab.ShowFoldingControls);
+        MarkPreviewOptionsPending(tab);
+        _ = PersistPreviewOptionsAsync(tab, options);
     }
 
-    private async Task PersistPreviewOptionsAsync(FilePreviewTab tab)
+    private async Task PersistPreviewOptionsAsync(FilePreviewTab tab, PreviewOptionsSnapshot options)
     {
         await _previewOptionsGate.WaitAsync();
         try
         {
             if (_settingsService is not null)
             {
-                var session = await GetSettingsSessionAsync(tab.FileType.LanguageId);
-                // 持久化作者字号(tab.FontSize 是显示字号 = 作者字号 × uiScale),避免下次加载
+                var session = await GetSettingsSessionAsync(options.LanguageId);
+                // 持久化作者字号(options.FontSize 是显示字号 = 作者字号 × uiScale),避免下次加载
                 // 重复放大。倍率取自会话快照而非静态缓存,保证与显示侧一致且不受测试静态污染。
                 var scale = UiFontService.ClampScale(
                     session.Current?.Effective(BuiltInSettingsCatalog.UiScale) ?? UiFontService.DefaultScale);
-                await session.CommitAsync(SettingScope.User,
+                SettingOperation[] operations =
                 [
-                    new(BuiltInSettingsCatalog.EditorWordWrap.Id, JsonValue.Create(tab.WordWrap ? "on" : "off"), LanguageId: tab.FileType.LanguageId),
-                    new(BuiltInSettingsCatalog.MinimapEnabled.Id, JsonValue.Create(tab.ShowMinimap), LanguageId: tab.FileType.LanguageId),
+                    new(BuiltInSettingsCatalog.EditorWordWrap.Id, JsonValue.Create(options.WordWrap ? "on" : "off"), LanguageId: options.LanguageId),
+                    new(BuiltInSettingsCatalog.MinimapEnabled.Id, JsonValue.Create(options.ShowMinimap), LanguageId: options.LanguageId),
                     // 缩放字号写回 User 作用域(不带 LanguageId):Ctrl+滚轮调整的是"整个阅读器"的
                     // 字号,所有语言一起变。若写成语言作用域,调整 .cs 只对 csharp 生效,
                     // .csproj(xml)等其他语言仍是旧值,标签之间就会显示不同字号。
                     new(BuiltInSettingsCatalog.EditorFontSize.Id,
-                        JsonValue.Create(Math.Round(tab.FontSize / scale, 1))),
-                    new(BuiltInSettingsCatalog.LineNumbers.Id, JsonValue.Create(tab.ShowLineNumbers ? "on" : "off"), LanguageId: tab.FileType.LanguageId),
-                    new(BuiltInSettingsCatalog.IndentationGuides.Id, JsonValue.Create(tab.ShowIndentGuides), LanguageId: tab.FileType.LanguageId),
-                    new(BuiltInSettingsCatalog.Folding.Id, JsonValue.Create(tab.ShowFoldingControls), LanguageId: tab.FileType.LanguageId),
-                ]);
+                        JsonValue.Create(Math.Round(options.FontSize / scale, 1))),
+                    new(BuiltInSettingsCatalog.LineNumbers.Id, JsonValue.Create(options.ShowLineNumbers ? "on" : "off"), LanguageId: options.LanguageId),
+                    new(BuiltInSettingsCatalog.IndentationGuides.Id, JsonValue.Create(options.ShowIndentGuides), LanguageId: options.LanguageId),
+                    new(BuiltInSettingsCatalog.Folding.Id, JsonValue.Create(options.ShowFoldingControls), LanguageId: options.LanguageId),
+                ];
+                for (var attempt = 0; attempt < 3; attempt++)
+                {
+                    var result = await session.CommitAsync(SettingScope.User, operations);
+                    if (result.Status == SettingsCommitStatus.Success)
+                    {
+                        return;
+                    }
+
+                    if (attempt == 2 || result.Status is not (SettingsCommitStatus.FileError or SettingsCommitStatus.Conflict))
+                    {
+                        return;
+                    }
+
+                    await Task.Delay(50 * (attempt + 1));
+                    await session.RefreshAsync();
+                }
                 return;
             }
         }
@@ -509,8 +544,50 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
         finally
         {
             _previewOptionsGate.Release();
+            MarkPreviewOptionsCompleted(tab);
         }
     }
+
+    private void MarkPreviewOptionsPending(FilePreviewTab tab)
+    {
+        lock (_pendingPreviewOptionsGate)
+        {
+            _pendingPreviewOptionWrites.TryGetValue(tab, out var count);
+            _pendingPreviewOptionWrites[tab] = count + 1;
+        }
+    }
+
+    private void MarkPreviewOptionsCompleted(FilePreviewTab tab)
+    {
+        lock (_pendingPreviewOptionsGate)
+        {
+            if (!_pendingPreviewOptionWrites.TryGetValue(tab, out var count) || count <= 1)
+            {
+                _pendingPreviewOptionWrites.Remove(tab);
+            }
+            else
+            {
+                _pendingPreviewOptionWrites[tab] = count - 1;
+            }
+        }
+    }
+
+    private bool HasPendingPreviewOptions(FilePreviewTab tab)
+    {
+        lock (_pendingPreviewOptionsGate)
+        {
+            return _pendingPreviewOptionWrites.ContainsKey(tab);
+        }
+    }
+
+    private sealed record PreviewOptionsSnapshot(
+        string LanguageId,
+        bool WordWrap,
+        bool ShowMinimap,
+        double FontSize,
+        bool ShowLineNumbers,
+        bool ShowIndentGuides,
+        bool ShowFoldingControls);
 
     public async Task OpenDiffAsync(GitDiffRequest request)
     {
@@ -834,6 +911,10 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
                              snapshot.Context.LanguageId is null ||
                              string.Equals(tab.FileType.LanguageId, snapshot.Context.LanguageId, StringComparison.OrdinalIgnoreCase)))
                 {
+                    // An earlier write can publish its settings snapshot while newer local option
+                    // changes are still queued. Keep the live tab as the local source of truth
+                    // until its final captured snapshot has been persisted.
+                    if (HasPendingPreviewOptions(tab)) continue;
                     tab.WordWrap = code.WordWrap;
                     tab.ShowMinimap = code.ShowMinimap;
                     tab.FontSize = code.FontSize;
@@ -883,9 +964,14 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
             }
             finally { _applyingSettings = false; }
         }
-        var dispatcher = System.Windows.Application.Current?.Dispatcher;
-        if (dispatcher is null || dispatcher.CheckAccess()) Apply();
-        else _ = dispatcher.BeginInvoke(Apply);
+        if (_uiContext is null || ReferenceEquals(SynchronizationContext.Current, _uiContext))
+        {
+            Apply();
+        }
+        else
+        {
+            _uiContext.Post(_ => Apply(), null);
+        }
     }
 
     private async Task OnWorkspaceSettingsContextChangedAsync(ProjectWorkspaceContext? context)
@@ -1136,6 +1222,12 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
 
     public async Task FlushAsync(CancellationToken cancellationToken = default)
     {
+        // Option changes are intentionally saved in the background during interaction. Shutdown
+        // and tests need a real completion boundary so the last captured snapshot cannot be left
+        // behind or observed halfway through the serialized write queue.
+        await _previewOptionsGate.WaitAsync(cancellationToken);
+        _previewOptionsGate.Release();
+
         if (_stateStore is null || _workspaceService?.Current?.ProjectPath is not { } workspace) return;
         foreach (var tab in Groups.AllTabs.ToArray())
         {

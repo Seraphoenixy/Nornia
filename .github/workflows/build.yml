@@ -86,7 +86,23 @@ jobs:
           $sourceDir = (Resolve-Path "publish/$rid").Path
           $outputDir = Join-Path $PWD 'installer-output'
           $iconPath = (Resolve-Path 'src/Nornia.Desktop/Assets/app.ico').Path
+          $languageDir = Join-Path $PWD 'installer-languages'
+          $chineseMessagesFile = Join-Path $languageDir 'ChineseSimplified.isl'
           New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
+          New-Item -ItemType Directory -Path $languageDir -Force | Out-Null
+
+          # ChineseSimplified.isl is an optional Inno Setup translation and is not present on
+          # every windows-latest image. Pin the Inno Setup 6.4-compatible source and verify it.
+          Invoke-WebRequest `
+            -Uri 'https://raw.githubusercontent.com/jrsoftware/issrc/is-6_4_3/Files/Languages/Unofficial/ChineseSimplified.isl' `
+            -OutFile $chineseMessagesFile `
+            -MaximumRetryCount 3 `
+            -RetryIntervalSec 2
+          $expectedLanguageHash = 'DCECA9FEA16EA057A64012AC8744A1ECA7DC6CE3187D0C8991ACCBB539F2D4A0'
+          $actualLanguageHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $chineseMessagesFile).Hash
+          if ($actualLanguageHash -ne $expectedLanguageHash) {
+            throw "ChineseSimplified.isl checksum mismatch: $actualLanguageHash"
+          }
 
           $iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
           if (-not $iscc) {
@@ -102,7 +118,8 @@ jobs:
             "/DAppArchitecture=$architecture" `
             "/DSourceDir=$sourceDir" `
             "/DOutputDir=$outputDir" `
-            "/DIconPath=$iconPath"
+            "/DIconPath=$iconPath" `
+            "/DChineseMessagesFile=$chineseMessagesFile"
           if ($LASTEXITCODE -ne 0) {
             throw "Inno Setup failed with exit code $LASTEXITCODE"
           }

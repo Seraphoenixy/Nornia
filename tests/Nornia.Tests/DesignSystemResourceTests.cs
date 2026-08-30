@@ -1762,6 +1762,20 @@ public sealed class DesignSystemResourceTests
     }
 
     [Fact]
+    public void SearchOptionToggles_UseThemeAwareToolbarStyle()
+    {
+        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/SearchSidebarView.xaml"));
+
+        Assert.Contains("x:Key=\"SearchOptionToggleStyle\"", view);
+        Assert.Equal(4, Regex.Matches(view, "Style=\"\\{StaticResource SearchOptionToggleStyle\\}\"").Count);
+        Assert.Contains("Content=\"{loc:StringLoc Key=Search_UseIgnoreFiles}\"", view);
+        Assert.Contains("Value=\"{DynamicResource HoverBrush}\"", view);
+        Assert.Contains("Value=\"{DynamicResource SelectionActiveBrush}\"", view);
+        Assert.Contains("Value=\"{DynamicResource AccentBrush}\"", view);
+        Assert.Contains("Value=\"{DynamicResource FocusBorderBrush}\"", view);
+    }
+
+    [Fact]
     public void CachePage_UsesResizableSummaryAndDetailTables()
     {
         var cache = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/CacheView.xaml"));
