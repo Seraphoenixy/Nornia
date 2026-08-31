@@ -57,7 +57,7 @@ public sealed class CacheViewModelTests
     [Fact]
     public async Task CleanCategory_CleansOnlyCheckedCandidatesInTheCategory()
     {
-        var (viewModel, _, cleanup, _) = Create(Fixture());
+        var (viewModel, inventory, cleanup, _) = Create(Fixture());
         await viewModel.ScanCommand.ExecuteAsync(null);
         var chrome = Assert.Single(viewModel.CategorySummaries, summary => summary.CategoryName == "Google Chrome");
 
@@ -66,6 +66,8 @@ public sealed class CacheViewModelTests
         Assert.Contains("c1", cleanup.CleanedIds);
         Assert.DoesNotContain("c2", cleanup.CleanedIds);
         Assert.DoesNotContain("c3", cleanup.CleanedIds);
+        Assert.Equal(1, inventory.ForcedScanCalls);
+        Assert.Equal(1, inventory.CachedScanCalls);
     }
 
     [Fact]

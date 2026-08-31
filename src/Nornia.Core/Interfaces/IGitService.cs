@@ -12,7 +12,10 @@ public interface IGitService
 {
     /// <summary>Reads branch/upstream info and staged/unstaged changes. Returns
     /// <see cref="GitRepositoryStatus.NotARepository"/> when the path is not inside a git worktree.</summary>
-    Task<GitRepositoryStatus> GetStatusAsync(string repositoryPath, CancellationToken cancellationToken = default);
+    Task<GitRepositoryStatus> GetStatusAsync(
+        string repositoryPath,
+        CancellationToken cancellationToken = default,
+        bool includeAllUntracked = true);
 
     /// <summary>Initializes a new local Git repository in an existing directory. This creates only
     /// Git metadata; it does not stage files, create a commit, or configure a remote.</summary>

@@ -31,6 +31,12 @@ public partial class MainViewModel : ObservableObject
     private readonly GitViewModel? _git;
     private readonly ProjectsViewModel? _projects;
     private readonly SettingsViewModel? _settings;
+    private readonly object _quickOpenCacheGate = new();
+    private string? _quickOpenCacheRoot;
+    private IReadOnlyList<string>? _quickOpenFilesCache;
+    private string? _quickOpenBuildRoot;
+    private Task<IReadOnlyList<string>>? _quickOpenBuildTask;
+    private long _quickOpenCacheGeneration;
 
     /// <summary>Guard for the 标签→活动栏 direction only: while a page-tab selection mirrors back
     /// into the activity bar, <see cref="OnSelectedNavigationItemChanged"/> must not re-open the
@@ -114,6 +120,7 @@ public partial class MainViewModel : ObservableObject
 
         // 顶栏命令中心标题:随工作区(项目)切换实时刷新。
         _explorer.Explorer.PropertyChanged += OnWorkspaceSourceChanged;
+        _explorer.Explorer.WorkspaceFilesChanged += OnWorkspaceFilesChanged;
 
         // 启动首帧不打开页面标签(壳先行,主内容区先呈现空状态引导);默认导航项(环境管理)
         // 的页面标签由 PreloadPagesAsync 在首帧后的空闲时机补开——否则着陆页内容区一直停留在
@@ -611,8 +618,23 @@ public partial class MainViewModel : ObservableObject
             await explorer.ActivateAsync();
         }
 
-        QuickInput.Open("打开文件", BuildQuickOpenItems());
+        QuickInput.Open("打开文件", [new QuickPickItem("正在扫描工作区…", "文件索引准备中", Codicons.Loading, static () => { })]);
         AttachQuickOpenPrefixMode();
+
+        var items = await BuildQuickOpenItemsAsync();
+        if (!QuickInput.IsOpen)
+        {
+            return;
+        }
+
+        if (_quickOpenSession is { } session)
+        {
+            session.FileItems = items.ToArray();
+            if (session.Mode == QuickOpenUiMode.File)
+            {
+                QuickInput.ReplaceItems(session.FileItems);
+            }
+        }
     }
 
     /// <summary>状态栏语言选择器(VS Code"更改语言模式"):QuickInput 枚举全部已注册语言,
@@ -657,7 +679,7 @@ public partial class MainViewModel : ObservableObject
 
     private sealed class QuickOpenSession
     {
-        public required QuickPickItem[] FileItems { get; init; }
+        public required QuickPickItem[] FileItems { get; set; }
         public required QuickPickItem[] SymbolItems { get; init; }
         public required QuickPickItem[] LineItems { get; init; }
         public QuickOpenUiMode Mode { get; set; } = QuickOpenUiMode.File;
@@ -724,16 +746,12 @@ public partial class MainViewModel : ObservableObject
         }
 
         session.Mode = mode;
-        QuickInput.Items.Clear();
-        foreach (var item in mode switch
+        QuickInput.ReplaceItems(mode switch
         {
             QuickOpenUiMode.Symbol => session.SymbolItems,
             QuickOpenUiMode.Line => session.LineItems,
             _ => session.FileItems,
-        })
-        {
-            QuickInput.Items.Add(item);
-        }
+        });
     }
 
     private void ExecuteQuickOpenGotoLine()
@@ -868,6 +886,88 @@ public partial class MainViewModel : ObservableObject
         return items;
     }
 
+    private async Task<IReadOnlyList<QuickPickItem>> BuildQuickOpenItemsAsync()
+    {
+        if (_explorer is not { } explorer)
+        {
+            return [];
+        }
+
+        var root = explorer.Explorer.WorkspacePath;
+        if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
+        {
+            return [];
+        }
+
+        var fullRoot = Path.GetFullPath(root);
+        IReadOnlyList<string>? files = null;
+        Task<IReadOnlyList<string>>? buildTask = null;
+        long cacheGeneration;
+        lock (_quickOpenCacheGate)
+        {
+            cacheGeneration = _quickOpenCacheGeneration;
+            if (string.Equals(_quickOpenCacheRoot, fullRoot, StringComparison.OrdinalIgnoreCase) &&
+                _quickOpenFilesCache is not null)
+            {
+                files = _quickOpenFilesCache;
+            }
+            else
+            {
+                if (!string.Equals(_quickOpenBuildRoot, fullRoot, StringComparison.OrdinalIgnoreCase) || _quickOpenBuildTask is null)
+                {
+                    _quickOpenBuildRoot = fullRoot;
+                    _quickOpenBuildTask = Task.Run<IReadOnlyList<string>>(() => QuickOpenFiles(fullRoot).ToArray());
+                }
+                buildTask = _quickOpenBuildTask;
+            }
+        }
+
+        if (files is null)
+        {
+            files = await buildTask!.ConfigureAwait(true);
+            var stale = false;
+            lock (_quickOpenCacheGate)
+            {
+                if (cacheGeneration == _quickOpenCacheGeneration &&
+                    string.Equals(_quickOpenBuildRoot, fullRoot, StringComparison.OrdinalIgnoreCase))
+                {
+                    _quickOpenCacheRoot = fullRoot;
+                    _quickOpenFilesCache = files;
+                }
+                else if (cacheGeneration != _quickOpenCacheGeneration)
+                {
+                    // A watcher event arrived while the index was being built. Do not publish a
+                    // stale snapshot into the overlay; the next pass reuses the new root/task or
+                    // starts a fresh scan as needed.
+                    stale = true;
+                }
+            }
+
+            if (stale)
+            {
+                return await BuildQuickOpenItemsAsync().ConfigureAwait(true);
+            }
+        }
+
+        return BuildQuickOpenItems(explorer, fullRoot, files);
+    }
+
+    private IReadOnlyList<QuickPickItem> BuildQuickOpenItems(
+        ExplorerPageViewModel explorer,
+        string root,
+        IReadOnlyList<string> files)
+    {
+        var items = new List<QuickPickItem>(files.Count);
+        foreach (var path in files)
+        {
+            var name = Path.GetFileName(path);
+            var relative = path.Length > root.Length + 1 ? path[(root.Length + 1)..] : name;
+            items.Add(new QuickPickItem(name, relative, Codicons.File, () => _ = explorer.Editor.OpenFileAsync(path)));
+        }
+
+        return items;
+    }
+
     /// <summary>Bounded, generated-folder-aware file enumeration for quick open. Skips VCS and build
     /// output trees that would drown the list (VS Code hides these by default too).</summary>
     public static IEnumerable<string> QuickOpenFiles(string root, int cap = 5000)
@@ -886,8 +986,18 @@ public partial class MainViewModel : ObservableObject
             IReadOnlyList<string> files = [];
             try
             {
-                directories = Directory.EnumerateDirectories(dir).OrderBy(d => d, StringComparer.OrdinalIgnoreCase).ToArray();
-                files = Directory.EnumerateFiles(dir).OrderBy(f => f, StringComparer.OrdinalIgnoreCase).ToArray();
+                // Quick open applies fuzzy ranking after the index is loaded, so sorting every
+                // directory here only delays the first usable rows and can enumerate millions of
+                // siblings before the global cap is reached. Preserve filesystem order and stop
+                // asking the OS once the cap's remaining budget is exhausted.
+                var remaining = Math.Max(0, cap - count);
+                directories = Directory.EnumerateDirectories(dir)
+                    .Where(d => !excluded.Contains(Path.GetFileName(d)))
+                    .Take(remaining)
+                    .ToArray();
+                files = Directory.EnumerateFiles(dir)
+                    .Take(Math.Max(0, remaining - directories.Count))
+                    .ToArray();
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or System.Security.SecurityException)
             {
@@ -897,10 +1007,7 @@ public partial class MainViewModel : ObservableObject
 
             foreach (var sub in directories)
             {
-                if (!excluded.Contains(System.IO.Path.GetFileName(sub)))
-                {
-                    pending.Push(sub);
-                }
+                pending.Push(sub);
             }
 
             foreach (var file in files)
@@ -979,7 +1086,20 @@ public partial class MainViewModel : ObservableObject
     {
         if (e.PropertyName == nameof(WorkspaceViewModel.WorkspacePath))
         {
+            InvalidateQuickOpenCache();
             OnPropertyChanged(nameof(WorkspaceTitle));
+        }
+    }
+
+    private void OnWorkspaceFilesChanged(object? sender, EventArgs e) => InvalidateQuickOpenCache();
+
+    private void InvalidateQuickOpenCache()
+    {
+        lock (_quickOpenCacheGate)
+        {
+            _quickOpenCacheGeneration++;
+            _quickOpenCacheRoot = null;
+            _quickOpenFilesCache = null;
         }
     }
 

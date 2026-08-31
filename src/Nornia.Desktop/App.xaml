@@ -699,15 +699,18 @@
           <ControlTemplate TargetType="ComboBox">
             <Grid SnapsToDevicePixels="True">
               <ToggleButton x:Name="ToggleButton" Focusable="False" ClickMode="Press"
+                            Background="{TemplateBinding Background}"
+                            BorderBrush="{TemplateBinding BorderBrush}"
+                            BorderThickness="{TemplateBinding BorderThickness}"
+                            Foreground="{TemplateBinding Foreground}"
                             IsChecked="{Binding IsDropDownOpen, RelativeSource={RelativeSource TemplatedParent}}">
                 <ToggleButton.Template>
                   <ControlTemplate TargetType="ToggleButton">
-                    <!-- The templated parent here is ToggleButton, whose default Background is
-                         the system control colour (white). Bind to the owning ComboBox instead
-                         so the closed selector stays on the dark input surface. -->
-                    <Border Background="{Binding Background, RelativeSource={RelativeSource AncestorType=ComboBox}}"
-                            BorderBrush="{Binding BorderBrush, RelativeSource={RelativeSource AncestorType=ComboBox}}"
-                            BorderThickness="{Binding BorderThickness, RelativeSource={RelativeSource AncestorType=ComboBox}}"
+                    <!-- Bind through the outer ComboBox template so the ToggleButton never falls
+                         back to the system control colour when a selector is materialized. -->
+                    <Border Background="{TemplateBinding Background}"
+                            BorderBrush="{TemplateBinding BorderBrush}"
+                            BorderThickness="{TemplateBinding BorderThickness}"
                             CornerRadius="{StaticResource RadiusSm}">
                       <TextBlock Text="{StaticResource CodiconChevronDown}" FontFamily="{StaticResource IconFontFamily}"
                                  FontSize="{DynamicResource IconChevron}" Foreground="{DynamicResource MutedTextBrush}"
@@ -747,17 +750,24 @@
       </Style.Triggers>
     </Style>
     <Style TargetType="ComboBoxItem">
-      <Setter Property="Background" Value="{DynamicResource InputBrush}" />
+      <Setter Property="Background" Value="{DynamicResource MenuBackgroundBrush}" />
       <Setter Property="Foreground" Value="{DynamicResource TextBrush}" />
       <Setter Property="Padding" Value="8,4" />
       <!-- 显式模板:项面填满下拉表面,悬停高亮走主题令牌,消除默认模板的白色缝隙 -->
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="ComboBoxItem">
-            <Border x:Name="ItemBorder" Background="Transparent" Padding="{TemplateBinding Padding}" SnapsToDevicePixels="True">
-              <ContentPresenter />
+            <Border x:Name="ItemBorder" Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}" SnapsToDevicePixels="True">
+              <ContentPresenter Content="{TemplateBinding Content}"
+                                ContentTemplate="{TemplateBinding ContentTemplate}"
+                                ContentStringFormat="{TemplateBinding ContentStringFormat}"
+                                TextElement.Foreground="{TemplateBinding Foreground}" />
             </Border>
             <ControlTemplate.Triggers>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter TargetName="ItemBorder" Property="Background" Value="{DynamicResource SelectionActiveBrush}" />
+                <Setter Property="Foreground" Value="{DynamicResource BrightTextBrush}" />
+              </Trigger>
               <Trigger Property="IsHighlighted" Value="True">
                 <Setter TargetName="ItemBorder" Property="Background" Value="{DynamicResource SelectionActiveBrush}" />
                 <Setter Property="Foreground" Value="{DynamicResource BrightTextBrush}" />
@@ -778,7 +788,9 @@
          勾选 = 强调色填充 + 亮色对勾,悬停边框加深;不再使用默认 Aero2 白盒蓝勾渲染。
          作用于查找栏(大小写/全词/正则/所选范围)、设置页开关与缓存清理列。 -->
     <Style TargetType="CheckBox">
+      <Setter Property="Background" Value="{DynamicResource InputBrush}" />
       <Setter Property="Foreground" Value="{DynamicResource TextBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource InputBorderBrush}" />
       <Setter Property="FocusVisualStyle" Value="{StaticResource AppFocusRing}" />
       <Setter Property="Template">
         <Setter.Value>
@@ -788,14 +800,16 @@
                           HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
                           VerticalAlignment="{TemplateBinding VerticalContentAlignment}">
                 <Border x:Name="Box" Width="16" Height="16" CornerRadius="{StaticResource RadiusSm}"
-                        Background="{DynamicResource InputBrush}" BorderBrush="{DynamicResource BorderBrush}"
+                        Background="{DynamicResource InputBrush}" BorderBrush="{TemplateBinding BorderBrush}"
                         BorderThickness="1" VerticalAlignment="Center" SnapsToDevicePixels="True">
                   <Path x:Name="Check" Data="M3.2 8.4 L6.8 11.8 L12.8 4.6"
                         Stroke="{DynamicResource BrightTextBrush}" StrokeThickness="1.8"
                         StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"
                         HorizontalAlignment="Center" VerticalAlignment="Center" Visibility="Collapsed" />
                 </Border>
-                <ContentPresenter x:Name="Label" Margin="6,0,0,0" VerticalAlignment="Center" RecognizesAccessKey="True" />
+                <ContentPresenter x:Name="Label" Margin="6,0,0,0" VerticalAlignment="Center"
+                                  ContentSource="Content" TextElement.Foreground="{TemplateBinding Foreground}"
+                                  RecognizesAccessKey="True" />
               </StackPanel>
             </Grid>
             <ControlTemplate.Triggers>

@@ -138,6 +138,18 @@ public sealed class SettingsCenterTests
     }
 
     [Fact]
+    public void SettingsView_UsesThemeAwareSelectionContainer()
+    {
+        var root = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", ".."));
+        var view = File.ReadAllText(Path.Combine(root, "src", "Nornia.Desktop", "Views", "SettingsView.xaml"));
+
+        // The settings cards are hosted by a ListBox for virtualization. Its local layout style
+        // must inherit the application ListBoxItem template, otherwise WPF shows the native
+        // blue/white selection surface instead of the active theme's selection layer.
+        Assert.Contains("<Style TargetType=\"ListBoxItem\" BasedOn=\"{StaticResource {x:Type ListBoxItem}}\">", view);
+    }
+
+    [Fact]
     public void SettingsView_TogglesCompactLayoutAtMeasuredWidth()
     {
         Assert.True(SettingsView.ShouldUseCompactLayout(SettingsView.CompactLayoutThreshold - 1));

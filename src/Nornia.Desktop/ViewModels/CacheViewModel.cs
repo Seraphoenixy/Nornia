@@ -1,5 +1,6 @@
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
+using Nornia.Core.Collections;
 using Nornia.Core.Interfaces;
 using Nornia.Core.Models;
 using Nornia.Desktop.Services;
@@ -23,7 +24,7 @@ public partial class CacheViewModel : PageViewModel, INavigationTarget
     private TimeSpan _lastScanElapsed;
     private bool _suspendSelectionRefresh;
 
-    public ObservableCollection<CacheCandidateItem> Candidates { get; } = [];
+    public BulkObservableCollection<CacheCandidateItem> Candidates { get; } = [];
     public ObservableCollection<CacheCategorySummaryItem> CategorySummaries { get; } = [];
 
     /// <summary>Multi-selection for the candidate grid (Ctrl+C / 复制选中).</summary>
@@ -97,10 +98,12 @@ public partial class CacheViewModel : PageViewModel, INavigationTarget
 
     private bool CanScan() => !IsBusy;
 
-    private async Task LoadCandidatesAsync(CancellationToken cancellationToken)
+    private async Task LoadCandidatesAsync(CancellationToken cancellationToken, bool forceRescan = true)
     {
         var stopwatch = Stopwatch.StartNew();
-        var rawCandidates = await _inventoryService.ScanForcedAsync(progress: null, cancellationToken);
+        var rawCandidates = forceRescan
+            ? await _inventoryService.ScanForcedAsync(progress: null, cancellationToken)
+            : await _inventoryService.ScanAsync(progress: null, cancellationToken);
         stopwatch.Stop();
         _lastScanElapsed = stopwatch.Elapsed;
         var classifiedCandidates = _classificationService.Classify(rawCandidates);
@@ -110,13 +113,13 @@ public partial class CacheViewModel : PageViewModel, INavigationTarget
         {
             SelectedCandidates.Clear();
             foreach (var existing in Candidates) existing.PropertyChanged -= OnCandidatePropertyChanged;
-            Candidates.Clear();
-            foreach (var candidate in classifiedCandidates)
+            var items = classifiedCandidates.Select(candidate =>
             {
                 var item = new CacheCandidateItem(candidate);
                 item.PropertyChanged += OnCandidatePropertyChanged;
-                Candidates.Add(item);
-            }
+                return item;
+            }).ToArray();
+            Candidates.ReplaceRange(items);
 
             CategorySummaries.Clear();
             foreach (var summary in summaries)
@@ -193,7 +196,7 @@ public partial class CacheViewModel : PageViewModel, INavigationTarget
         }
         var reclaimed = results.Where(result => result.Status == CacheCleanupStatus.Cleaned).Sum(result => result.ReclaimedBytes);
         CleanupResultSummary = $"清理完成：预计 {FormatSize(before)}，实际释放 {FormatSize(reclaimed)}。";
-        await LoadCandidatesAsync(cancellationToken);
+        await LoadCandidatesAsync(cancellationToken, forceRescan: false);
     }, "仍有失败项时，可打开目录或查看 Problems。", canCancel: true,
         successMessageFactory: () => CleanupResultSummary);
 
@@ -229,7 +232,7 @@ public partial class CacheViewModel : PageViewModel, INavigationTarget
         }
         var reclaimed = results.Where(result => result.Status == CacheCleanupStatus.Cleaned).Sum(result => result.ReclaimedBytes);
         CleanupResultSummary = $"分类“{summary.CategoryName}”清理完成：预计 {FormatSize(before)}，实际释放 {FormatSize(reclaimed)}。";
-        await LoadCandidatesAsync(cancellationToken);
+        await LoadCandidatesAsync(cancellationToken, forceRescan: false);
     }, "仍有失败项时，可打开目录或查看 Problems。", canCancel: true,
         successMessageFactory: () => CleanupResultSummary);
 

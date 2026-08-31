@@ -730,21 +730,61 @@ public sealed record DiffDisplayLine(DiffRenderLine? Source, int OriginalIndex, 
 {
     public bool IsCollapsedContext => HiddenLineCount > 0;
     public string Text => IsCollapsedContext ? $"  … 展开 {HiddenLineCount} 行未更改内容 …" : Source?.Text ?? string.Empty;
+
+    /// <summary>Materializes this projected row for an editor document. Side-by-side panes pass
+    /// their own source list while sharing the same projection, so a collapsed prompt keeps the
+    /// same hidden count and text on both sides.</summary>
+    public DiffRenderLine ToRenderLine(IReadOnlyList<DiffRenderLine>? source = null, bool hideHunkHeader = false)
+    {
+        if (IsCollapsedContext)
+        {
+            return new DiffRenderLine(Text, GitDiffLineKind.None, null, null,
+                HiddenLineCount: HiddenLineCount);
+        }
+
+        var result = source is null ? Source! : source[OriginalIndex];
+        return hideHunkHeader && result.Kind == GitDiffLineKind.HunkHeader
+            ? result with { Text = string.Empty }
+            : result;
+    }
 }
 
 public static class DiffContextProjection
 {
     /// <summary>Context-run projection with VS Code-style fold thresholds (D7). A run that touches
     /// a document edge is foldable once it can keep <paramref name="contextLines"/> on the change
-    /// side and still hide a line (length ≥ context+1); a run between two boundaries needs
-    /// context on both sides (length ≥ 2·context+1). The display shape is unchanged:
+    /// side and still hide a line (length ≥ context+1); a run between two changes needs context on
+    /// both sides (length ≥ 2·context+1). Hunk headers never count as context and do not split a
+    /// run when no change lies between them. Callers may retain them as metadata rows when the
+    /// surface needs them; side-by-side rendering omits its empty metadata rows. The display shape
+    /// is unchanged:
     /// <paramref name="contextLines"/> on each side (clamped so at least one line stays hidden)
     /// with a single collapsed placeholder between them. Expanded runs are never folded.</summary>
-    public static IReadOnlyList<DiffDisplayLine> Build(IReadOnlyList<DiffRenderLine> lines, ISet<int>? expandedContextStarts = null, int contextLines = 3)
+    public static IReadOnlyList<DiffDisplayLine> Build(
+        IReadOnlyList<DiffRenderLine> lines,
+        ISet<int>? expandedContextStarts = null,
+        int contextLines = 3,
+        bool includeHunkHeaders = true)
     {
         if (contextLines < 0)
         {
             contextLines = 0;
+        }
+
+        // A unified diff can split one unchanged region into two context runs at a hunk header.
+        // Only use the hunk-aware pass when there are real changes to anchor the logical run. The
+        // no-change case intentionally keeps the old projection semantics for synthetic side rows
+        // and metadata-only test documents.
+        var hasChange = false;
+        var hasHunkHeader = false;
+        for (var index = 0; index < lines.Count; index++)
+        {
+            hasChange |= lines[index].IsChange;
+            hasHunkHeader |= lines[index].Kind == GitDiffLineKind.HunkHeader;
+            if (hasChange && hasHunkHeader)
+            {
+                return BuildAcrossHunkHeaders(lines, expandedContextStarts, contextLines, includeHunkHeaders);
+            }
         }
 
         var display = new List<DiffDisplayLine>(lines.Count);
@@ -771,6 +811,9 @@ public static class DiffContextProjection
                 && expandedContextStarts?.Contains(start + edge) != true)
             {
                 for (var line = start; line < start + edge; line++) display.Add(new DiffDisplayLine(lines[line], line));
+                // The folded run is represented by exactly one display row. It has no source row:
+                // the hidden count is display metadata and ToRenderLine materializes the prompt
+                // only once for each editor surface.
                 display.Add(new DiffDisplayLine(null, start + edge, hidden));
                 for (var line = index - edge; line < index; line++) display.Add(new DiffDisplayLine(lines[line], line));
             }
@@ -782,6 +825,146 @@ public static class DiffContextProjection
 
         return display;
     }
+
+    private static IReadOnlyList<DiffDisplayLine> BuildAcrossHunkHeaders(
+        IReadOnlyList<DiffRenderLine> lines,
+        ISet<int>? expandedContextStarts,
+        int contextLines,
+        bool includeHunkHeaders)
+    {
+        var display = new List<DiffDisplayLine>(lines.Count);
+        for (var index = 0; index < lines.Count;)
+        {
+            if (lines[index].IsChange || lines[index].Kind == GitDiffLineKind.Notice)
+            {
+                display.Add(new DiffDisplayLine(lines[index], index));
+                index++;
+                continue;
+            }
+
+            var start = index;
+            while (index < lines.Count
+                && !lines[index].IsChange
+                && lines[index].Kind != GitDiffLineKind.Notice)
+            {
+                index++;
+            }
+
+            AddLogicalContextRun(display, lines, start, index, expandedContextStarts, contextLines, includeHunkHeaders);
+        }
+
+        return display;
+    }
+
+    private static void AddLogicalContextRun(
+        List<DiffDisplayLine> display,
+        IReadOnlyList<DiffRenderLine> lines,
+        int start,
+        int end,
+        ISet<int>? expandedContextStarts,
+        int contextLines,
+        bool includeHunkHeaders)
+    {
+        var contextCount = 0;
+        for (var index = start; index < end; index++)
+        {
+            if (lines[index].Kind != GitDiffLineKind.HunkHeader)
+            {
+                contextCount++;
+            }
+        }
+
+        if (contextCount == 0)
+        {
+            AddSourceRange(display, lines, start, end, includeHunkHeaders);
+            return;
+        }
+
+        var edge = Math.Min(contextLines, contextCount / 2);
+        var hidden = contextCount - edge * 2;
+        var hasChangeBefore = start > 0 && lines[start - 1].IsChange;
+        var hasChangeAfter = end < lines.Count && lines[end].IsChange;
+        var atEdge = !hasChangeBefore || !hasChangeAfter;
+        var minimumFoldable = atEdge ? contextLines + 1 : 2 * contextLines + 1;
+
+        var firstHiddenIndex = -1;
+        var contextOrdinal = 0;
+        for (var index = start; index < end; index++)
+        {
+            if (lines[index].Kind != GitDiffLineKind.HunkHeader)
+            {
+                if (contextOrdinal == edge)
+                {
+                    firstHiddenIndex = index;
+                    break;
+                }
+
+                contextOrdinal++;
+            }
+        }
+
+        var shouldFold = contextCount >= minimumFoldable
+            && hidden > 0
+            && firstHiddenIndex >= 0
+            && expandedContextStarts?.Contains(firstHiddenIndex) != true;
+
+        if (!shouldFold)
+        {
+            AddSourceRange(display, lines, start, end, includeHunkHeaders);
+            return;
+        }
+
+        var insertedPrompt = false;
+        contextOrdinal = 0;
+        for (var index = start; index < end; index++)
+        {
+            // Hunk headers are metadata, not source context. Keep them in the projection for
+            // sticky-header/navigation logic when requested. Side-by-side panes omit these rows
+            // because their two materialized cells are both empty and would create phantom lines.
+            if (lines[index].Kind == GitDiffLineKind.HunkHeader)
+            {
+                if (includeHunkHeaders)
+                {
+                    display.Add(new DiffDisplayLine(lines[index], index));
+                }
+
+                continue;
+            }
+
+            if (contextOrdinal < edge || contextOrdinal >= contextCount - edge)
+            {
+                display.Add(new DiffDisplayLine(lines[index], index));
+            }
+            else if (!insertedPrompt)
+            {
+                // The prompt owns the first hidden source index. Reusing this stable anchor lets
+                // DiffDisplayMap expand the complete logical run, including context from both
+                // sides of an intervening hunk header, on the next rebuild.
+                display.Add(new DiffDisplayLine(null, firstHiddenIndex, hidden));
+                insertedPrompt = true;
+            }
+
+            contextOrdinal++;
+        }
+    }
+
+    private static void AddSourceRange(
+        List<DiffDisplayLine> display,
+        IReadOnlyList<DiffRenderLine> lines,
+        int start,
+        int end,
+        bool includeHunkHeaders)
+    {
+        for (var index = start; index < end; index++)
+        {
+            if (!includeHunkHeaders && lines[index].Kind == GitDiffLineKind.HunkHeader)
+            {
+                continue;
+            }
+
+            display.Add(new DiffDisplayLine(lines[index], index));
+        }
+    }
 }
 
 /// <summary>Explicit bidirectional projection shared by inline and side-by-side surfaces. Display
@@ -789,12 +972,14 @@ public static class DiffContextProjection
 public sealed class DiffDisplayMap
 {
     private readonly IReadOnlyList<DiffRenderLine> _source;
+    private readonly bool _includeHunkHeaders;
     private readonly HashSet<int> _expandedContextStarts = [];
     private Dictionary<int, int> _originalToDisplay = [];
 
-    public DiffDisplayMap(IReadOnlyList<DiffRenderLine> source, bool collapseContext = true)
+    public DiffDisplayMap(IReadOnlyList<DiffRenderLine> source, bool collapseContext = true, bool includeHunkHeaders = true)
     {
         _source = source;
+        _includeHunkHeaders = includeHunkHeaders;
         CollapseContext = collapseContext;
         Rebuild();
     }
@@ -834,6 +1019,14 @@ public sealed class DiffDisplayMap
 
     public void SetCollapseContext(bool value)
     {
+        // Turning the global projection off is a new folding session. Do not retain per-prompt
+        // expansion anchors, otherwise turning it back on leaves the document unexpectedly fully
+        // expanded and makes the setting appear to have no effect.
+        if (!value)
+        {
+            _expandedContextStarts.Clear();
+        }
+
         CollapseContext = value;
         Rebuild();
     }
@@ -841,7 +1034,7 @@ public sealed class DiffDisplayMap
     private void Rebuild()
     {
         Lines = CollapseContext
-            ? DiffContextProjection.Build(_source, _expandedContextStarts)
+            ? DiffContextProjection.Build(_source, _expandedContextStarts, includeHunkHeaders: _includeHunkHeaders)
             : _source.Select((line, index) => new DiffDisplayLine(line, index)).ToArray();
         _originalToDisplay = new Dictionary<int, int>();
         for (var index = 0; index < Lines.Count; index++)

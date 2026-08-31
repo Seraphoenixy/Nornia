@@ -11,7 +11,7 @@ public sealed record CodeReadingOptions(bool WordWrap = false,
 
 public enum DiffLayoutMode { Inline, SideBySide }
 
-public sealed record DiffReadingOptions(DiffLayoutMode DefaultLayout = DiffLayoutMode.Inline,
+public sealed record DiffReadingOptions(DiffLayoutMode DefaultLayout = DiffLayoutMode.SideBySide,
     bool CollapseUnchangedContext = true, bool ShowIntralineChanges = true,
     bool ShowOverviewRuler = true, bool SynchronizeScrolling = true,
     bool IgnoreWhitespaceEndOfLine = false, bool UseInlineWhenNarrow = true);

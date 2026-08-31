@@ -12,6 +12,7 @@ public sealed class AppDataCacheService : ICacheInventoryService, ICacheCleanupS
     private readonly object _scanLock = new();
     private IReadOnlyList<CacheCandidate>? _lastScan;
     private long _lastScanAt;
+    private Task<IReadOnlyList<CacheCandidate>>? _scanInFlight;
 
     private static readonly HashSet<string> ExactCacheNames = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -69,20 +70,46 @@ public sealed class AppDataCacheService : ICacheInventoryService, ICacheCleanupS
         // Scanning the entire user profile tree is expensive; reuse a recent result so dashboard and
         // cache-page refreshes do not re-walk the filesystem on every activation.
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        Task<IReadOnlyList<CacheCandidate>> scanTask;
         lock (_scanLock)
         {
             if (!forceRescan && _lastScan is not null && now - _lastScanAt < Nornia.Core.NorniaSettings.CacheScanCacheSeconds)
             {
                 return _lastScan;
             }
+
+            // Forced refreshes still share an in-flight walk. This prevents simultaneous page
+            // activation and cleanup refreshes from traversing the user profile more than once.
+            _scanInFlight ??= ScanAndCacheAsync(progress, cancellationToken);
+            scanTask = _scanInFlight;
         }
 
+        try
+        {
+            return await scanTask.ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (_scanLock)
+            {
+                if (ReferenceEquals(_scanInFlight, scanTask))
+                {
+                    _scanInFlight = null;
+                }
+            }
+        }
+    }
+
+    private async Task<IReadOnlyList<CacheCandidate>> ScanAndCacheAsync(
+        IProgress<string>? progress,
+        CancellationToken cancellationToken)
+    {
         if (_roots.Count == 0)
         {
             return [];
         }
 
-        var candidates = new List<CacheCandidate>();
+        var rootScans = new List<Task<IReadOnlyList<CacheCandidate>>>(_roots.Count);
         foreach (var root in _roots)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -91,8 +118,16 @@ public sealed class AppDataCacheService : ICacheInventoryService, ICacheCleanupS
                 continue;
             }
 
-            await Task.Run(() => ScanRoot(root, candidates, cancellationToken), cancellationToken);
+            progress?.Report($"正在扫描 {root}");
+            rootScans.Add(Task.Run<IReadOnlyList<CacheCandidate>>(() =>
+            {
+                var rootCandidates = new List<CacheCandidate>();
+                ScanRoot(root, rootCandidates, cancellationToken);
+                return rootCandidates;
+            }, cancellationToken));
         }
+
+        var candidates = (await Task.WhenAll(rootScans).ConfigureAwait(false)).SelectMany(items => items).ToList();
 
         var result = candidates
             .OrderByDescending(candidate => candidate.Confidence)
@@ -102,7 +137,7 @@ public sealed class AppDataCacheService : ICacheInventoryService, ICacheCleanupS
         lock (_scanLock)
         {
             _lastScan = result;
-            _lastScanAt = now;
+            _lastScanAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         }
 
         return result;
@@ -122,6 +157,7 @@ public sealed class AppDataCacheService : ICacheInventoryService, ICacheCleanupS
 
         // Cleanup targets must be resolved against a fresh scan: cached candidates may be stale or gone.
         var currentCandidates = await ScanCoreAsync(forceRescan: true, progress, cancellationToken);
+        var completed = false;
         try
         {
             var byId = currentCandidates.ToDictionary(candidate => candidate.Id, StringComparer.OrdinalIgnoreCase);
@@ -150,15 +186,36 @@ public sealed class AppDataCacheService : ICacheInventoryService, ICacheCleanupS
                 }
             }
 
+            var cleanedIds = results
+                .Where(result => result.Status == CacheCleanupStatus.Cleaned)
+                .Select(result => result.Id)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            if (cleanedIds.Count > 0)
+            {
+                var updated = currentCandidates
+                    .Select(candidate => cleanedIds.Contains(candidate.Id) ? candidate with { SizeBytes = 0 } : candidate)
+                    .ToArray();
+                lock (_scanLock)
+                {
+                    _lastScan = updated;
+                    _lastScanAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                }
+            }
+
+            completed = true;
             return results;
         }
         finally
         {
-            // The cache inventory changed; drop the shared snapshot so the next scan is fresh.
-            lock (_scanLock)
+            if (!completed)
             {
-                _lastScan = null;
-                _lastScanAt = 0;
+                // A cancelled/partially failed cleanup may have changed the file system without a
+                // complete snapshot update, so force the next inventory request to re-scan.
+                lock (_scanLock)
+                {
+                    _lastScan = null;
+                    _lastScanAt = 0;
+                }
             }
         }
     }

@@ -310,6 +310,7 @@ public partial class App : Application
         // cleanup completes) the process is about to terminate, and a still-running abandoned
         // phase must never touch a disposed token.
         var services = _services;
+        var performanceMetrics = services?.GetService<IUiPerformanceMetrics>() as UiPerformanceMetrics;
         _services = null;
         var deadline = new CancellationTokenSource(ShutdownCleanupDeadline);
         var cleanup = RunShutdownCleanupAsync(services, deadline.Token);
@@ -329,6 +330,7 @@ public partial class App : Application
                 ShutdownCleanupSeconds, string.Join(", ", cleanup.Result.Abandoned), cleanup.Result.PhasesSummary);
         }
 
+        performanceMetrics?.Flush();
         Log.CloseAndFlush();
         base.OnExit(e);
     }

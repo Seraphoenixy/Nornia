@@ -42,7 +42,7 @@
 
     <DataTemplate x:Key="SettingsEditorTemplate">
       <StackPanel VerticalAlignment="Center">
-        <CheckBox Content="启用" IsChecked="{Binding BooleanValue}"
+        <CheckBox Style="{StaticResource {x:Type CheckBox}}" Content="启用" IsChecked="{Binding BooleanValue}"
                   Visibility="{Binding IsBoolean, Converter={StaticResource BooleanToVisibilityConverter}}"
                   AutomationProperties.Name="{Binding Title}" />
         <ComboBox ItemsSource="{Binding EnumOptions}" SelectedItem="{Binding SelectedEnum}"
@@ -181,7 +181,7 @@
              AutomationProperties.Name="设置结果">
       <ListBox.ItemsPanel><ItemsPanelTemplate><VirtualizingStackPanel /></ItemsPanelTemplate></ListBox.ItemsPanel>
       <ListBox.ItemContainerStyle>
-        <Style TargetType="ListBoxItem">
+        <Style TargetType="ListBoxItem" BasedOn="{StaticResource {x:Type ListBoxItem}}">
           <Setter Property="HorizontalContentAlignment" Value="Stretch" />
           <Setter Property="Padding" Value="0" />
           <Setter Property="Margin" Value="0,0,0,8" />

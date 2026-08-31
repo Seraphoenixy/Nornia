@@ -10,9 +10,10 @@ namespace Nornia.Core.Services;
 
 public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
 {
-    // Text fallback must inspect a complete byte prefix to decide UTF-8 vs GB18030, so it cannot
-    // stream-decode byte-by-byte. Keep that prefix explicitly bounded; an unterminated generated
-    // line must not turn a read-only diff into an unbounded allocation.
+    // Text fallback must inspect the retained byte stream to decide UTF-8 vs GB18030. Keep the
+    // retained prefix explicitly bounded; an unterminated generated line must not turn a read-only
+    // diff into an unbounded allocation. The prefix is spooled to disk instead of a large byte[] so
+    // a large diff does not create a transient 64 MB managed allocation.
     private const int MaximumTextFallbackCaptureBytes = 64 * 1024 * 1024;
     private readonly ConcurrentDictionary<int, Process> _activeProcesses = new();
 
@@ -290,9 +291,16 @@ public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
 
         // Retain exactly the first maximumLines complete stdout lines, capped in bytes as well.
         // Continue draining after either cap so the child never blocks on a full pipe.
-        async Task<byte[]> CaptureStdoutAsync()
+        async Task<string> CaptureStdoutAsync()
         {
-            var captured = new MemoryStream(64 * 1024);
+            var path = Path.Combine(Path.GetTempPath(), $"nornia-diff-{Guid.NewGuid():N}.tmp");
+            await using var captured = new FileStream(
+                path,
+                FileMode.CreateNew,
+                FileAccess.Write,
+                FileShare.Read,
+                bufferSize: 64 * 1024,
+                options: FileOptions.Asynchronous | FileOptions.SequentialScan);
             var chunk = new byte[64 * 1024];
             var newlines = 0;
             var capturing = true;
@@ -323,7 +331,7 @@ public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
 
                 if (retained > 0)
                 {
-                    captured.Write(chunk, 0, retained);
+                    await captured.WriteAsync(chunk.AsMemory(0, retained), cancellationToken).ConfigureAwait(false);
                 }
 
                 if (retained < read)
@@ -333,7 +341,8 @@ public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
                 }
             }
 
-            return captured.ToArray();
+            await captured.FlushAsync(cancellationToken).ConfigureAwait(false);
+            return path;
         }
 
         async Task PumpAsync(StreamReader reader, bool isError)
@@ -352,6 +361,7 @@ public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
         }
 
         var error = PumpAsync(process.StandardError, true);
+        string? stdoutPath = null;
         var completion = Task.Run(async () =>
         {
             try
@@ -361,12 +371,21 @@ public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
                 // 永远退不出,等待方也随之永久挂起(大 diff 视图空白即源于此)。
                 // CaptureStdoutAsync 在管道写端关闭(进程退出)时返回,其后 WaitForExitAsync
                 // 立即完成;取消经 ReadAsync 触发 catch 分支杀进程,语义与原先一致。
-                var stdoutBytes = await CaptureStdoutAsync().ConfigureAwait(false);
+                stdoutPath = await CaptureStdoutAsync().ConfigureAwait(false);
                 await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
                 await error.ConfigureAwait(false);
-                var (encoding, bomLength) = DecodeEncodingForCapturedText(stdoutBytes);
-                var stdout = new MemoryStream(stdoutBytes, bomLength, stdoutBytes.Length - bomLength, writable: false);
-                await PumpAsync(new StreamReader(stdout, encoding, detectEncodingFromByteOrderMarks: false, leaveOpen: false), false).ConfigureAwait(false);
+                await using (var stdout = new FileStream(
+                    stdoutPath,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.Read,
+                    bufferSize: 64 * 1024,
+                    options: FileOptions.Asynchronous | FileOptions.SequentialScan))
+                {
+                    var (encoding, bomLength) = await DetectEncodingForCapturedTextAsync(stdout, cancellationToken).ConfigureAwait(false);
+                    stdout.Position = bomLength;
+                    await PumpAsync(new StreamReader(stdout, encoding, detectEncodingFromByteOrderMarks: false, leaveOpen: true), false).ConfigureAwait(false);
+                }
                 await channel.Writer.WriteAsync(new ProcessStreamEvent(null, false, process.ExitCode, limitReached), CancellationToken.None).ConfigureAwait(false);
                 channel.Writer.TryComplete();
             }
@@ -374,6 +393,14 @@ public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
             {
                 StopProcess(process);
                 channel.Writer.TryComplete(exception);
+            }
+            finally
+            {
+                if (stdoutPath is not null)
+                {
+                    try { File.Delete(stdoutPath); } catch (IOException) { }
+                    catch (UnauthorizedAccessException) { }
+                }
             }
         }, CancellationToken.None);
 
@@ -389,19 +416,46 @@ public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
         }
     }
 
-    /// <summary>Chooses the decode encoding for a fully captured stdout payload: a UTF-8 BOM at
-    /// the start is authoritative and skipped (matching the previous StreamReader behavior);
-    /// clean strict UTF-8 decodes as-is; anything else — a legacy GBK/ANSI file — decodes as
-    /// GB18030. Returns the encoding and the number of leading BOM bytes to skip.</summary>
-    private static (Encoding Encoding, int BomLength) DecodeEncodingForCapturedText(byte[] bytes)
+    /// <summary>Chooses the decode encoding for the retained stdout spool. UTF-8 validation is
+    /// incremental so the complete retained payload never has to be copied into a managed array.</summary>
+    private static async Task<(Encoding Encoding, int BomLength)> DetectEncodingForCapturedTextAsync(
+        FileStream stream,
+        CancellationToken cancellationToken)
     {
-        var bomLength = TextEncodingDetector.Utf8BomLength(bytes);
+        var head = new byte[3];
+        var headLength = 0;
+        while (headLength < head.Length)
+        {
+            var read = await stream.ReadAsync(head.AsMemory(headLength), cancellationToken).ConfigureAwait(false);
+            if (read == 0) break;
+            headLength += read;
+        }
+
+        var bomLength = TextEncodingDetector.Utf8BomLength(head.AsSpan(0, headLength));
         if (bomLength > 0)
         {
+            stream.Position = 0;
             return (TextEncodingDetector.Utf8Replacement, bomLength);
         }
 
-        return (TextEncodingDetector.IsStrictUtf8(bytes) ? TextEncodingDetector.Utf8Strict : TextEncodingDetector.Gb18030, 0);
+        stream.Position = 0;
+        var strict = true;
+        var pending = Array.Empty<byte>();
+        var buffer = new byte[64 * 1024];
+        while (strict)
+        {
+            var read = await stream.ReadAsync(buffer.AsMemory(), cancellationToken).ConfigureAwait(false);
+            if (read == 0) break;
+            strict = TextEncodingDetector.IsStrictUtf8Chunk(buffer.AsSpan(0, read), pending, out pending);
+        }
+
+        if (strict && pending.Length > 0)
+        {
+            strict = false;
+        }
+
+        stream.Position = 0;
+        return (strict ? TextEncodingDetector.Utf8Strict : TextEncodingDetector.Gb18030, 0);
     }
 
     private static void StopProcess(Process process)

@@ -635,7 +635,7 @@ public sealed class GitServiceTests
             $"'{subCommand}' is a write command and must not set GIT_OPTIONAL_LOCKS");
     }
 
-    // ===== G5: per-repository serialization gate =====
+    // ===== G5: per-repository read pool / exclusive write gate =====
 
     /// <summary>Runner that blocks every invocation until released and records the maximum
     /// number of concurrently in-flight git processes — both per repository and in total.</summary>
@@ -645,10 +645,12 @@ public sealed class GitServiceTests
         private int _maxPerRepository;
         private int _totalInFlight;
         private int _maxTotalInFlight;
+        private int _invocationCount;
         private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public int MaxConcurrent => Volatile.Read(ref _maxPerRepository);
         public int MaxTotalInFlight => Volatile.Read(ref _maxTotalInFlight);
+        public int InvocationCount => Volatile.Read(ref _invocationCount);
         public void Release() => _release.TrySetResult();
 
         public Task<ProcessResult> RunAsync(
@@ -660,6 +662,7 @@ public sealed class GitServiceTests
             int? maximumOutputBytes = null)
         {
             var repo = arguments[1]; // -C <path>
+            Interlocked.Increment(ref _invocationCount);
             var perRepo = _perRepository.AddOrUpdate(repo, 1, (_, v) => v + 1);
             RaiseMax(ref _maxPerRepository, perRepo);
             RaiseMax(ref _maxTotalInFlight, Interlocked.Increment(ref _totalInFlight));
@@ -701,7 +704,7 @@ public sealed class GitServiceTests
     }
 
     [Fact]
-    public async Task ConcurrentCommandsForSameRepository_NeverOverlap()
+    public async Task ConcurrentReadCommandsForSameRepository_AreBoundedAndOverlap()
     {
         var runner = new GatingProcessRunner();
         var service = new GitService(runner);
@@ -710,13 +713,35 @@ public sealed class GitServiceTests
         var second = service.GetStatusAsync(@"C:\repo");
         var third = service.GetStatusAsync(@"C:\repo");
 
-        await Task.Delay(50); // let the first acquire the gate and park, the rest queue behind it
+        await Task.Delay(50); // all three readers should acquire the bounded read pool and park
         runner.Release();
 
         var results = await Task.WhenAll(first, second, third);
 
-        Assert.True(runner.MaxConcurrent == 1, $"expected 1 concurrent git process per repository, saw {runner.MaxConcurrent}");
+        Assert.True(runner.MaxConcurrent == 3, $"expected all three readers to overlap within the pool, saw {runner.MaxConcurrent}");
         Assert.All(results, r => Assert.True(r.IsRepository));
+    }
+
+    [Fact]
+    public async Task WriteForSameRepository_WaitsForReaders()
+    {
+        var runner = new GatingProcessRunner();
+        var service = new GitService(runner);
+
+        var reads = new[]
+        {
+            service.GetStatusAsync(@"C:\repo"),
+            service.GetStatusAsync(@"C:\repo"),
+            service.GetStatusAsync(@"C:\repo"),
+        };
+        await Task.Delay(50);
+        var write = service.StageAsync(@"C:\repo", ["file.txt"]);
+        await Task.Delay(50);
+
+        Assert.Equal(3, runner.InvocationCount);
+        runner.Release();
+        await Task.WhenAll(reads.Append(write));
+        Assert.Equal(4, runner.InvocationCount);
     }
 
     [Fact]

@@ -58,7 +58,7 @@
             </Button.Style>
           </Button>
           <Button Content="{StaticResource CodiconUnfold}" FontFamily="{StaticResource IconFontFamily}" Padding="6,0" Margin="0"
-                  Command="{Binding ToggleContextCollapseCommand}" ToolTip="折叠 / 展开未更改上下文" AutomationProperties.Name="折叠未更改上下文">
+                  Command="{Binding ToggleContextCollapseCommand}" ToolTip="{Binding ContextCollapseToolTip}" AutomationProperties.Name="{Binding ContextCollapseToolTip}">
             <Button.Style>
               <Style TargetType="Button" BasedOn="{StaticResource IconButton}">
                 <Style.Triggers>

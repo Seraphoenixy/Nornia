@@ -16,15 +16,19 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
 {
     private const string GitExecutable = "git";
 
+    // The diff viewer folds unchanged runs down to a small visible window. Git must therefore
+    // return more than its default three context lines; otherwise the projection has nothing
+    // foldable to work with. Keep this value in sync for display and hunk-application reads so
+    // the hunk header/counts passed back by the viewer identify the same patch.
+    private const int DiffReviewContextLines = 20;
+
     /// <summary>NUL-byte probe window for classifying an untracked worktree file as binary — the
     /// same head size the read-only preview decoder uses (BOM-less files with a NUL in the head
     /// are binary; UTF-16/32 text is caught by its NULs before any BOM logic applies).</summary>
     private const int BinaryProbeLength = 4096;
 
-    /// <summary>Upper bound for a single <c>git status</c> stdout capture. <c>--untracked-files=all</c>
-    /// has no entry limit, so a repository with tens of thousands of untracked files can emit tens
-    /// of MB; the cap bounds memory and the truncation flag lets the caller degrade instead of
-    /// buffering unbounded output.</summary>
+    /// <summary>Upper bound for a single <c>git status</c> stdout capture. The cap bounds memory and
+    /// the truncation flag lets the caller degrade instead of buffering unbounded output.</summary>
     internal const int StatusMaximumOutputBytes = 32 * 1024 * 1024;
 
     /// <summary>Entry cap for one status parse (VS Code's statusLimit). Beyond it
@@ -37,21 +41,23 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
     internal static readonly IReadOnlyDictionary<string, string> OptionalLocksDisabled =
         new Dictionary<string, string>(StringComparer.Ordinal) { ["GIT_OPTIONAL_LOCKS"] = "0" };
 
-    // Per-repository serialization gate (1 concurrent git process per repository path). User write
-    // operations and silent watcher-driven status refreshes must never overlap: concurrent
-    // processes can hit .git\index.lock or read a half-updated index. The gate serializes every
-    // command issued for the same repository, so the two classes of operations are mutually
-    // exclusive by construction (a deferred silent refresh simply queues behind the write).
-    private readonly ConcurrentDictionary<string, SemaphoreSlim> _repositoryGates = new(StringComparer.OrdinalIgnoreCase);
+    // Read-only Git commands use a small shared pool per repository. Writes remain exclusive and
+    // wait for every read to finish, so the safety invariant is preserved without making the full
+    // Git page pay the sum of status + branch + log + stash command durations.
+    private readonly ConcurrentDictionary<string, RepositoryExecutionGate> _repositoryGates = new(StringComparer.OrdinalIgnoreCase);
 
-    private SemaphoreSlim RepositoryGate(string repositoryPath) =>
-        _repositoryGates.GetOrAdd(Path.GetFullPath(repositoryPath), _ => new SemaphoreSlim(1, 1));
+    private RepositoryExecutionGate RepositoryGate(string repositoryPath) =>
+        _repositoryGates.GetOrAdd(Path.GetFullPath(repositoryPath), _ => new RepositoryExecutionGate());
 
-    public async Task<GitRepositoryStatus> GetStatusAsync(string repositoryPath, CancellationToken cancellationToken = default)
+    public async Task<GitRepositoryStatus> GetStatusAsync(
+        string repositoryPath,
+        CancellationToken cancellationToken = default,
+        bool includeAllUntracked = true)
     {
+        var untrackedMode = includeAllUntracked ? "all" : "normal";
         var result = await RunGitAsync(
             repositoryPath,
-            ["status", "--porcelain=v2", "--branch", "-z", "--untracked-files=all"],
+            ["status", "--porcelain=v2", "--branch", "-z", $"--untracked-files={untrackedMode}"],
             cancellationToken,
             allowFailure: true,
             readOnly: true,
@@ -193,7 +199,7 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
         if (staged) arguments.Add("--cached");
         arguments.Add("--no-ext-diff");
         if (ignoreWhitespaceEndOfLine) arguments.Add("--ignore-space-at-eol");
-        arguments.Add("--unified=3");
+        arguments.Add($"--unified={DiffReviewContextLines}");
         arguments.Add("--");
         arguments.Add(path);
         var parser = new GitDiffStreamParser(path, staged);
@@ -201,9 +207,7 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
         var error = new StringBuilder();
         // `git diff` reads the index, so it must not overlap another command's write pass for the
         // same repository (same per-repository gate as RunGitAsync).
-        var gate = RepositoryGate(repositoryPath);
-        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
+        using (await RepositoryGate(repositoryPath).EnterAsync(readOnly: true, cancellationToken).ConfigureAwait(false))
         {
             // Diff content lines carry the file's raw bytes; a legacy GBK/ANSI file garbles under
             // the fixed UTF-8 decode, so this goes through the strict-UTF-8→GB18030 fallback.
@@ -217,10 +221,6 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
                 }
                 foreach (var parsed in parser.Accept(item.Text ?? string.Empty)) yield return parsed;
             }
-        }
-        finally
-        {
-            gate.Release();
         }
 
         yield return parser.Metadata;
@@ -276,7 +276,7 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
             arguments.Add("--cached");
         }
 
-        arguments.AddRange(["--no-ext-diff", "--unified=3"]);
+        arguments.AddRange(["--no-ext-diff", $"--unified={DiffReviewContextLines}"]);
         if (paths is { Count: > 0 })
         {
             arguments.Add("--");
@@ -302,7 +302,7 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
             arguments.Add("--cached");
         }
 
-        arguments.AddRange(["--no-ext-diff", "--unified=3"]);
+        arguments.AddRange(["--no-ext-diff", $"--unified={DiffReviewContextLines}"]);
         if (paths is { Count: > 0 })
         {
             arguments.Add("--");
@@ -1148,19 +1148,17 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
         var whitespaceArgument = ignoreWhitespaceEndOfLine ? "--ignore-space-at-eol" : null;
         string[] diffArguments;
         if (commitHash.Contains("...")) diffArguments = whitespaceArgument is null
-            ? ["diff", "--no-ext-diff", "--unified=3", commitHash, "--", path]
-            : ["diff", "--no-ext-diff", "--ignore-space-at-eol", "--unified=3", commitHash, "--", path];
+            ? ["diff", "--no-ext-diff", $"--unified={DiffReviewContextLines}", commitHash, "--", path]
+            : ["diff", "--no-ext-diff", "--ignore-space-at-eol", $"--unified={DiffReviewContextLines}", commitHash, "--", path];
         else diffArguments = whitespaceArgument is null
-            ? ["show", "--no-ext-diff", "--unified=3", "--format=", commitHash, "--", path]
-            : ["show", "--no-ext-diff", "--ignore-space-at-eol", "--unified=3", "--format=", commitHash, "--", path];
+            ? ["show", "--no-ext-diff", $"--unified={DiffReviewContextLines}", "--format=", commitHash, "--", path]
+            : ["show", "--no-ext-diff", "--ignore-space-at-eol", $"--unified={DiffReviewContextLines}", "--format=", commitHash, "--", path];
         var arguments = new List<string> { "-C", repositoryPath };
         arguments.AddRange(diffArguments);
         var parser = new GitDiffStreamParser(path, false);
         ProcessStreamEvent? completion = null;
         var error = new StringBuilder();
-        var gate = RepositoryGate(repositoryPath);
-        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
+        using (await RepositoryGate(repositoryPath).EnterAsync(readOnly: true, cancellationToken).ConfigureAwait(false))
         {
             // Same legacy-encoding fallback as StreamDiffAsync: diff content lines carry the
             // file's raw bytes and must not be fixed-decoded as UTF-8.
@@ -1170,10 +1168,6 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
                 if (item.IsError) { if (error.Length < 4096) error.AppendLine(item.Text); continue; }
                 foreach (var parsed in parser.Accept(item.Text ?? string.Empty)) yield return parsed;
             }
-        }
-        finally
-        {
-            gate.Release();
         }
         yield return parser.Metadata;
         yield return new GitDiffCompletedEvent(completion?.ExitCode ?? -1, completion?.OutputLimitReached == true, error.Length == 0 ? null : error.ToString());
@@ -1334,9 +1328,7 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
         var args = new List<string>(arguments.Count + 2) { "-C", repositoryPath };
         args.AddRange(arguments);
 
-        var gate = RepositoryGate(repositoryPath);
-        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
+        using (await RepositoryGate(repositoryPath).EnterAsync(readOnly, cancellationToken).ConfigureAwait(false))
         {
             var result = await processRunner.RunAsync(
                 GitExecutable,
@@ -1350,10 +1342,6 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
             }
 
             return result;
-        }
-        finally
-        {
-            gate.Release();
         }
     }
 
@@ -1370,9 +1358,7 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
         var args = new List<string>(arguments.Count + 2) { "-C", repositoryPath };
         args.AddRange(arguments);
 
-        var gate = RepositoryGate(repositoryPath);
-        await gate.WaitAsync(cancellationToken).ConfigureAwait(false);
-        try
+        using (await RepositoryGate(repositoryPath).EnterAsync(readOnly, cancellationToken).ConfigureAwait(false))
         {
             var result = await processRunner.RunRawAsync(
                 GitExecutable,
@@ -1386,9 +1372,56 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
 
             return result;
         }
-        finally
+    }
+}
+
+/// <summary>Async reader/writer gate for one repository. Up to four read-only Git processes may
+/// overlap; a writer closes the turnstile first, then acquires all read slots, preventing both
+/// overlap with existing readers and starvation by newly arriving readers.</summary>
+internal sealed class RepositoryExecutionGate
+{
+    private const int ReadSlots = 4;
+    private readonly SemaphoreSlim _turnstile = new(1, 1);
+    private readonly SemaphoreSlim _slots = new(ReadSlots, ReadSlots);
+
+    public async ValueTask<IDisposable> EnterAsync(bool readOnly, CancellationToken cancellationToken)
+    {
+        if (readOnly)
         {
-            gate.Release();
+            await _turnstile.WaitAsync(cancellationToken).ConfigureAwait(false);
+            _turnstile.Release();
+            await _slots.WaitAsync(cancellationToken).ConfigureAwait(false);
+            return new Lease(_slots, 1, null);
+        }
+
+        await _turnstile.WaitAsync(cancellationToken).ConfigureAwait(false);
+        var acquired = 0;
+        try
+        {
+            for (; acquired < ReadSlots; acquired++)
+            {
+                await _slots.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            return new Lease(_slots, acquired, _turnstile);
+        }
+        catch
+        {
+            while (acquired-- > 0) _slots.Release();
+            _turnstile.Release();
+            throw;
+        }
+    }
+
+    private sealed class Lease(SemaphoreSlim slots, int slotCount, SemaphoreSlim? turnstile) : IDisposable
+    {
+        private int _released;
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref _released, 1) != 0) return;
+            for (var i = 0; i < slotCount; i++) slots.Release();
+            turnstile?.Release();
         }
     }
 }

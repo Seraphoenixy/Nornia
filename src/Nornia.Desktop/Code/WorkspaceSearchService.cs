@@ -103,76 +103,149 @@ public sealed class WorkspaceSearchService(ISettingsService settings, IUiLogServ
             : null;
         var comparison = query.Options.CaseSensitive ? StringComparison.Ordinal : StringComparison.OrdinalIgnoreCase;
 
-        // Phase 1 — enumerate candidate files (metadata only: no file contents are read here).
-        var candidates = new List<(string FullPath, string RelativePath)>();
-        EnumerateCandidates(root, query, filter, candidates, logService, cancellationToken);
-
-        // Phase 2 — bounded parallel scan, streamed through a bounded channel (arrival order,
-        // same asyncDataTree streaming model as VS Code; the UI builds the tree as files arrive).
+        // Phase 1 + 2 — enumerate metadata and scan file contents through a bounded pipeline. The
+        // previous implementation materialized every candidate before opening the first file; a
+        // large workspace therefore consumed a second full list and delayed the first result. The
+        // candidate channel keeps producer memory bounded while workers scan as soon as entries are
+        // discovered.
         var scanned = 0;
         var matchedFiles = 0;
         var matchedLines = 0;
         var truncated = 0; // 0/1, Volatile
+        using var scanLifetime = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var scanToken = scanLifetime.Token;
+        var candidates = Channel.CreateBounded<(string FullPath, string RelativePath)>(new BoundedChannelOptions(1024)
+        {
+            FullMode = BoundedChannelFullMode.Wait,
+            SingleReader = false,
+            SingleWriter = true,
+        });
         var channel = Channel.CreateBounded<WorkspaceSearchFileResult>(new BoundedChannelOptions(ResultChannelCapacity)
         {
             FullMode = BoundedChannelFullMode.Wait,
             SingleReader = true,
             SingleWriter = false,
         });
+
+        var producer = Task.Run(async () =>
+        {
+            try
+            {
+                foreach (var candidate in EnumerateCandidatePaths(root, query, filter, logService, scanToken))
+                {
+                    await candidates.Writer.WriteAsync(candidate, scanToken).ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException) when (scanToken.IsCancellationRequested)
+            {
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException)
+            {
+                logService?.Write("DEBUG", $"工作区搜索枚举提前结束：{ex.Message}");
+            }
+            finally
+            {
+                candidates.Writer.TryComplete();
+            }
+        }, CancellationToken.None);
+
+        async Task ScanCandidateAsync((string FullPath, string RelativePath) candidate)
+        {
+            if (Volatile.Read(ref truncated) == 1 || scanToken.IsCancellationRequested)
+            {
+                return;
+            }
+
+            var currentScanned = Interlocked.Increment(ref scanned);
+            var matches = await SearchFileAsync(candidate.FullPath, query, regex, comparison, scanToken)
+                .ConfigureAwait(false);
+            if (matches.Count == 0)
+            {
+                if ((currentScanned & 255) == 0)
+                {
+                    progress?.Report(new(currentScanned, Volatile.Read(ref matchedFiles),
+                        Volatile.Read(ref matchedLines), Volatile.Read(ref truncated) == 1));
+                }
+                return;
+            }
+
+            var fileSlot = Interlocked.Increment(ref matchedFiles);
+            if (fileSlot > MaximumMatchedFiles)
+            {
+                Volatile.Write(ref truncated, 1);
+                scanLifetime.Cancel();
+                return;
+            }
+
+            // Reserve the global match budget atomically. Parallel workers can otherwise all see
+            // the same remaining room and overshoot the advertised result cap.
+            var acceptedCount = 0;
+            var total = 0;
+            while (acceptedCount == 0)
+            {
+                var before = Volatile.Read(ref matchedLines);
+                var room = MaximumMatches - before;
+                if (room <= 0)
+                {
+                    Volatile.Write(ref truncated, 1);
+                    scanLifetime.Cancel();
+                    return;
+                }
+
+                acceptedCount = Math.Min(matches.Count, room);
+                if (Interlocked.CompareExchange(ref matchedLines, before + acceptedCount, before) == before)
+                {
+                    total = before + acceptedCount;
+                    break;
+                }
+            }
+
+            if (acceptedCount < matches.Count)
+            {
+                matches = matches.Take(acceptedCount).ToArray();
+            }
+
+            if (fileSlot >= MaximumMatchedFiles || total >= MaximumMatches)
+            {
+                Volatile.Write(ref truncated, 1);
+            }
+
+            await channel.Writer.WriteAsync(
+                new WorkspaceSearchFileResult(candidate.FullPath, candidate.RelativePath, matches), scanToken)
+                .ConfigureAwait(false);
+
+            if (Volatile.Read(ref truncated) == 1)
+            {
+                scanLifetime.Cancel();
+            }
+        }
+
+        async Task WorkerAsync()
+        {
+            try
+            {
+                await foreach (var candidate in candidates.Reader.ReadAllAsync(scanToken).ConfigureAwait(false))
+                {
+                    await ScanCandidateAsync(candidate).ConfigureAwait(false);
+                }
+            }
+            catch (OperationCanceledException) when (scanToken.IsCancellationRequested)
+            {
+            }
+        }
+
+        var workerCount = Math.Min(8, Math.Max(1, Environment.ProcessorCount));
+        var workers = Enumerable.Range(0, workerCount).Select(_ => WorkerAsync()).ToArray();
         var scanTask = Task.Run(async () =>
         {
             try
             {
-                await Parallel.ForEachAsync(candidates, new ParallelOptions
-                {
-                    MaxDegreeOfParallelism = Environment.ProcessorCount,
-                    CancellationToken = cancellationToken,
-                }, async (candidate, loopToken) =>
-                {
-                    if (Volatile.Read(ref truncated) == 1) return;
-                    Interlocked.Increment(ref scanned);
-
-                    var matches = await SearchFileAsync(candidate.FullPath, query, regex, comparison, loopToken)
-                        .ConfigureAwait(false);
-                    if (matches.Count == 0)
-                    {
-                        if ((Volatile.Read(ref scanned) & 255) == 0)
-                        {
-                            progress?.Report(new(Volatile.Read(ref scanned), Volatile.Read(ref matchedFiles),
-                                Volatile.Read(ref matchedLines), Volatile.Read(ref truncated) == 1));
-                        }
-
-                        return;
-                    }
-
-                    var fileSlot = Interlocked.Increment(ref matchedFiles);
-                    if (fileSlot > MaximumMatchedFiles)
-                    {
-                        Volatile.Write(ref truncated, 1);
-                        return;
-                    }
-
-                    var room = MaximumMatches - Volatile.Read(ref matchedLines);
-                    if (room <= 0)
-                    {
-                        Volatile.Write(ref truncated, 1);
-                        return;
-                    }
-
-                    if (matches.Count > room) matches = matches.Take(room).ToArray();
-                    var total = Interlocked.Add(ref matchedLines, matches.Count);
-                    if (fileSlot >= MaximumMatchedFiles || total >= MaximumMatches) Volatile.Write(ref truncated, 1);
-                    await channel.Writer.WriteAsync(
-                        new WorkspaceSearchFileResult(candidate.FullPath, candidate.RelativePath, matches), loopToken)
-                        .ConfigureAwait(false);
-                });
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-            {
-                // Cancellation propagates through the reader below; the scan itself just unwinds.
+                await producer.ConfigureAwait(false);
+                await Task.WhenAll(workers).ConfigureAwait(false);
             }
             finally
             {
+                candidates.Writer.TryComplete();
                 channel.Writer.TryComplete();
             }
         }, CancellationToken.None);
@@ -186,6 +259,7 @@ public sealed class WorkspaceSearchService(ISettingsService settings, IUiLogServ
         }
         finally
         {
+            scanLifetime.Cancel();
             try
             {
                 // Wait for the scan to settle so no worker keeps touching the caller's workspace
@@ -227,6 +301,19 @@ public sealed class WorkspaceSearchService(ISettingsService settings, IUiLogServ
         IUiLogService? logService,
         CancellationToken cancellationToken)
     {
+        foreach (var candidate in EnumerateCandidatePaths(root, query, filter, logService, cancellationToken))
+        {
+            candidates.Add(candidate);
+        }
+    }
+
+    private static IEnumerable<(string FullPath, string RelativePath)> EnumerateCandidatePaths(
+        string root,
+        WorkspaceSearchQuery query,
+        SearchPathFilter filter,
+        IUiLogService? logService,
+        CancellationToken cancellationToken)
+    {
         var stack = new Stack<(string FullPath, string RelativePath, GitIgnoreScope Scope)>();
         stack.Push((root, string.Empty, GitIgnoreScope.Empty));
         while (stack.Count > 0)
@@ -237,43 +324,47 @@ public sealed class WorkspaceSearchService(ISettingsService settings, IUiLogServ
                 ? GitIgnoreRule.LoadForDirectory(current, relativeDirectory, inheritedScope, logService)
                 : GitIgnoreScope.Empty;
 
-            try
+            // IgnoreInaccessible keeps the walk alive across ACL boundaries. A directory can still
+            // disappear between enumeration and attribute lookup; that race is handled per entry
+            // below and the producer also converts an enumeration-level IO error into partial
+            // results instead of failing the UI search.
+            foreach (var path in new FileSystemEnumerable<string>(
+                         current,
+                         static (ref FileSystemEntry entry) => entry.ToFullPath(),
+                         SingleDirectoryOptions))
             {
-                // FileSystemEntry 是 ref struct,不能作泛型实参:变换为完整路径字符串,
-                // 目录判定按属性位查询。
-                foreach (var path in new FileSystemEnumerable<string>(
-                             current,
-                             static (ref FileSystemEntry entry) => entry.ToFullPath(),
-                             SingleDirectoryOptions))
+                bool isDirectory;
+                try
                 {
-                    var isDirectory = (File.GetAttributes(path) & FileAttributes.Directory) != 0;
-                    if (isDirectory)
-                    {
-                        var relative = Relative(root, path);
-                        if (IgnoredDirectoryNames.Contains(Path.GetFileName(path)) || filter.IsExcluded(relative, true) ||
-                            GitIgnoreRule.IsIgnored(relative, true, rules))
-                        {
-                            continue;
-                        }
-
-                        stack.Push((path, relative, rules));
-                    }
-                    else
-                    {
-                        cancellationToken.ThrowIfCancellationRequested();
-                        var relative = Relative(root, path);
-                        if (filter.IsExcluded(relative, false) || GitIgnoreRule.IsIgnored(relative, false, rules))
-                        {
-                            continue;
-                        }
-
-                        candidates.Add((path, relative));
-                    }
+                    isDirectory = (File.GetAttributes(path) & FileAttributes.Directory) != 0;
                 }
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException)
-            {
-                continue; // an unreadable directory is skipped; the walk continues elsewhere
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException)
+                {
+                    continue;
+                }
+
+                if (isDirectory)
+                {
+                    var relative = Relative(root, path);
+                    if (IgnoredDirectoryNames.Contains(Path.GetFileName(path)) || filter.IsExcluded(relative, true) ||
+                        GitIgnoreRule.IsIgnored(relative, true, rules))
+                    {
+                        continue;
+                    }
+
+                    stack.Push((path, relative, rules));
+                }
+                else
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    var relative = Relative(root, path);
+                    if (filter.IsExcluded(relative, false) || GitIgnoreRule.IsIgnored(relative, false, rules))
+                    {
+                        continue;
+                    }
+
+                    yield return (path, relative);
+                }
             }
         }
     }

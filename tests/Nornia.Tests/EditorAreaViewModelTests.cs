@@ -616,12 +616,12 @@ public sealed class EditorAreaViewModelTests : IDisposable
         await editor.OpenDiffAsync(new GitDiffRequest(@"C:\repo", "src/A.cs", false, false));
 
         var diff = Assert.IsType<DiffTab>(editor.OpenTabs.First(tab => tab is DiffTab));
-        Assert.True(diff.IsInlineDiff);
+        Assert.True(diff.IsSideBySideDiff);
 
         editor.ToggleActiveDiffModeCommand.Execute(null);
 
-        Assert.True(diff.IsSideBySideDiff);
-        Assert.False(diff.IsInlineDiff);
+        Assert.True(diff.IsInlineDiff);
+        Assert.False(diff.IsSideBySideDiff);
     }
 
     // ===== Editor copy commands (复制选中 / 复制全部 diff, 复制标签路径) =====

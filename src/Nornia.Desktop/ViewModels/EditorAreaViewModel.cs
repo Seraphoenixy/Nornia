@@ -176,7 +176,12 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
         _outlineParser = outlineParser;
         _searchService = searchService;
         _projectLauncher = projectLauncher;
-        _uiContext = SynchronizationContext.Current;
+        // Only a WPF dispatcher context owns UI-bound collections. Test frameworks also install
+        // custom SynchronizationContexts; capturing one of those makes background settings
+        // notifications depend on the runner's scheduling/pump and can stall under CI load.
+        _uiContext = SynchronizationContext.Current is System.Windows.Threading.DispatcherSynchronizationContext
+            ? SynchronizationContext.Current
+            : null;
         _fileContentWatcher = fileContentWatcher ?? NullFileContentWatcher.Instance;
         _repositoryWatcher = repositoryWatcher ?? NullGitRepositoryWatcher.Instance;
         _fileContentWatcher.FileChanged += OnFileChanged;
@@ -601,6 +606,7 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
             EditorFontSize = options.FontSize > 0 ? options.FontSize : 14,
             FontFamily = options.FontFamily,
             DiffMode = diffOptions.DefaultLayout == DiffLayoutMode.SideBySide ? GitDiffMode.SideBySide : GitDiffMode.Inline,
+            IsLayoutManuallySelected = false,
             IsContextCollapsed = diffOptions.CollapseUnchangedContext,
             ShowIntralineChanges = diffOptions.ShowIntralineChanges,
             ShowOverviewRuler = diffOptions.ShowOverviewRuler,
@@ -824,6 +830,7 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
     {
         if (SelectedTab is DiffTab diff)
         {
+            diff.IsLayoutManuallySelected = true;
             diff.DiffMode = diff.DiffMode == GitDiffMode.Inline ? GitDiffMode.SideBySide : GitDiffMode.Inline;
         }
     }
@@ -3387,8 +3394,8 @@ public sealed partial class DiffTab : EditorTabItem
     [RelayCommand]
     private void OpenInCode() => OpenInCodeRequested?.Invoke(this, EventArgs.Empty);
 
-    public ObservableCollection<GitDiffLine> DiffLines { get; } = [];
-    public ObservableCollection<GitSideBySideRow> SideBySideRows { get; } = [];
+    public BulkObservableCollection<GitDiffLine> DiffLines { get; } = [];
+    public BulkObservableCollection<GitSideBySideRow> SideBySideRows { get; } = [];
 
     /// <summary>Hunks represented by the current Diff snapshot. This is kept beside the flattened
     /// display collections so hunk actions never infer identity from visual rows.</summary>
@@ -3410,7 +3417,7 @@ public sealed partial class DiffTab : EditorTabItem
     private ReadOnlyContentTier capacityTier = ReadOnlyContentTier.Full;
 
     [ObservableProperty]
-    private GitDiffMode diffMode = GitDiffMode.Inline;
+    private GitDiffMode diffMode = GitDiffMode.SideBySide;
 
     /// <summary>Collapses long unchanged runs into a review-friendly projection. Raw Git lines
     /// remain untouched for copying, statistics and source-line authority.</summary>
@@ -3518,17 +3525,8 @@ public sealed partial class DiffTab : EditorTabItem
             if (_loadFailed && !_disposed)
             {
                 var refreshNotice = DiffNotice;
-                DiffLines.Clear();
-                foreach (var line in previousLines)
-                {
-                    DiffLines.Add(line);
-                }
-
-                SideBySideRows.Clear();
-                foreach (var row in previousRows)
-                {
-                    SideBySideRows.Add(row);
-                }
+                DiffLines.ReplaceRange(previousLines);
+                SideBySideRows.ReplaceRange(previousRows);
 
                 Hunks = previousHunks;
                 _diffRevision = previousRevision;
@@ -3676,6 +3674,13 @@ public sealed partial class DiffTab : EditorTabItem
 
     private bool CanNavigateChanges() => _changeCount > 0;
 
+    public bool IsLayoutManuallySelected { get; set; }
+
+    public bool ShouldAutoUseInlineForWidth(double availableWidth) =>
+        UseInlineWhenNarrow && !IsLayoutManuallySelected && availableWidth < NarrowInlineWidth;
+
+    public const double NarrowInlineWidth = 700;
+
     public bool CanApplyHunk(int hunkIndex, GitHunkOperation operation)
     {
         if (_request.CommitHash is not null
@@ -3759,8 +3764,16 @@ public sealed partial class DiffTab : EditorTabItem
     }
 
     [RelayCommand]
-    private void ToggleDiffMode() =>
+    private void ToggleDiffMode()
+    {
+        IsLayoutManuallySelected = true;
         DiffMode = DiffMode == GitDiffMode.Inline ? GitDiffMode.SideBySide : GitDiffMode.Inline;
+    }
+
+    public string ContextCollapseToolTip => IsContextCollapsed ? "显示未更改上下文" : "隐藏未更改上下文";
+
+    partial void OnIsContextCollapsedChanged(bool value) =>
+        OnPropertyChanged(nameof(ContextCollapseToolTip));
 
     [RelayCommand]
     private void ToggleContextCollapse() => IsContextCollapsed = !IsContextCollapsed;
@@ -4126,7 +4139,7 @@ public sealed partial class DiffTab : EditorTabItem
             }
         }
 
-        var rows = new List<GitSideBySideRow>();
+        var rows = new List<GitSideBySideRow>(Math.Min(sourceLineCount, MaxDiffLines));
         foreach (var row in diff.ToSideBySideRows())
         {
             if (rows.Count >= MaxDiffLines)
@@ -4175,15 +4188,10 @@ public sealed partial class DiffTab : EditorTabItem
         OnPropertyChanged(nameof(Hunks));
         CapacityTier = built.CapacityTier;
 
-        foreach (var line in built.Lines)
-        {
-            DiffLines.Add(line);
-        }
-
-        foreach (var row in built.Rows)
-        {
-            SideBySideRows.Add(row);
-        }
+        // One Reset per projection prevents AvalonEdit/list bindings from laying out once per
+        // diff line. The snapshot is already fully built off the UI thread.
+        DiffLines.ReplaceRange(built.Lines);
+        SideBySideRows.ReplaceRange(built.Rows);
 
         _addedCount = built.AddedCount;
         _removedCount = built.RemovedCount;

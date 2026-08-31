@@ -578,10 +578,10 @@ Dashboard 同时承担任务中心职责：根据持久化的项目健康状态�
 
 ### 16.5 Diff 标签（DiffDocumentView）
 
-- 内联 / 并排双模式（含同步滚动、行号边距、行尾缩略、字符级 intraline、可点击 overviewRuler、hunk 导航 Alt+F5、上下文折叠展开条）；模式默认值 `diffEditor.renderSideBySide` 设置持久化（会话级）。
-- **窄窗自动内联**：`diffEditor.useInlineViewWhenSpaceIsLimited`（默认开）——窗口 < 540px 时即使请求并排也以内联显示（仅显示层，不改 DiffMode）。
+- 内联 / 并排双模式（含同步滚动、行号边距、行尾缩略、字符级 intraline、可点击 overviewRuler、hunk 导航 Alt+F5、上下文折叠展开条）；模式默认值 `diffEditor.renderSideBySide` 为并排并持久化（会话级）。
+- **窄窗自动内联**：`diffEditor.useInlineViewWhenSpaceIsLimited`（默认开）——窗口 < 700px 时即使请求并排也以内联显示（仅显示层，不改 DiffMode）。
 - **@@ hunk 头吸顶**：内联模式滚动经过 hunk 头后将其钉在顶部，点击跳转（`UpdateDiffSticky`）。
-- **改行 modified 着色**：并排构建时对"old=Removed ∧ new=Added"的同行对标记 `IsModified`，用 `DiffModifiedBrush` 整行渲染（三主题同步，`DesignSystemResourceTests` 守卫）。行号右侧原有的变更加粗实线（3px，`EditorGutterAddedBrush`/`EditorGutterDeletedBrush`/`DiffModifiedBarBrush`）已按需求移除，变更识别由整行着色 + 行号区 ± 符号列承担（对应令牌保留在主题中，仍受守卫）。
+- **改行 modified 着色**：并排构建时对"old=Removed ∧ new=Added"的同行对标记 `IsModified`，但两侧仍分别以 Removed 红色 / Added 绿色整行渲染（`DiffModifiedBrush` 仅作无具体侧类型时的回退，三主题同步，`DesignSystemResourceTests` 守卫）。行号右侧原有的变更加粗实线（3px，`EditorGutterAddedBrush`/`EditorGutterDeletedBrush`/`DiffModifiedBarBrush`）已按需求移除，变更识别由整行着色 + 行号区 ± 符号列承担（对应令牌保留在主题中，仍受守卫）。
 - diff 右击菜单：复制 / 全选 / 复制全部（统一 Diff）/ 在代码标签页打开文件（`DiffTab.OpenInCodeRequested` → `OpenFileAsync`）；状态条含光标 Ln/Col（聚焦面驱动）。
 - **忽略行尾空白**：diffEditor.ignoreTrimWhitespace 设置 + 工具栏切换（DiffTab.ToggleIgnoreWhitespaceCommand），真实按 --ignore-space-at-eol 重算（IGitService/GitService 流式方法均支持，测试桩默认实现忽略该标记）。
 - **Diff 内查找**：顶部查找栏（IsFindBarOpen 切换）对统一文本搜索（忽略大小写），全部匹配高亮 + 当前行强调（DiffFindRenderer），Enter/F3 下一条、Shift+F3 上一条、Esc 关闭；并排模式下同步滚动两侧到对应旧/新行号。

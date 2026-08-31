@@ -7,10 +7,11 @@ namespace Nornia.Desktop.Services;
 /// a rename is reported for both the old and the new name) during one debounced window.</summary>
 public sealed class WorkspaceFilesChangedEventArgs : EventArgs
 {
-    public WorkspaceFilesChangedEventArgs(string rootPath, IReadOnlySet<string> changedPaths)
+    public WorkspaceFilesChangedEventArgs(string rootPath, IReadOnlySet<string> changedPaths, bool isOverflowed = false)
     {
         RootPath = rootPath;
         ChangedPaths = changedPaths;
+        IsOverflowed = isOverflowed;
     }
 
     /// <summary>Workspace root the notification was raised for.</summary>
@@ -18,6 +19,10 @@ public sealed class WorkspaceFilesChangedEventArgs : EventArgs
 
     /// <summary>Full paths of the created / deleted / renamed files and directories.</summary>
     public IReadOnlySet<string> ChangedPaths { get; }
+
+    /// <summary>True when the native event burst exceeded the bounded path set. Consumers should
+    /// reconcile the loaded root/ancestors instead of trusting the incomplete path list.</summary>
+    public bool IsOverflowed { get; }
 }
 
 /// <summary>Structural watcher over the workspace root and its currently loaded directories.
@@ -85,6 +90,7 @@ public sealed class WorkspaceFileWatcher : IWorkspaceFileWatcher
 {
     internal static readonly TimeSpan DefaultDebounceInterval = TimeSpan.FromMilliseconds(200);
     private const int InternalBufferSize = 64 * 1024;
+    private const int MaximumPendingPaths = 4096;
 
     private readonly IUiDispatcher _dispatcher;
     private readonly TimeSpan _debounceInterval;
@@ -94,6 +100,7 @@ public sealed class WorkspaceFileWatcher : IWorkspaceFileWatcher
     private Timer? _debounceTimer;
     private string? _rootPath;
     private readonly HashSet<string> _pendingPaths = new(StringComparer.OrdinalIgnoreCase);
+    private bool _pendingOverflow;
     private long _generation;
 
     public WorkspaceFileWatcher() : this(new WpfUiDispatcher(), DefaultDebounceInterval)
@@ -190,7 +197,7 @@ public sealed class WorkspaceFileWatcher : IWorkspaceFileWatcher
                 return;
             }
 
-            _pendingPaths.Add(fullPath);
+            AddPendingPathNoLock(fullPath);
             _debounceTimer ??= new Timer(_ => OnDebounceElapsed(), null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
             try
             {
@@ -239,6 +246,7 @@ public sealed class WorkspaceFileWatcher : IWorkspaceFileWatcher
         string? root;
         long generation;
         HashSet<string> paths;
+        bool overflowed;
         lock (_gate)
         {
             if (_watchers.Count == 0)
@@ -249,20 +257,22 @@ public sealed class WorkspaceFileWatcher : IWorkspaceFileWatcher
             root = _rootPath;
             generation = _generation;
             paths = new HashSet<string>(_pendingPaths, StringComparer.OrdinalIgnoreCase);
+            overflowed = _pendingOverflow;
             _pendingPaths.Clear();
+            _pendingOverflow = false;
         }
 
         _dispatcher.BeginInvoke(() =>
         {
             lock (_gate)
             {
-                if (paths.Count == 0 || root is null || generation != _generation || _rootPath is null)
+                if ((paths.Count == 0 && !overflowed) || root is null || generation != _generation || _rootPath is null)
                 {
                     return;
                 }
             }
 
-            FilesChanged?.Invoke(this, new WorkspaceFilesChangedEventArgs(root, paths));
+            FilesChanged?.Invoke(this, new WorkspaceFilesChangedEventArgs(root, paths, overflowed));
         });
     }
 
@@ -272,6 +282,7 @@ public sealed class WorkspaceFileWatcher : IWorkspaceFileWatcher
         _debounceTimer?.Dispose();
         _debounceTimer = null;
         _pendingPaths.Clear();
+        _pendingOverflow = false;
         foreach (var directory in _watchers.Keys.ToArray())
         {
             DisposeWatcherNoLock(directory);
@@ -289,7 +300,7 @@ public sealed class WorkspaceFileWatcher : IWorkspaceFileWatcher
                 return;
             }
 
-            _pendingPaths.Add(fullPath);
+            AddPendingPathNoLock(fullPath);
             _debounceTimer ??= new Timer(_ => OnDebounceElapsed(), null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
             try
             {
@@ -300,6 +311,23 @@ public sealed class WorkspaceFileWatcher : IWorkspaceFileWatcher
                 // Detached while an OS callback was in flight.
             }
         }
+    }
+
+    private void AddPendingPathNoLock(string fullPath)
+    {
+        if (_pendingOverflow)
+        {
+            return;
+        }
+
+        if (_pendingPaths.Count >= MaximumPendingPaths)
+        {
+            _pendingPaths.Clear();
+            _pendingOverflow = true;
+            return;
+        }
+
+        _pendingPaths.Add(fullPath);
     }
 
     private void AddWatcherNoLock(string directory)

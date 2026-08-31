@@ -188,16 +188,20 @@ internal sealed class FakePackageRepository : IPackageRepository
 internal sealed class FakeCacheInventory(IReadOnlyList<CacheCandidate> candidates) : ICacheInventoryService
 {
     public int ScanCalls { get; private set; }
+    public int ForcedScanCalls { get; private set; }
+    public int CachedScanCalls { get; private set; }
 
     public Task<IReadOnlyList<CacheCandidate>> ScanAsync(IProgress<string>? progress = null, CancellationToken cancellationToken = default)
     {
         ScanCalls++;
+        CachedScanCalls++;
         return Task.FromResult(candidates);
     }
 
     public Task<IReadOnlyList<CacheCandidate>> ScanForcedAsync(IProgress<string>? progress = null, CancellationToken cancellationToken = default)
     {
         ScanCalls++;
+        ForcedScanCalls++;
         return Task.FromResult(candidates);
     }
 }
@@ -498,7 +502,7 @@ internal sealed class FakeGitService : IGitService
     public List<string> CommitFileListRequests { get; } = [];
     public List<(string RepositoryPath, string Path, bool Staged, GitDiffHunk Hunk, GitHunkOperation Operation)> HunkOperations { get; } = [];
 
-    public async Task<GitRepositoryStatus> GetStatusAsync(string repositoryPath, CancellationToken cancellationToken = default)
+    public async Task<GitRepositoryStatus> GetStatusAsync(string repositoryPath, CancellationToken cancellationToken = default, bool includeAllUntracked = true)
     {
         StatusRequests.Add(repositoryPath);
         if (StatusGate is not null)

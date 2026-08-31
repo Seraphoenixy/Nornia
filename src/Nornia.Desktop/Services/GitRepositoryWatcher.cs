@@ -110,6 +110,15 @@ public sealed class GitRepositoryWatcher : IGitRepositoryWatcher
     internal static readonly TimeSpan DefaultDebounceInterval = TimeSpan.FromMilliseconds(200);
     internal static readonly TimeSpan DefaultSuppressionWindow = TimeSpan.FromMilliseconds(250);
     private const int InternalBufferSize = 64 * 1024;
+    private const int MaximumPendingChangedPaths = 4096;
+    private static readonly HashSet<string> IgnoredWorkingTreeDirectories = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".vs", "bin", "obj", "node_modules"
+    };
+    private static readonly HashSet<string> IgnoredTransientFileSuffixes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ".tmp", ".temp", ".swp", ".swo", ".crdownload"
+    };
 
     private readonly IUiDispatcher _dispatcher;
     private readonly TimeSpan _debounceInterval;
@@ -122,6 +131,7 @@ public sealed class GitRepositoryWatcher : IGitRepositoryWatcher
     private int _operationSuppressionDepth;
     private bool _suppressAllWorkingTreePaths;
     private readonly HashSet<string> _suppressedWorkingTreePaths = new(StringComparer.OrdinalIgnoreCase);
+    private bool _pendingPathOverflow;
     private string? _repositoryPath;
     private readonly HashSet<string> _pendingChangedPaths = new(StringComparer.OrdinalIgnoreCase);
     private bool _pendingIndexChanged;
@@ -279,6 +289,18 @@ public sealed class GitRepositoryWatcher : IGitRepositoryWatcher
             return IsRelevantGitMetadata(relative);
         }
 
+        var segments = relative.Split(new[] { '\\', '/' }, StringSplitOptions.RemoveEmptyEntries);
+        if (segments.SkipLast(1).Any(IgnoredWorkingTreeDirectories.Contains))
+        {
+            return false;
+        }
+
+        var fileName = segments.LastOrDefault() ?? string.Empty;
+        if (fileName.StartsWith('~') || IgnoredTransientFileSuffixes.Any(suffix => fileName.EndsWith(suffix, StringComparison.OrdinalIgnoreCase)))
+        {
+            return false;
+        }
+
         return true;
     }
 
@@ -314,7 +336,20 @@ public sealed class GitRepositoryWatcher : IGitRepositoryWatcher
             }
             else
             {
-                _pendingChangedPaths.Add(relative.Replace('\\', '/'));
+                if (_pendingPathOverflow)
+                {
+                    // Keep only an overflow marker; the next status read is authoritative and a
+                    // bounded set prevents an event storm from becoming an unbounded allocation.
+                }
+                else if (_pendingChangedPaths.Count >= MaximumPendingChangedPaths)
+                {
+                    _pendingChangedPaths.Clear();
+                    _pendingPathOverflow = true;
+                }
+                else
+                {
+                    _pendingChangedPaths.Add(relative.Replace('\\', '/'));
+                }
             }
         }
 
@@ -450,16 +485,18 @@ public sealed class GitRepositoryWatcher : IGitRepositoryWatcher
         lock (_gate)
         {
             if (_repositoryPath is not null &&
-                (_pendingChangedPaths.Count > 0 || _pendingIndexChanged || _pendingHeadOrRefsChanged))
+                (_pendingChangedPaths.Count > 0 || _pendingIndexChanged || _pendingHeadOrRefsChanged || _pendingPathOverflow))
             {
                 args = new GitRepositoryChangesDetectedEventArgs(
                     _repositoryPath,
                     new HashSet<string>(_pendingChangedPaths, StringComparer.OrdinalIgnoreCase),
                     _pendingIndexChanged,
-                    _pendingHeadOrRefsChanged);
+                    _pendingHeadOrRefsChanged,
+                    _pendingPathOverflow);
             }
 
             _pendingChangedPaths.Clear();
+            _pendingPathOverflow = false;
             _pendingIndexChanged = false;
             _pendingHeadOrRefsChanged = false;
         }
@@ -491,6 +528,7 @@ public sealed class GitRepositoryWatcher : IGitRepositoryWatcher
         _debounceTimer?.Dispose();
         _debounceTimer = null;
         _pendingChangedPaths.Clear();
+        _pendingPathOverflow = false;
         _pendingIndexChanged = false;
         _pendingHeadOrRefsChanged = false;
         _operationSuppressionDepth = 0;

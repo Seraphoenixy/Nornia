@@ -218,9 +218,13 @@ public sealed class TerminalSurfaceControl : FrameworkElement
     private void UpdateCellMetrics()
     {
         var typeface = new Typeface(MonoFont(), FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);
+        var pixelsPerDip = VisualTreeHelper.GetDpi(this).PixelsPerDip;
+        // Match VS Code/xterm's font measurement: the terminal grid is based on the
+        // natural advance of a representative monospace glyph, not on a fixed width and
+        // not on a later horizontal transform of the rendered text.
         var sample = new FormattedText(
-            "M", CultureInfo.CurrentUICulture, FlowDirection.LeftToRight, typeface, TerminalFontSize,
-            Brushes.Black, VisualTreeHelper.GetDpi(this).PixelsPerDip);
+            "X", CultureInfo.CurrentUICulture, FlowDirection.LeftToRight, typeface, TerminalFontSize,
+            Brushes.Transparent, pixelsPerDip);
         _cellWidth = Math.Max(4, sample.WidthIncludingTrailingWhitespace);
         _cellHeight = Math.Max(8, sample.Height);
     }
@@ -249,10 +253,14 @@ public sealed class TerminalSurfaceControl : FrameworkElement
     {
         if (!string.IsNullOrWhiteSpace(TerminalFontFamily))
         {
-            return new FontFamily(TerminalFontFamily);
+            // Match VS Code's terminal font resolution: always append an explicit monospace
+            // fallback. If the configured family is not installed, WPF must not silently fall
+            // back to a proportional UI font while the grid is measured from a monospace glyph.
+            return new FontFamily(FontCatalog.ComposeRenderingFamily(TerminalFontFamily));
         }
 
-        return (Application.Current?.TryFindResource("MonoFontFamily") as FontFamily) ?? new FontFamily("Consolas");
+        return (Application.Current?.TryFindResource("MonoFontFamily") as FontFamily)
+            ?? new FontFamily(FontCatalog.ComposeRenderingFamily(null));
     }
 
     // ===== rendering =====
@@ -351,8 +359,8 @@ public sealed class TerminalSurfaceControl : FrameworkElement
     }
 
     /// <summary>把一行渲染进独立 DrawingVisual 并缓存(内容画在 y=0,位置由调用方的
-    /// 平移变换定位 → 滚动无需失效缓存,T2)。背景 run 按网格 + 前景文本按"网格锚定分段":
-    /// 每段锚定在其起始列的网格 x 上(详见段循环注释),同色连续段一段一次 DrawText。</summary>
+    /// 平移变换定位 → 滚动无需失效缓存,T2)。背景 run 按网格 + 前景文本按颜色分段,
+    /// 文本使用与网格相同字体的自然 advance 绘制。</summary>
     private DrawingVisual? RenderLine(TerminalCell[] line, string text)
     {
         var typeface = EnsureTypeface();
@@ -386,48 +394,98 @@ public sealed class TerminalSurfaceControl : FrameworkElement
             {
                 hasText = true;
                 var dpi = VisualTreeHelper.GetDpi(this).PixelsPerDip;
-                // 网格锚定分段:背景与光标按"列×_cellWidth"网格定位,而文本若整行一段、
-                // 按字体自然 advance 累加定位,CJK 宽字符/回退字形的 advance 与网格的偏差会
-                // 逐字累计——光标块与最后一个字符之间显出"看得见的空隙"(模型里并无空格)。
-                // 与 xterm.js/Windows Terminal 一致,让字形贴齐网格:每段画在其起始列的网格 x,
-                // 偏差只在段内存在、不跨段累计。分段边界 = 前景色变化 / 宽字符(独立成段,
-                // 其双格宽度由网格表达)/ \0 占位格(宽字符第二格与空格,跳过不画)。
-                // 纯 ASCII 单色行 → 恰为一段画在 x=0,与旧实现完全同成本。
-                var segmentStart = -1;
+                // 光标、背景和选区都按"列×_cellWidth"定位;文本从同一网格列起点自然绘制,
+                // 不通过 ScaleTransform 拉伸字形。宽字符单独绘制并占两列;宽字符的 \0
+                // 占位格被跳过。
+                var segmentStartCell = -1;
+                var segmentStartText = -1;
                 var segmentColor = 0;
-                for (var column = 0; column <= text.Length; column++)
+                var textIndex = 0;
+                var column = 0;
+                void FlushTextSegment(int endColumn, int endTextIndex)
                 {
-                    var atEnd = column == text.Length;
-                    var drawable = !atEnd && line[column].Char != '\0';
-                    var color = !atEnd ? line[column].Foreground : 0;
-                    var boundary = atEnd || !drawable
-                        || (segmentStart >= 0 && (color != segmentColor || line[column].Width == 2));
-
-                    if (segmentStart >= 0 && boundary)
+                    if (segmentStartCell < 0)
                     {
-                        var segment = text[segmentStart..column];
+                        return;
+                    }
+
+                    var safeEndText = Math.Clamp(endTextIndex, segmentStartText, text.Length);
+                    var segment = text[segmentStartText..safeEndText];
+                    if (segment.Length > 0)
+                    {
                         var brush = segmentColor != 0 ? ColorBrush(segmentColor) : foreground;
-                        var formatted = new FormattedText(
-                            segment, CultureInfo.CurrentUICulture, FlowDirection.LeftToRight, typeface,
-                            TerminalFontSize, brush, dpi);
-                        context.DrawText(formatted, new Point(segmentStart * _cellWidth, 0));
-                        segmentStart = -1;
+                        DrawTextRun(context, segment, segmentStartCell, typeface, brush, dpi);
                     }
 
-                    // 首个普通字符本身不是边界，但必须在这里开启段。旧逻辑仅在边界后
-                    // 赋 segmentStart，导致纯 ASCII/同色输出永远保持 -1，屏幕有内容却
-                    // 没有任何 DrawText 调用，表现为整个终端只有背景、看不到文字。
-                    if (drawable && segmentStart < 0)
-                    {
-                        segmentStart = column;
-                        segmentColor = color;
-                    }
+                    segmentStartCell = -1;
+                    segmentStartText = -1;
                 }
+
+                while (column < line.Length && textIndex < text.Length)
+                {
+                    var cell = line[column];
+                    if (cell.Char == '\0')
+                    {
+                        // Internal NULs are real empty cells (or the continuation cell of a wide
+                        // character). The latter is consumed together with its head below.
+                        FlushTextSegment(column, textIndex);
+                        column++;
+                        textIndex++;
+                        continue;
+                    }
+
+                    var cellWidth = cell.Width == 2 ? 2 : 1;
+                    if (cellWidth == 2)
+                    {
+                        FlushTextSegment(column, textIndex);
+                        var brush = cell.Foreground != 0 ? ColorBrush(cell.Foreground) : foreground;
+                        DrawTextRun(context, cell.Char.ToString(), column, typeface, brush, dpi);
+                        column += 2;
+                        // GetRenderedLine retains the internal NUL continuation when another
+                        // character follows the wide glyph, but trims it when this is the last
+                        // visible cell.
+                        textIndex = Math.Min(text.Length, textIndex + 2);
+                        continue;
+                    }
+
+                    if (segmentStartCell >= 0 && cell.Foreground != segmentColor)
+                    {
+                        FlushTextSegment(column, textIndex);
+                    }
+
+                    if (segmentStartCell < 0)
+                    {
+                        segmentStartCell = column;
+                        segmentStartText = textIndex;
+                        segmentColor = cell.Foreground;
+                    }
+
+                    column++;
+                    textIndex++;
+                }
+
+                FlushTextSegment(column, textIndex);
             }
         }
 
         // 空行返回 null:缓存"已知空"状态,避免每帧 GetLine + 字符串构造。
         return hasBackground || hasText ? visual : null;
+    }
+
+    /// <summary>使用与 UpdateCellMetrics 相同的 Typeface/字号/DPI 绘制文本,因此字符
+    /// advance 与终端网格一致,字形本身不做水平缩放。</summary>
+    private void DrawTextRun(DrawingContext context, string text, int startColumn,
+        Typeface typeface, Brush brush, double pixelsPerDip)
+    {
+        if (text.Length == 0)
+        {
+            return;
+        }
+
+        var formatted = new FormattedText(
+            text, CultureInfo.CurrentUICulture, FlowDirection.LeftToRight, typeface,
+            TerminalFontSize, brush, pixelsPerDip);
+        context.DrawText(formatted, new Point(startColumn * _cellWidth, 0));
     }
 
     private Typeface EnsureTypeface()

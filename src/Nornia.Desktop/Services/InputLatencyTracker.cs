@@ -61,7 +61,9 @@ public sealed class InputLatencyTracker : IDisposable
     public void NoteInteraction()
     {
         if (_disposed) return;
-        Volatile.Write(ref _pendingTicks, Stopwatch.GetTimestamp());
+        // One render frame represents the current interaction burst. Keep the first timestamp in
+        // that burst so rapid key presses do not overwrite the oldest latency sample.
+        Interlocked.CompareExchange(ref _pendingTicks, Stopwatch.GetTimestamp(), 0);
         HookFrame();
     }
 

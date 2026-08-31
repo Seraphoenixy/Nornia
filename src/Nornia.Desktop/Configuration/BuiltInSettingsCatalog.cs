@@ -68,7 +68,7 @@ public sealed class BuiltInSettingsCatalog
             new SettingDefinition<string>(EditorRulers, "80", "垂直标尺", "在指定列绘制垂直参考线(逗号分隔的列号,如 80,120)。",
                 "编辑器", ["ruler", "columns"], EditorScopes, SettingEditorKind.String,
                 value => string.IsNullOrWhiteSpace(value) ? null : null),
-            Bool(DiffSideBySide, false, "并排显示 Diff", "在两个同步阅读面中显示旧版本和新版本。", "Diff", SharedScopes),
+            Bool(DiffSideBySide, true, "并排显示 Diff", "在两个同步阅读面中显示旧版本和新版本。宽屏默认并排，窄窗口可自动回退为内联。", "Diff", SharedScopes),
             Bool(DiffHideUnchanged, true, "折叠未修改区域", "默认隐藏较长的未修改上下文。", "Diff", SharedScopes),
         Bool(DiffIntraline, true, "行内差异", "突出显示行内单词、标识符或标点的变化。", "Diff", SharedScopes),
             Bool(DiffOverview, true, "Diff 概览尺", "显示完整变更分布。", "Diff", SharedScopes),

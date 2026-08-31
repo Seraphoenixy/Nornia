@@ -934,7 +934,11 @@ public sealed class DesignSystemResourceTests
         Assert.Contains("IsMouseOver", comboBox);
         Assert.Contains("IsEnabled", comboBox);
         Assert.Contains("Opacity", comboBox);
-        Assert.Contains("RelativeSource AncestorType=ComboBox", comboBox);
+        // The closed selector forwards the ComboBox brushes through the outer template into its
+        // ToggleButton; relying on an AncestorType lookup from a nested template is not stable
+        // after WPF materializes the control in a DataTemplate.
+        Assert.Contains("Background=\"{TemplateBinding Background}\"", comboBox);
+        Assert.Contains("BorderBrush=\"{TemplateBinding BorderBrush}\"", comboBox);
         Assert.Contains("TextElement.Foreground=\"{TemplateBinding Foreground}\"", comboBox);
 
         var comboBoxItem = StyleBlock(app, "<Style TargetType=\"ComboBoxItem\">");
@@ -942,6 +946,19 @@ public sealed class DesignSystemResourceTests
         Assert.Contains("SelectionActiveBrush", comboBoxItem);
         Assert.Contains("IsEnabled", comboBoxItem);
         Assert.Contains("<ControlTemplate TargetType=\"ComboBoxItem\">", comboBoxItem);
+    }
+
+    [Fact]
+    public void SettingsBooleanEditor_UsesThemedCheckBoxStyle()
+    {
+        var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
+        var settings = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/SettingsView.xaml"));
+        var checkBox = StyleBlock(app, "<Style TargetType=\"CheckBox\">");
+
+        Assert.Contains("Background=\"{DynamicResource InputBrush}\"", checkBox);
+        Assert.Contains("BorderBrush=\"{TemplateBinding BorderBrush}\"", checkBox);
+        Assert.Contains("TextElement.Foreground=\"{TemplateBinding Foreground}\"", checkBox);
+        Assert.Contains("Style=\"{StaticResource {x:Type CheckBox}}\" Content=\"启用\"", settings);
     }
 
     [Fact]

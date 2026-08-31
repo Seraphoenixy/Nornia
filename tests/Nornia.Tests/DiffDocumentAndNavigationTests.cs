@@ -159,6 +159,148 @@ public sealed class DiffDocumentBuilderTests
     }
 
     [Fact]
+    public void MissingSideRows_AreTreatedAsPlaceholderShadows()
+    {
+        var rows = SampleDiff().ToSideBySideRows();
+        var (oldSide, newSide) = DiffDocumentBuilders.BuildSideBySide(rows);
+
+        Assert.Contains(oldSide, line => DiffDocumentBuilders.IsPlaceholderLine(line));
+        Assert.Contains(newSide, line => DiffDocumentBuilders.IsPlaceholderLine(line));
+        Assert.False(DiffDocumentBuilders.IsPlaceholderLine(new DiffRenderLine(string.Empty, GitDiffLineKind.Context, 1, 1)));
+    }
+
+    [Fact]
+    public void SideBySide_MarksOnlyUnmatchedCellsForDiagonalShadow()
+    {
+        var rows = new[]
+        {
+            new GitSideBySideRow(null, GitDiffLineKind.None, string.Empty,
+                1, GitDiffLineKind.Added, "new line"),
+            new GitSideBySideRow(2, GitDiffLineKind.Removed, "old line",
+                null, GitDiffLineKind.None, string.Empty),
+            new GitSideBySideRow(null, GitDiffLineKind.None, string.Empty,
+                null, GitDiffLineKind.None, string.Empty),
+            new GitSideBySideRow(null, GitDiffLineKind.HunkHeader, "@@ -1 +1 @@",
+                null, GitDiffLineKind.HunkHeader, "@@ -1 +1 @@"),
+        };
+
+        var (oldSide, newSide) = DiffDocumentBuilders.BuildSideBySide(rows);
+
+        Assert.True(oldSide[0].IsSideBySidePlaceholder);
+        Assert.False(newSide[0].IsSideBySidePlaceholder);
+        Assert.False(oldSide[1].IsSideBySidePlaceholder);
+        Assert.True(newSide[1].IsSideBySidePlaceholder);
+        Assert.False(oldSide[2].IsSideBySidePlaceholder);
+        Assert.False(newSide[2].IsSideBySidePlaceholder);
+        Assert.False(oldSide[3].IsSideBySidePlaceholder);
+        Assert.False(newSide[3].IsSideBySidePlaceholder);
+    }
+
+    [Fact]
+    public void WhitespaceOnlyPaddingRows_AreAlsoPlaceholderShadows()
+    {
+        var placeholder = new DiffRenderLine("   ", GitDiffLineKind.None, null, null);
+        Assert.True(DiffDocumentBuilders.IsPlaceholderLine(placeholder));
+    }
+
+    [Fact]
+    public void CollapsedPlaceholder_ReportsHiddenContextCount()
+    {
+        var line = new DiffDisplayLine(null, 7, 12);
+
+        Assert.True(line.IsCollapsedContext);
+        Assert.Equal("  … 展开 12 行未更改内容 …", line.Text);
+
+        var renderLine = new DiffRenderLine(line.Text, GitDiffLineKind.None, null, null,
+            HiddenLineCount: line.HiddenLineCount);
+        Assert.True(renderLine.IsCollapsedContext);
+        Assert.True(DiffDocumentBuilders.IsPlaceholderLine(renderLine));
+    }
+
+    [Fact]
+    public void SideBySideCollapsedContext_CreatesPlaceholderPromptRows()
+    {
+        var hunk = new GitDiffHunk(1, 20, 1, 20, "@@ -1,20 +1,20 @@",
+        [
+            new GitDiffLine(GitDiffLineKind.Context, 1, 1, "keep-a"),
+            new GitDiffLine(GitDiffLineKind.Context, 2, 2, "keep-b"),
+            new GitDiffLine(GitDiffLineKind.Context, 3, 3, "keep-c"),
+            new GitDiffLine(GitDiffLineKind.Context, 4, 4, "keep-d"),
+            new GitDiffLine(GitDiffLineKind.Context, 5, 5, "keep-e"),
+            new GitDiffLine(GitDiffLineKind.Context, 6, 6, "keep-f"),
+            new GitDiffLine(GitDiffLineKind.Context, 7, 7, "keep-g"),
+            new GitDiffLine(GitDiffLineKind.Context, 8, 8, "keep-h"),
+            new GitDiffLine(GitDiffLineKind.Context, 9, 9, "keep-i"),
+            new GitDiffLine(GitDiffLineKind.Context, 10, 10, "keep-j"),
+            new GitDiffLine(GitDiffLineKind.Removed, 11, null, "gone"),
+            new GitDiffLine(GitDiffLineKind.Added, null, 11, "new"),
+            new GitDiffLine(GitDiffLineKind.Context, 12, 12, "keep-k"),
+            new GitDiffLine(GitDiffLineKind.Context, 13, 13, "keep-l"),
+            new GitDiffLine(GitDiffLineKind.Context, 14, 14, "keep-m"),
+            new GitDiffLine(GitDiffLineKind.Context, 15, 15, "keep-n"),
+            new GitDiffLine(GitDiffLineKind.Context, 16, 16, "keep-o"),
+            new GitDiffLine(GitDiffLineKind.Context, 17, 17, "keep-p"),
+            new GitDiffLine(GitDiffLineKind.Context, 18, 18, "keep-q"),
+            new GitDiffLine(GitDiffLineKind.Context, 19, 19, "keep-r"),
+            new GitDiffLine(GitDiffLineKind.Context, 20, 20, "keep-s"),
+        ]);
+        var diff = new GitFileDiff("a.txt", null, false, false, false, [hunk]);
+        var sideBySide = DiffDocumentBuilders.BuildSideBySide(diff.ToSideBySideRows());
+        var source = DiffDocumentBuilders.BuildSideBySideCollapseSource(sideBySide.Old, sideBySide.New);
+        var map = new DiffDisplayMap(source, collapseContext: true, includeHunkHeaders: false);
+
+        Assert.Contains(map.Lines, line => line.IsCollapsedContext);
+        Assert.Contains(map.Lines, line => line.Text.Contains("未更改内容"));
+        Assert.DoesNotContain(map.Lines, line => line.Source?.Kind == GitDiffLineKind.HunkHeader);
+        Assert.All(map.Lines.Where(line => line.IsCollapsedContext), line =>
+            Assert.Null(line.Source));
+
+        var oldDisplay = map.Lines.Select(line => line.ToRenderLine(sideBySide.Old)).ToArray();
+        var newDisplay = map.Lines.Select(line => line.ToRenderLine(sideBySide.New)).ToArray();
+        var oldPrompts = oldDisplay.Where(line => line.IsCollapsedContext).ToArray();
+        var newPrompts = newDisplay.Where(line => line.IsCollapsedContext).ToArray();
+        Assert.Equal(oldPrompts.Length, newPrompts.Length);
+        Assert.NotEmpty(oldPrompts);
+        Assert.Equal(oldPrompts.Select(line => line.Text), newPrompts.Select(line => line.Text));
+        Assert.Equal(oldPrompts.Select(line => line.HiddenLineCount), newPrompts.Select(line => line.HiddenLineCount));
+    }
+
+    [Fact]
+    public void ContextProjection_MergesContextAcrossHunkHeaderWhenNoChangeLiesBetween()
+    {
+        var lines = new List<DiffRenderLine>
+        {
+            new("@@ -1,11 +1,11 @@", GitDiffLineKind.HunkHeader, null, null),
+            new("first change", GitDiffLineKind.Removed, 1, null),
+        };
+        for (var lineNumber = 2; lineNumber <= 11; lineNumber++)
+        {
+            lines.Add(new DiffRenderLine($"context-{lineNumber}", GitDiffLineKind.Context, lineNumber, lineNumber));
+        }
+
+        lines.Add(new DiffRenderLine("@@ -12,11 +12,11 @@", GitDiffLineKind.HunkHeader, null, null));
+        for (var lineNumber = 12; lineNumber <= 21; lineNumber++)
+        {
+            lines.Add(new DiffRenderLine($"context-{lineNumber}", GitDiffLineKind.Context, lineNumber, lineNumber));
+        }
+
+        lines.Add(new DiffRenderLine("second change", GitDiffLineKind.Added, null, 22));
+
+        var map = new DiffDisplayMap(lines, collapseContext: true);
+        var prompts = map.Lines.Where(line => line.IsCollapsedContext).ToArray();
+
+        // Two Git hunks contribute one unchanged run between the two actual changes, so there is
+        // one prompt for all 20 context rows (3 visible on each side, 14 hidden in the middle).
+        Assert.Single(prompts);
+        Assert.Equal(14, prompts[0].HiddenLineCount);
+
+        var promptIndex = map.Lines.ToList().FindIndex(line => line.IsCollapsedContext);
+        Assert.True(map.ExpandAtDisplayIndex(promptIndex));
+        Assert.DoesNotContain(map.Lines, line => line.IsCollapsedContext);
+        Assert.Equal(lines.Count, map.Lines.Count);
+    }
+
+    [Fact]
     public void CountBlocks_GroupsContiguousChanges()
     {
         var lines = DiffDocumentBuilders.BuildInline(SampleDiff().Hunks.SelectMany(h => h.Lines));
@@ -356,13 +498,66 @@ public sealed class DiffTabNavigationTests
         await editor.OpenDiffAsync(new GitDiffRequest(@"C:\repo", "a.cs", false, false));
         var diff = Assert.IsType<DiffTab>(Assert.Single(editor.OpenTabs));
 
-        Assert.True(diff.IsInlineDiff);
-        Assert.Equal("内联 Diff", diff.DiffModeLabel);
+        Assert.True(diff.IsSideBySideDiff);
+        Assert.Equal("并排 Diff", diff.DiffModeLabel);
 
         diff.ToggleDiffModeCommand.Execute(null);
 
-        Assert.True(diff.IsSideBySideDiff);
-        Assert.Equal("并排 Diff", diff.DiffModeLabel);
-        Assert.False(diff.IsInlineDiff);
+        Assert.True(diff.IsInlineDiff);
+        Assert.Equal("内联 Diff", diff.DiffModeLabel);
+        Assert.False(diff.IsSideBySideDiff);
+    }
+
+    [Fact]
+    public void DiffDisplayMap_ToggleCollapseContext_RebuildsProjection()
+    {
+        var lines = Enumerable.Range(1, 17)
+            .Select(line => line == 9
+                ? new DiffRenderLine("changed", GitDiffLineKind.Added, null, line)
+                : new DiffRenderLine($"line {line}", GitDiffLineKind.Context, line, line))
+            .ToArray();
+
+        var map = new DiffDisplayMap(lines, collapseContext: true);
+        var prompts = map.Lines.Where(line => line.IsCollapsedContext).ToArray();
+        Assert.Equal(2, prompts.Length);
+        Assert.All(prompts, line => Assert.Equal(2, line.HiddenLineCount));
+
+        var promptIndex = map.Lines.ToList().IndexOf(prompts[0]);
+        Assert.True(map.ExpandAtDisplayIndex(promptIndex));
+        Assert.Single(map.Lines, line => line.IsCollapsedContext);
+
+        var remainingPrompt = Assert.Single(map.Lines, line => line.IsCollapsedContext);
+        Assert.True(map.ExpandAtDisplayIndex(map.Lines.ToList().IndexOf(remainingPrompt)));
+        Assert.DoesNotContain(map.Lines, line => line.IsCollapsedContext);
+        Assert.Equal(lines.Length, map.Lines.Count);
+
+        map.SetCollapseContext(false);
+        Assert.DoesNotContain(map.Lines, line => line.IsCollapsedContext);
+        Assert.Equal(lines.Length, map.Lines.Count);
+
+        map.SetCollapseContext(true);
+        Assert.Contains(map.Lines, line => line.IsCollapsedContext);
+    }
+
+    [Fact]
+    public async Task ManualLayoutOverride_PreventsAutoInlineSwitchOnNarrowWidth()
+    {
+        var editor = CreateEditor(new FakeGitService { DiffResult = SampleDiff() });
+        await editor.OpenDiffAsync(new GitDiffRequest(@"C:\repo", "a.cs", false, false));
+        var diff = Assert.IsType<DiffTab>(Assert.Single(editor.OpenTabs));
+
+        diff.UseInlineWhenNarrow = true;
+        diff.IsLayoutManuallySelected = false;
+        Assert.True(diff.ShouldAutoUseInlineForWidth(699));
+        Assert.False(diff.ShouldAutoUseInlineForWidth(700));
+        Assert.False(diff.ShouldAutoUseInlineForWidth(2000));
+
+        diff.DiffMode = GitDiffMode.SideBySide;
+        diff.IsLayoutManuallySelected = true;
+        Assert.False(diff.ShouldAutoUseInlineForWidth(500));
+
+        diff.DiffMode = GitDiffMode.Inline;
+        diff.IsLayoutManuallySelected = true;
+        Assert.False(diff.ShouldAutoUseInlineForWidth(500));
     }
 }

@@ -45,6 +45,23 @@ public sealed class AppDataCacheServiceTests : IDisposable
         Assert.Empty(Directory.EnumerateFileSystemEntries(cachePath));
     }
 
+    [Fact]
+    public async Task ConcurrentScans_ShareOneInFlightWalk()
+    {
+        var cachePath = Path.Combine(_root, ".cache");
+        Directory.CreateDirectory(cachePath);
+        await File.WriteAllTextAsync(Path.Combine(cachePath, "item.bin"), "cache-data");
+        var service = new AppDataCacheService([_root]);
+
+        var scans = await Task.WhenAll(
+            service.ScanForcedAsync(),
+            service.ScanForcedAsync(),
+            service.ScanAsync());
+
+        Assert.Same(scans[0], scans[1]);
+        Assert.Same(scans[1], scans[2]);
+    }
+
     public void Dispose()
     {
         if (Directory.Exists(_root)) Directory.Delete(_root, recursive: true);

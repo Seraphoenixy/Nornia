@@ -77,12 +77,32 @@ public sealed class SettingsLiveEffectTests : IDisposable
     {
         var settings = new FakeSettingsService();
         var git = new FakeGitService { Status = new GitRepositoryStatus(false, null, null, 0, 0, [], []), DiffResult = SampleDiff() };
-        var editor = new EditorAreaViewModel(
-            git, new FakeUiLogService(), new FakeClipboardService(),
-            CodeFileTypeRegistry.Instance, TextDocumentDecoder.Instance, CodeOutlineParser.Instance,
-            TextSearchService.Instance, null,
-            settings, new FakeProjectWorkspaceService(), new FakeApplicationStateStore());
-        return (editor, settings);
+        var previousContext = SynchronizationContext.Current;
+        try
+        {
+            // A ViewModel must not mistake a test/server synchronization context for the WPF UI
+            // dispatcher. This non-pumping context makes that contract deterministic: capturing it
+            // would drop every live settings application and reproduce the CI timeout.
+            SynchronizationContext.SetSynchronizationContext(new NonPumpingSynchronizationContext());
+            var editor = new EditorAreaViewModel(
+                git, new FakeUiLogService(), new FakeClipboardService(),
+                CodeFileTypeRegistry.Instance, TextDocumentDecoder.Instance, CodeOutlineParser.Instance,
+                TextSearchService.Instance, null,
+                settings, new FakeProjectWorkspaceService(), new FakeApplicationStateStore());
+            return (editor, settings);
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(previousContext);
+        }
+    }
+
+    private sealed class NonPumpingSynchronizationContext : SynchronizationContext
+    {
+        public override void Post(SendOrPostCallback callback, object? state)
+        {
+            // Deliberately does not pump. Only a DispatcherSynchronizationContext is a UI owner.
+        }
     }
 
     // ===== 编辑器:标签上限 / 阅读选项实时生效 =====
@@ -153,7 +173,7 @@ public sealed class SettingsLiveEffectTests : IDisposable
         var (editor, settings) = CreateEditor();
         await editor.OpenDiffAsync(new GitDiffRequest(_tempDir, "a.cs", IsStaged: false, IsUntracked: false));
         var tab = editor.Groups.AllTabs.OfType<DiffTab>().Single();
-        Assert.True(tab.DiffMode == GitDiffMode.Inline);
+        Assert.True(tab.DiffMode == GitDiffMode.SideBySide);
 
         await SetAsync(settings, BuiltInSettingsCatalog.DiffSideBySide, true);
         await SetAsync(settings, BuiltInSettingsCatalog.DiffIgnoreTrimWhitespace, true);
@@ -169,9 +189,18 @@ public sealed class SettingsLiveEffectTests : IDisposable
     private (WorkspaceViewModel Workspace, FakeSettingsService Settings) CreateWorkspace()
     {
         var settings = new FakeSettingsService();
-        var workspace = new WorkspaceViewModel(new FakeFolderPicker(), settings,
-            new FakeProjectWorkspaceService(), new FakeUiLogService(), new FakeClipboardService());
-        return (workspace, settings);
+        var previousContext = SynchronizationContext.Current;
+        try
+        {
+            SynchronizationContext.SetSynchronizationContext(new NonPumpingSynchronizationContext());
+            var workspace = new WorkspaceViewModel(new FakeFolderPicker(), settings,
+                new FakeProjectWorkspaceService(), new FakeUiLogService(), new FakeClipboardService());
+            return (workspace, settings);
+        }
+        finally
+        {
+            SynchronizationContext.SetSynchronizationContext(previousContext);
+        }
     }
 
     [Fact]

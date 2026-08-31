@@ -90,8 +90,7 @@ public partial class DiffDocumentView : UserControl
     private DiffDisplayMap? _inlineMap;
     private DiffDisplayMap? _sideMap;
     // 原始 hunk 头文本(按 hunk 序):折叠投影会把 @@ 元数据从内联文档隐藏(hideHunkHeader),
-    // sticky 行仍显示真实头文本;第 k 个显示 hunk 头与第 k 个原始 hunk 头一一对应
-    // (折叠只压缩上下文,不增删 hunk 头)。
+    // sticky 行仍显示真实头文本;第 k 个显示 hunk 头与第 k 个原始 hunk 头一一对应。
     private IReadOnlyList<string> _rawHunkHeaderTexts = [];
     // 并排两侧的行对齐变更掩码(RebuildDocuments 随 _oldLines/_newLines 一次性重建):
     // 变更导航/概览 current 标记按并排行号空间定位。每次重建只分配一次,
@@ -121,9 +120,11 @@ public partial class DiffDocumentView : UserControl
         NewOverviewCanvas.SizeChanged += (_, _) => RedrawSideOverviews();
         NewOverviewCanvas.MouseLeftButtonDown += OnSideOverviewMouseDown;
         // Click-to-expand collapsed context placeholders (VS Code "… N unchanged lines …" bar).
-        InlineEditor.TextArea.TextView.PreviewMouseLeftButtonDown += OnEditorPreviewMouseDown;
-        OldEditor.TextArea.TextView.PreviewMouseLeftButtonDown += OnEditorPreviewMouseDown;
-        NewEditor.TextArea.TextView.PreviewMouseLeftButtonDown += OnEditorPreviewMouseDown;
+        // Listen on the panes instead of only TextView: the floating hunk-action canvas is layered
+        // over the editors and can otherwise become the routed-event source, making a prompt click
+        // look inert even though the prompt is visible.
+        InlinePane.PreviewMouseLeftButtonDown += OnDiffPanePreviewMouseDown;
+        SideBySidePane.PreviewMouseLeftButtonDown += OnDiffPanePreviewMouseDown;
         InlineEditor.TextArea.TextView.MouseMove += OnDiffTextViewMouseMove;
         OldEditor.TextArea.TextView.MouseMove += OnDiffTextViewMouseMove;
         NewEditor.TextArea.TextView.MouseMove += OnDiffTextViewMouseMove;
@@ -182,12 +183,24 @@ public partial class DiffDocumentView : UserControl
 
     private TextEditor _positionedEditor = null!;
 
-    /// <summary>窄窗自动内联(VS Code useInlineViewWhenSpaceIsLimited):窗口过窄时即使请求并排
-    /// 也以内联显示(仅显示层,不改 DiffMode)。</summary>
-    private const double NarrowInlineWidth = 540;
+    /// <summary>窄窗自动内联(VS Code useInlineViewWhenSpaceIsLimited):未手动选择布局时,
+    /// 宽度不足时切回单栏；一旦用户手工选择则保持该布局，且仅作用于当前本次打开的 Diff 标签。
+    /// 这不依赖全局状态，因此对同一文件的下一次打开会重新回到自动决策。</summary>
+    private const double NarrowInlineWidth = 700;
 
-    private bool EffectiveInline() =>
-        _tab is null || _tab.IsInlineDiff || (_tab.UseInlineWhenNarrow && ActualWidth < NarrowInlineWidth);
+    private bool EffectiveInline()
+    {
+        if (_tab is null)
+        {
+            return true;
+        }
+
+        // The selected diff mode remains the baseline. The narrow-window option is only an
+        // automatic fallback for a requested side-by-side layout; without this OR an inline
+        // default would unexpectedly turn into side-by-side as soon as the view became wide.
+        return _tab.IsInlineDiff
+            || (!_tab.IsLayoutManuallySelected && _tab.ShouldAutoUseInlineForWidth(ActualWidth));
+    }
 
     private void UpdateLayoutMode()
     {
@@ -939,7 +952,17 @@ public partial class DiffDocumentView : UserControl
 
     private void OnTabPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
-        if (e.PropertyName is nameof(DiffTab.IsLoaded) or nameof(DiffTab.DiffMode) or nameof(DiffTab.IsContextCollapsed))
+        if (e.PropertyName == nameof(DiffTab.IsContextCollapsed))
+        {
+            // This is a direct user action from the toolbar. Apply it immediately so the button
+            // cannot appear inert while a background-priority coalesced rebuild is waiting behind
+            // other dispatcher work; collection changes still use the coalesced path below.
+            RebuildDocuments();
+            UpdateLayoutMode();
+            return;
+        }
+
+        if (e.PropertyName is nameof(DiffTab.IsLoaded) or nameof(DiffTab.DiffMode))
         {
             if (e.PropertyName == nameof(DiffTab.IsLoaded))
             {
@@ -1150,26 +1173,53 @@ public partial class DiffDocumentView : UserControl
             .Where(line => line.Kind == GitDiffLineKind.HunkHeader)
             .Select(line => line.Text)
             .ToArray();
-        var sideBySide = DiffDocumentBuilders.BuildSideBySide(_tab.SideBySideRows);
-        var sideCollapseSource = DiffDocumentBuilders.BuildSideBySideCollapseSource(sideBySide.Old, sideBySide.New);
+        // The inline projection is also the source for the diff find bar. The much larger paired
+        // projection is only needed by the visible side-by-side layout; deferring it avoids doing
+        // a second alignment pass every time an inline diff is refreshed or its context is toggled.
+        (IReadOnlyList<DiffRenderLine> Old, IReadOnlyList<DiffRenderLine> New) sideBySide = _tab.IsSideBySideDiff
+            ? DiffDocumentBuilders.BuildSideBySide(_tab.SideBySideRows)
+            : (Array.Empty<DiffRenderLine>() as IReadOnlyList<DiffRenderLine>,
+               Array.Empty<DiffRenderLine>() as IReadOnlyList<DiffRenderLine>);
+        var sideCollapseSource = _tab.IsSideBySideDiff
+            ? DiffDocumentBuilders.BuildSideBySideCollapseSource(sideBySide.Old, sideBySide.New)
+            : [];
+
+        // Keep the projection map in sync with the toggle state. Reusing stale maps is what caused
+        // collapsing / expanding unchanged context to appear non-responsive when the user toggled the
+        // setting without a full reload.
+        if (_tab.IsLoaded)
+        {
+            _inlineMap ??= new DiffDisplayMap(rawInline, collapseContext: _tab.IsContextCollapsed);
+            _inlineMap.SetCollapseContext(_tab.IsContextCollapsed);
+            if (_tab.IsSideBySideDiff)
+            {
+                // Side-by-side hunk spacer/header cells are both empty. Do not materialize them
+                // into editor documents, otherwise every hunk contributes phantom blank rows below
+                // a fold.
+                _sideMap ??= new DiffDisplayMap(sideCollapseSource, collapseContext: _tab.IsContextCollapsed,
+                    includeHunkHeaders: false);
+                _sideMap.SetCollapseContext(_tab.IsContextCollapsed);
+            }
+            else
+            {
+                // Recreate the side projection when the user switches back to it; an empty map
+                // from an inline rebuild must never shadow the real rows.
+                _sideMap = null;
+            }
+        }
+
+        var inlineMap = _inlineMap ?? new DiffDisplayMap(rawInline, collapseContext: _tab.IsContextCollapsed);
+        var sideMap = _tab.IsSideBySideDiff
+            ? _sideMap ?? new DiffDisplayMap(sideCollapseSource, collapseContext: _tab.IsContextCollapsed,
+                includeHunkHeaders: false)
+            : new DiffDisplayMap([], collapseContext: _tab.IsContextCollapsed, includeHunkHeaders: false);
         if (_tab.IsContextCollapsed)
         {
-            // Once the tab is loaded, keep a persistent projection so click-to-expand state
-            // survives rebuilds / mode switches; during loading use throwaway maps (the lines
-            // arrive incrementally and a persistent map would churn on every batch).
-            if (_tab.IsLoaded && _inlineMap is null)
-            {
-                _inlineMap = new DiffDisplayMap(rawInline);
-                _sideMap = new DiffDisplayMap(sideCollapseSource);
-            }
-
-            var inlineMap = _inlineMap ?? new DiffDisplayMap(rawInline);
-            var sideMap = _sideMap ?? new DiffDisplayMap(sideCollapseSource);
-            // Keep hunk headers in the projection as hard folding boundaries, but do not expose
-            // the raw unified-diff "@@ ... @@" metadata in the single-column reading surface.
-            _inlineLines = inlineMap.Lines.Select(line => ToDisplayLine(line, hideHunkHeader: true)).ToArray();
-            _oldLines = sideMap.Lines.Select(line => ToDisplayLine(line, sideBySide.Old)).ToArray();
-            _newLines = sideMap.Lines.Select(line => ToDisplayLine(line, sideBySide.New)).ToArray();
+            // Inline keeps metadata rows for sticky hunk headers; side-by-side drops its empty
+            // spacer/header rows so they cannot become phantom blank editor lines.
+            _inlineLines = inlineMap.Lines.Select(line => line.ToRenderLine(hideHunkHeader: true)).ToArray();
+            _oldLines = sideMap.Lines.Select(line => line.ToRenderLine(sideBySide.Old)).ToArray();
+            _newLines = sideMap.Lines.Select(line => line.ToRenderLine(sideBySide.New)).ToArray();
         }
         else
         {
@@ -1180,9 +1230,21 @@ public partial class DiffDocumentView : UserControl
 
         _sideChangeMask = DiffDocumentBuilders.BuildSideBySideChangeMask(_oldLines, _newLines);
 
-        SetEditorDocument(InlineEditor, _inlineLines);
-        SetEditorDocument(OldEditor, _oldLines);
-        SetEditorDocument(NewEditor, _newLines);
+        // Only the visible layout owns a populated AvalonEdit document. Keeping all three
+        // projections materialized made a 100k-line diff pay for three TextDocument instances,
+        // even though two editors were Collapsed. Switching layout rebuilds the newly visible side.
+        if (_tab.IsInlineDiff)
+        {
+            SetEditorDocument(InlineEditor, _inlineLines);
+            SetEditorDocument(OldEditor, []);
+            SetEditorDocument(NewEditor, []);
+        }
+        else
+        {
+            SetEditorDocument(InlineEditor, []);
+            SetEditorDocument(OldEditor, _oldLines);
+            SetEditorDocument(NewEditor, _newLines);
+        }
         _ = ApplyPresentationAsync();
 
         InstallMargins();
@@ -1201,14 +1263,52 @@ public partial class DiffDocumentView : UserControl
     }
 
     /// <summary>Expands the collapsed-context placeholder under the pointer (VS Code click-to-expand)
-    /// and rebuilds the editors from the persistent projection.</summary>
-    private void OnEditorPreviewMouseDown(object sender, System.Windows.Input.MouseButtonEventArgs e)
+    /// and rebuilds the editors from the persistent projection. This is pane-level because the
+    /// floating hunk-action canvas sits above the editor TextViews in the visual tree.</summary>
+    private void OnDiffPanePreviewMouseDown(object sender, MouseButtonEventArgs e)
     {
-        if (sender is not TextView textView)
+        if (e.ChangedButton != MouseButton.Left || e.Handled)
         {
             return;
         }
 
+        TextEditor? editor;
+        if (ReferenceEquals(sender, InlinePane))
+        {
+            if (InlineHunkActionBar.IsMouseOver || OverviewCanvas.IsMouseOver)
+            {
+                return;
+            }
+
+            editor = InlineEditor;
+        }
+        else if (ReferenceEquals(sender, SideBySidePane))
+        {
+            if (SideHunkActionBar.IsMouseOver || OldOverviewCanvas.IsMouseOver || NewOverviewCanvas.IsMouseOver)
+            {
+                return;
+            }
+
+            var pointer = e.GetPosition(SideBySidePane);
+            var oldOrigin = OldEditor.TransformToAncestor(SideBySidePane).Transform(new Point(0, 0));
+            var newOrigin = NewEditor.TransformToAncestor(SideBySidePane).Transform(new Point(0, 0));
+            var oldBounds = new Rect(oldOrigin, new Size(OldEditor.ActualWidth, OldEditor.ActualHeight));
+            var newBounds = new Rect(newOrigin, new Size(NewEditor.ActualWidth, NewEditor.ActualHeight));
+            editor = oldBounds.Contains(pointer) ? OldEditor
+                : newBounds.Contains(pointer) ? NewEditor
+                : null;
+        }
+        else
+        {
+            return;
+        }
+
+        if (editor is null)
+        {
+            return;
+        }
+
+        var textView = editor.TextArea.TextView;
         var position = textView.GetPositionFloor(e.GetPosition(textView));
         if (position is not { Line: >= 1 } hit)
         {
@@ -1216,8 +1316,8 @@ public partial class DiffDocumentView : UserControl
         }
 
         var displayIndex = hit.Line - 1;
-        var map = ReferenceEquals(textView, InlineEditor.TextArea.TextView) ? _inlineMap : _sideMap;
-        if (map is null || displayIndex >= map.Lines.Count || !map.Lines[displayIndex].IsCollapsedContext)
+        var map = ReferenceEquals(editor, InlineEditor) ? _inlineMap : _sideMap;
+        if (map is null || displayIndex < 0 || displayIndex >= map.Lines.Count || !map.Lines[displayIndex].IsCollapsedContext)
         {
             return;
         }
@@ -1227,22 +1327,6 @@ public partial class DiffDocumentView : UserControl
             RebuildDocuments();
             e.Handled = true;
         }
-    }
-
-    private static DiffRenderLine ToDisplayLine(
-        DiffDisplayLine line,
-        IReadOnlyList<DiffRenderLine>? source = null,
-        bool hideHunkHeader = false)
-    {
-        if (line.IsCollapsedContext)
-        {
-            return new DiffRenderLine(line.Text, GitDiffLineKind.None, null, null);
-        }
-
-        var result = source is null ? line.Source! : source[line.OriginalIndex];
-        return hideHunkHeader && result.Kind == GitDiffLineKind.HunkHeader
-            ? result with { Text = string.Empty }
-            : result;
     }
 
     private static void SetEditorDocument(TextEditor editor, IReadOnlyList<DiffRenderLine> lines)
@@ -1754,6 +1838,7 @@ public partial class DiffDocumentView : UserControl
         private Brush _activeNumberBrush = Brushes.White;
         private Brush _addedGutterBrush = Brushes.Green;
         private Brush _removedGutterBrush = Brushes.Red;
+        private Brush _collapsedContextBrush = Brushes.Gray;
         private int _activeLine = -1;
         // D10: 行号位数缓存。旧实现每次 MeasureOverride 对整份行列表做两次 LINQ 全量扫描;
         // 位数只随行列表实例变化(RebuildDocuments 每次产出新数组,UpdateLines 是唯一换文档
@@ -1818,6 +1903,9 @@ public partial class DiffDocumentView : UserControl
             _activeNumberBrush = _owner.Brush("CodeLineNumberActiveBrush") ?? _numberBrush;
             _addedGutterBrush = _owner.Brush("EditorGutterAddedBrush") ?? Brushes.Green;
             _removedGutterBrush = _owner.Brush("EditorGutterDeletedBrush") ?? Brushes.Red;
+            _collapsedContextBrush = _owner.Brush("DiffPlaceholderForegroundBrush")
+                ?? _owner.Brush("DiffExpandPlaceholderBrush")
+                ?? _numberBrush;
             InvalidateVisual();
         }
 
@@ -1876,6 +1964,11 @@ public partial class DiffDocumentView : UserControl
 
             var fontSize = _owner._tab?.EditorFontSize ?? 14;
             var typeface = new Typeface(_owner.InlineEditor.FontFamily.Source);
+            var iconFamily = _owner.TryFindResource("IconFontFamily") as FontFamily
+                ?? Application.Current?.TryFindResource("IconFontFamily") as FontFamily;
+            var iconTypeface = iconFamily is null
+                ? typeface
+                : new Typeface(iconFamily, FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);
             var visualLines = GetValidVisualLines(view);
             if (visualLines is null)
             {
@@ -1907,7 +2000,30 @@ public partial class DiffDocumentView : UserControl
                 var dip = VisualTreeHelper.GetDpi(this).PixelsPerDip;
                 var oldText = line.OldLineNumber?.ToString() ?? string.Empty;
                 var newText = line.NewLineNumber?.ToString() ?? string.Empty;
-                if (_mode == DiffNumberMode.Both)
+                if (line.IsCollapsedContext)
+                {
+                    // VS Code keeps the expand affordance in the line-number gutter. The prompt
+                    // itself is a single document row, so draw one glyph per number column and
+                    // deliberately do not synthesize old/new line numbers for hidden rows.
+                    if (_mode == DiffNumberMode.Both)
+                    {
+                        var split = HunkActionGutterWidth + (ActualWidth - HunkActionGutterWidth) / 2;
+                        DrawNumberIcon(drawingContext, Codicons.Ellipsis, split - 8, y,
+                            _collapsedContextBrush, iconTypeface, fontSize, dip);
+                        drawingContext.DrawRectangle(
+                            _owner.Brush("DiffEditorBorderBrush") ?? Brushes.Transparent,
+                            null,
+                            new Rect(split, y + 2, 1, Math.Max(1, visualLine.Height - 4)));
+                        DrawNumberIcon(drawingContext, Codicons.Ellipsis, ActualWidth - 6, y,
+                            _collapsedContextBrush, iconTypeface, fontSize, dip);
+                    }
+                    else
+                    {
+                        DrawNumberIcon(drawingContext, Codicons.Ellipsis, ActualWidth - 6, y,
+                            _collapsedContextBrush, iconTypeface, fontSize, dip);
+                    }
+                }
+                else if (_mode == DiffNumberMode.Both)
                 {
                     var split = HunkActionGutterWidth + (ActualWidth - HunkActionGutterWidth) / 2;
                     DrawNumber(drawingContext, oldText, split - 8, y, brush, typeface, fontSize, dip);
@@ -1940,6 +2056,20 @@ public partial class DiffDocumentView : UserControl
             }
         }
 
+        private static void DrawNumberIcon(DrawingContext drawingContext, string glyph, double right,
+            double y, Brush brush, Typeface typeface, double fontSize, double pixelsPerDip)
+        {
+            var formatted = new FormattedText(
+                glyph,
+                System.Globalization.CultureInfo.CurrentUICulture,
+                FlowDirection.LeftToRight,
+                typeface,
+                fontSize,
+                brush,
+                pixelsPerDip);
+            drawingContext.DrawText(formatted, new Point(Math.Max(0, right - formatted.Width), y));
+        }
+
         private static void DrawNumber(DrawingContext drawingContext, string text, double right,
             double y, Brush brush, Typeface typeface, double fontSize, double pixelsPerDip)
         {
@@ -1970,6 +2100,7 @@ public partial class DiffDocumentView : UserControl
         private Brush _modifiedBrush = Brushes.Transparent;
         private Brush _hoverBrush = Brushes.Transparent;
         private Brush _placeholderBrush = Brushes.Transparent;
+        private Brush _placeholderShadowBrush = Brushes.Transparent;
 
         public DiffLineBackgroundRenderer(IReadOnlyList<DiffRenderLine> lines, DiffDocumentView owner, TextView textView)
         {
@@ -1994,11 +2125,44 @@ public partial class DiffDocumentView : UserControl
             _modifiedBrush = OwnerBrush("DiffModifiedBrush", _modifiedBrush);
             _hoverBrush = OwnerBrush("HoverBrush", _hoverBrush);
             _placeholderBrush = OwnerBrush("DiffUnchangedRegionBrush", _placeholderBrush);
+            _placeholderShadowBrush = CreatePlaceholderShadowBrush(_placeholderBrush);
             _textView.InvalidateLayer(Layer);
         }
 
         private Brush OwnerBrush(string key, Brush fallback) =>
             _owner.TryFindResource(key) as Brush ?? Application.Current?.TryFindResource(key) as Brush ?? fallback;
+
+        private static Brush CreatePlaceholderShadowBrush(Brush fill)
+        {
+            var slash = new SolidColorBrush(Color.FromArgb(85, 118, 121, 124));
+            var slashGeometry = new RectangleGeometry(new Rect(4.5, -2, 1, 14))
+            {
+                Transform = new RotateTransform(45, 5, 5),
+            };
+            return new DrawingBrush
+            {
+                TileMode = TileMode.Tile,
+                Viewport = new Rect(0, 0, 10, 10),
+                ViewportUnits = BrushMappingMode.Absolute,
+                Stretch = Stretch.None,
+                Drawing = new DrawingGroup
+                {
+                    Children =
+                    {
+                        new GeometryDrawing
+                        {
+                            Brush = fill,
+                            Geometry = new RectangleGeometry(new Rect(0, 0, 10, 10)),
+                        },
+                        new GeometryDrawing
+                        {
+                            Brush = slash,
+                            Geometry = slashGeometry,
+                        },
+                    },
+                },
+            };
+        }
 
         public void Draw(TextView textView, DrawingContext drawingContext)
         {
@@ -2020,29 +2184,27 @@ public partial class DiffDocumentView : UserControl
                 var kind = line.Kind;
                 // VisualTop is document-space; the background layer draws in viewport space.
                 var y = visualLine.VisualTop - textView.ScrollOffset.Y;
-                if (line.IsModified)
-                {
-                    // 改行(old 删 + new 增的配对):修正着色覆盖纯增删色。
-                    var modifiedRect = new Rect(0, y, textView.ActualWidth, visualLine.Height);
-                    drawingContext.DrawRectangle(_modifiedBrush, null, modifiedRect);
-                    continue;
-                }
-
                 var background = kind switch
                 {
                     GitDiffLineKind.Added => _addedBrush,
                     GitDiffLineKind.Removed => _removedBrush,
                     GitDiffLineKind.HunkHeader => _headerBrush,
+                    // IsModified identifies a paired replacement, but each side still keeps its
+                    // semantic Added/Removed kind. Prefer that side-specific color above; this
+                    // fallback is only for a future modified row without a concrete side kind.
+                    _ when line.IsModified => _modifiedBrush,
                     _ => null,
                 };
 
                 if (background is null)
                 {
-                    // VS Code-style expandable placeholder bar ("… 展开 N 行未更改内容 …").
-                    if (kind == GitDiffLineKind.None && _lines[index].Text.Contains("…"))
+                    // Only a real unmatched side cell gets the VS Code diagonal shadow fill. A
+                    // collapsed context prompt is already the sole visible representative of the
+                    // hidden run; it must stay on the editor's normal background.
+                    if (!line.IsCollapsedContext && DiffDocumentBuilders.IsPlaceholderLine(line))
                     {
                         drawingContext.DrawRectangle(
-                            _placeholderBrush,
+                            line.IsSideBySidePlaceholder ? _placeholderShadowBrush : _placeholderBrush,
                             null,
                             new Rect(0, y, textView.ActualWidth, visualLine.Height));
                     }
@@ -2183,7 +2345,7 @@ public partial class DiffDocumentView : UserControl
             }
 
             // VS Code-style clickable collapsed-context placeholder ("… 展开 N 行未更改内容 …").
-            if (kind == GitDiffLineKind.None && lines[index].Text.Contains("…"))
+            if (lines[index].IsCollapsedContext)
             {
                 var expandBrush = _owner.Brush("DiffPlaceholderForegroundBrush")
                     ?? _owner.Brush("DiffExpandPlaceholderBrush");

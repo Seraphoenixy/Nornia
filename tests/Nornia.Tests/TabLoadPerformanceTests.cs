@@ -421,7 +421,7 @@ internal sealed class GatedFakeGitService : IGitService
     public Task<string> GetDiffRevisionAsync(string repositoryPath, string path, bool staged, bool isUntracked = false, CancellationToken cancellationToken = default) =>
         Task.FromResult("revision-gated");
 
-    public Task<GitRepositoryStatus> GetStatusAsync(string repositoryPath, CancellationToken cancellationToken = default) =>
+    public Task<GitRepositoryStatus> GetStatusAsync(string repositoryPath, CancellationToken cancellationToken = default, bool includeAllUntracked = true) =>
         Task.FromResult(GitRepositoryStatus.NotARepository);
 
     public Task<string> GetRawDiffAsync(string repositoryPath, bool staged, IReadOnlyList<string>? paths = null, CancellationToken cancellationToken = default) =>

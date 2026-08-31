@@ -1797,7 +1797,10 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             return;
         }
 
-        var status = await _gitService.GetStatusAsync(path, cancellationToken);
+        // Watcher refreshes only need the current status shape. Avoid expanding every untracked
+        // directory into every file on each build/save burst; an explicit/full refresh still uses
+        // the detailed all-files form below.
+        var status = await _gitService.GetStatusAsync(path, cancellationToken, includeAllUntracked: false);
         StatusRefreshed?.Invoke(this, status);
         IsRepository = status.IsRepository;
         if (!status.IsRepository)

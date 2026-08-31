@@ -69,6 +69,11 @@ public partial class WorkspaceViewModel : PageViewModel
     /// <summary>Raised when a workspace root changes (the project workbench syncs terminal + git).</summary>
     public event EventHandler<string>? WorkspaceOpened;
 
+    /// <summary>Raised after the watcher identifies a visible workspace change. Consumers such as
+    /// quick open can invalidate their derived file index without subscribing to the native watcher
+    /// directly.</summary>
+    public event EventHandler? WorkspaceFilesChanged;
+
     /// <summary>Raised by the folder picker. The page-level workbench turns this into a shared
     /// project-context activation instead of letting the tree own a separate workspace.</summary>
     public event EventHandler<string>? WorkspaceSelectionRequested;
@@ -108,7 +113,9 @@ public partial class WorkspaceViewModel : PageViewModel
         _workspaceService = workspaceService;
         _clipboard = clipboard;
         _fileWatcher = fileWatcher ?? NullWorkspaceFileWatcher.Instance;
-        _uiContext = SynchronizationContext.Current;
+        _uiContext = SynchronizationContext.Current is System.Windows.Threading.DispatcherSynchronizationContext
+            ? SynchronizationContext.Current
+            : null;
         _fileWatcher.FilesChanged += OnWorkspaceFilesChanged;
         _workspaceService.ContextChanged += OnWorkspaceSettingsChangedAsync;
         _selectionOpenScheduler.Action = RunPendingSelectionOpen;
@@ -645,6 +652,17 @@ public partial class WorkspaceViewModel : PageViewModel
         }
 
         bool hasPending;
+        if (e.IsOverflowed)
+        {
+            // The native event path set is intentionally bounded. A burst overflow means the
+            // precise set is incomplete, so reconcile from the workspace root once instead of
+            // retaining an unbounded managed hash set.
+            lock (_pendingTreeGate)
+            {
+                _pendingTreePaths.Add(root);
+            }
+        }
+
         lock (_pendingTreeGate)
         {
             hasPending = _pendingTreePaths.Count > 0;
@@ -652,6 +670,7 @@ public partial class WorkspaceViewModel : PageViewModel
 
         if (hasPending)
         {
+            WorkspaceFilesChanged?.Invoke(this, EventArgs.Empty);
             StartTreeRefresh(immediate: false);
         }
     }
