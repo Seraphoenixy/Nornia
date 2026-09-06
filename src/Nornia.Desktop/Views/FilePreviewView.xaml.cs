@@ -6,6 +6,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Input;
+using System.Windows.Media;
 using Nornia.Desktop.Markdown;
 
 namespace Nornia.Desktop.Views;
@@ -30,6 +31,9 @@ public partial class FilePreviewView : UserControl
 
     /// <summary>预览控件句柄(集成测试断言跳转结果用;XAML x:Name 字段为私有)。</summary>
     internal MarkdownPreviewView MarkdownViewControl => MarkdownView;
+
+    /// <summary>代码编辑器控件句柄(集成测试断言跳转/居中结果用;XAML x:Name 字段为私有)。</summary>
+    internal CodeDocumentView CodeViewControl => CodeView;
 
     public FilePreviewView()
     {
@@ -556,7 +560,14 @@ public partial class FilePreviewView : UserControl
         while (current is not null)
         {
             if (current is T match) return match;
-            current = System.Windows.Media.VisualTreeHelper.GetParent(current);
+            current = current switch
+            {
+                FrameworkContentElement content => content.Parent ?? ContentOperations.GetParent(content),
+                ContentElement content => ContentOperations.GetParent(content),
+                Visual or System.Windows.Media.Media3D.Visual3D =>
+                    System.Windows.Media.VisualTreeHelper.GetParent(current) ?? LogicalTreeHelper.GetParent(current),
+                _ => LogicalTreeHelper.GetParent(current),
+            };
         }
         return null;
     }

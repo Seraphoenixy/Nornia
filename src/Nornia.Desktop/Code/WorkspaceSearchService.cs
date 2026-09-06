@@ -682,6 +682,34 @@ internal sealed class SimpleGlobCache
         for (var i = 0; i < pattern.Length; i++)
         {
             var character = pattern[i];
+            // Product include/exclude patterns use the conventional recursive glob meaning:
+            // **/ matches zero or more path segments, so **/*.cs includes both a.cs and
+            // src/a.cs. A trailing /** also includes the directory itself (and everything under
+            // it), which is required for patterns such as **/generated/** to prune a walk early.
+            if (character == '/' && i + 2 < pattern.Length && i + 3 == pattern.Length
+                && pattern[i + 1] == '*' && pattern[i + 2] == '*')
+            {
+                builder.Append("(?:/.*)?");
+                i += 2;
+                continue;
+            }
+
+            if (character == '*' && i + 1 < pattern.Length && pattern[i + 1] == '*')
+            {
+                if (i + 2 < pattern.Length && pattern[i + 2] == '/')
+                {
+                    builder.Append("(?:.*/)?");
+                    i += 2;
+                    continue;
+                }
+
+                // A bare ** has the same recursive-anything meaning as the old two-star
+                // translation; consume both stars so the branch is explicit.
+                builder.Append(".*");
+                i++;
+                continue;
+            }
+
             if (character == '\\')
             {
                 if (i + 1 >= pattern.Length)

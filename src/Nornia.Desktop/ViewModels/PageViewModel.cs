@@ -7,6 +7,7 @@ namespace Nornia.Desktop.ViewModels;
 public abstract partial class PageViewModel(string title, IUiLogService logService) : ObservableObject
 {
     private bool _activated;
+    private readonly SemaphoreSlim _activationGate = new(1, 1);
     private CancellationTokenSource? _operationCancellation;
     private int _statusToken;
 
@@ -39,13 +40,24 @@ public abstract partial class PageViewModel(string title, IUiLogService logServi
 
     public async Task ActivateAsync()
     {
-        if (_activated)
+        await _activationGate.WaitAsync();
+        try
         {
-            return;
-        }
+            if (_activated)
+            {
+                return;
+            }
 
-        _activated = true;
-        await OnFirstActivatedAsync();
+            // Publish the one-time flag only after initialization succeeds. A transient
+            // startup failure must leave the page retryable, while the gate prevents two
+            // concurrent activation callers from running initialization twice.
+            await OnFirstActivatedAsync();
+            _activated = true;
+        }
+        finally
+        {
+            _activationGate.Release();
+        }
     }
 
     protected virtual Task OnFirstActivatedAsync() => Task.CompletedTask;
@@ -132,14 +144,23 @@ public abstract partial class PageViewModel(string title, IUiLogService logServi
 
     // Clears the status-bar feedback a few seconds after a terminal state, unless a newer
     // operation has started (guarded by _statusToken). Resumes on the UI sync context.
-    private async void ScheduleStatusClear(int delayMs = 4000)
+    private void ScheduleStatusClear(int delayMs = 4000) => _ = ScheduleStatusClearAsync(delayMs);
+
+    private async Task ScheduleStatusClearAsync(int delayMs)
     {
-        var token = _statusToken;
-        await Task.Delay(delayMs);
-        if (token == _statusToken)
+        try
         {
-            StatusMessage = string.Empty;
-            StatusKind = StatusKind.Info;
+            var token = _statusToken;
+            await Task.Delay(delayMs);
+            if (token == _statusToken)
+            {
+                StatusMessage = string.Empty;
+                StatusKind = StatusKind.Info;
+            }
+        }
+        catch (Exception ex)
+        {
+            LogService.Write("WARNING", $"清理页面状态消息失败：{ex.Message}");
         }
     }
 

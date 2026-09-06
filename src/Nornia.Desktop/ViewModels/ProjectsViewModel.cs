@@ -31,6 +31,9 @@ public partial class ProjectsViewModel : PageViewModel, INavigationTarget
     private readonly IUiPerformanceMetrics? _performanceMetrics;
     private readonly IClipboardService _clipboard;
     private IProjectWorkspaceService? _workspaceService;
+    private readonly SemaphoreSlim _workspaceContextGate = new(1, 1);
+    private ProjectWorkspaceContext? _workspaceContext;
+    private long _workspaceGeneration;
 
     public ProjectsViewModel(
         IEnvironmentProfileService profileService,
@@ -64,6 +67,7 @@ public partial class ProjectsViewModel : PageViewModel, INavigationTarget
         _performanceMetrics = performanceMetrics;
         _clipboard = clipboard ?? NullClipboardService.Instance;
         _workspaceService = workspaceService;
+        _workspaceContext = workspaceService?.Current;
         if (_workspaceService is not null)
         {
             _workspaceService.ContextChanged += ApplyWorkspaceContextAsync;
@@ -110,6 +114,72 @@ public partial class ProjectsViewModel : PageViewModel, INavigationTarget
     /// after opening a project so the catalog and the activity badge stay in sync).</summary>
     public Task RefreshCatalogAsync(CancellationToken cancellationToken = default) => LoadProjectsAsync(cancellationToken);
 
+    private static bool PathsEqual(string? left, string? right)
+    {
+        if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right)) return false;
+        try
+        {
+            var normalizedLeft = Path.GetFullPath(left)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var normalizedRight = Path.GetFullPath(right)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            return string.Equals(normalizedLeft, normalizedRight, StringComparison.OrdinalIgnoreCase);
+        }
+        catch (ArgumentException)
+        {
+            return string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    private bool IsProjectContextCurrent(ProjectWorkspaceContext? context, string path)
+    {
+        if (_workspaceService is null)
+        {
+            return PathsEqual(ProjectPath, path);
+        }
+
+        return ReferenceEquals(_workspaceContext, context)
+            && PathsEqual(ProjectPath, path);
+    }
+
+    private void EnsureProjectContextCurrent(
+        ProjectWorkspaceContext? context,
+        string path,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!IsProjectContextCurrent(context, path))
+        {
+            throw new OperationCanceledException(cancellationToken);
+        }
+    }
+
+    private async Task<bool> RunProjectAsync(
+        string operation,
+        Func<string, ProjectWorkspaceContext?, CancellationToken, Task> action,
+        string recommendedNextStep = "",
+        bool canCancel = true)
+    {
+        await _workspaceContextGate.WaitAsync();
+        try
+        {
+            var context = _workspaceContext;
+            var path = ProjectPath;
+            if (!IsProjectContextCurrent(context, path)) return false;
+
+            return await RunAsync(operation, async cancellationToken =>
+            {
+                EnsureProjectContextCurrent(context, path, cancellationToken);
+                await action(path, context, cancellationToken);
+                EnsureProjectContextCurrent(context, path, cancellationToken);
+            }, recommendedNextStep, canCancel);
+        }
+        finally
+        {
+            _workspaceContextGate.Release();
+        }
+    }
+
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(RemoveProjectCommand))]
     private ProjectAsset? selectedProject;
@@ -144,48 +214,67 @@ public partial class ProjectsViewModel : PageViewModel, INavigationTarget
     [ObservableProperty] private string workflowHint = "1. 选择项目目录  2. 初始化或检查  3. 预览修复计划  4. 确认后应用";
 
     [RelayCommand]
-    private void Browse()
+    private async Task Browse()
     {
         var selected = _folderPicker.PickFolder(ProjectPath);
-        if (selected is not null)
+        if (selected is null)
+        {
+            return;
+        }
+
+        if (_workspaceService is not null)
+        {
+            await _workspaceService.ActivateAsync(selected);
+        }
+        else
         {
             ProjectPath = selected;
             ProjectName = new DirectoryInfo(selected).Name;
-            if (_workspaceService is not null)
-            {
-                _ = _workspaceService.ActivateAsync(selected);
-            }
         }
     }
 
     [RelayCommand(CanExecute = nameof(CanInitialize))]
-    private Task InitializeAsync() => RunAsync("初始化项目环境", async () =>
+    private async Task InitializeAsync()
     {
-        var path = await _profileService.InitializeAsync(ProjectPath, ProjectName);
-        var profile = await _profileService.LoadAsync(ProjectPath);
-        await _projectCatalogService.RegisterAsync(ProjectPath, profile);
-        if (_workspaceService is not null)
+        string? initializedPath = null;
+        ProjectWorkspaceContext? initializedContext = null;
+        var initialized = await RunProjectAsync("初始化项目环境", async (path, context, cancellationToken) =>
         {
-            await _workspaceService.ActivateAsync(ProjectPath);
+            initializedContext = context;
+            initializedPath = path;
+            var createdPath = await _profileService.InitializeAsync(path, ProjectName);
+            var profile = await _profileService.LoadAsync(path, cancellationToken);
+            await _projectCatalogService.RegisterAsync(path, profile);
+            await LoadProjectsAsync(cancellationToken);
+            ProfileSummary = $"已创建 {createdPath}";
+            NotifyProjectCommands();
+        });
+
+        if (initialized && initializedPath is { } path && _workspaceService is not null
+            && ReferenceEquals(_workspaceService.Current, initializedContext)
+            && ReferenceEquals(_workspaceContext, initializedContext))
+        {
+            // Rebind only when the user has not requested another project while initialization was
+            // running; the pending context event must remain the winner otherwise.
+            await _workspaceService.ActivateAsync(path);
         }
-        await LoadProjectsAsync();
-        ProfileSummary = $"已创建 {path}";
-        NotifyProjectCommands();
-    });
+    }
 
     [RelayCommand(CanExecute = nameof(CanInspect))]
-    private Task CheckAsync() => RunAsync("检查项目环境", async cancellationToken =>
+    private Task CheckAsync() => RunProjectAsync("检查项目环境", async (path, context, cancellationToken) =>
     {
-        var (_, runtimes, results) = await EvaluateAsync(cancellationToken);
+        var (_, runtimes, results) = await EvaluateAsync(path, context, cancellationToken);
+        EnsureProjectContextCurrent(context, path, cancellationToken);
         UpdateCheckResults(results, CurrentOperation?.CorrelationId);
         SetRepairPlan(_repairPlanner.CreatePlan(results, runtimes));
         await LoadProjectsAsync(cancellationToken);
     }, "确认项目包含有效的 Nornia.yaml，或查看 Problems。", canCancel: true);
 
     [RelayCommand(CanExecute = nameof(CanPlanRepair))]
-    private Task PlanRepairAsync() => RunAsync("生成修复计划", async cancellationToken =>
+    private Task PlanRepairAsync() => RunProjectAsync("生成修复计划", async (path, context, cancellationToken) =>
     {
-        var (_, runtimes, results) = await EvaluateAsync(cancellationToken);
+        var (_, runtimes, results) = await EvaluateAsync(path, context, cancellationToken);
+        EnsureProjectContextCurrent(context, path, cancellationToken);
         UpdateCheckResults(results, CurrentOperation?.CorrelationId);
         var plan = _repairPlanner.CreatePlan(results, runtimes);
         SetRepairPlan(plan);
@@ -193,9 +282,10 @@ public partial class ProjectsViewModel : PageViewModel, INavigationTarget
     }, "修正无效版本约束后重新生成计划。", canCancel: true);
 
     [RelayCommand(CanExecute = nameof(CanApplyRepair))]
-    private Task ApplyRepairAsync() => RunAsync("应用环境修复", async cancellationToken =>
+    private Task ApplyRepairAsync() => RunProjectAsync("应用环境修复", async (path, context, cancellationToken) =>
     {
-        var (_, runtimes, results) = await EvaluateAsync(cancellationToken);
+        var (_, runtimes, results) = await EvaluateAsync(path, context, cancellationToken);
+        EnsureProjectContextCurrent(context, path, cancellationToken);
         var plan = _repairPlanner.CreatePlan(results, runtimes);
         SetRepairPlan(plan);
         WriteRepairPlan(plan, CurrentOperation?.CorrelationId);
@@ -214,14 +304,17 @@ public partial class ProjectsViewModel : PageViewModel, INavigationTarget
         }
 
         await _repairExecutor.ExecuteAsync(plan.Operations, OperationProgress, cancellationToken);
-        var (_, refreshedRuntimes, refreshedResults) = await EvaluateAsync(cancellationToken);
+        EnsureProjectContextCurrent(context, path, cancellationToken);
+        var (_, refreshedRuntimes, refreshedResults) = await EvaluateAsync(path, context, cancellationToken);
+        EnsureProjectContextCurrent(context, path, cancellationToken);
         UpdateCheckResults(refreshedResults, CurrentOperation?.CorrelationId);
         SetRepairPlan(_repairPlanner.CreatePlan(refreshedResults, refreshedRuntimes));
         await LoadProjectsAsync(cancellationToken);
     }, "查看 Problems，确认包管理器可用后重新生成修复计划。", canCancel: true);
 
     [RelayCommand(CanExecute = nameof(CanOpen))]
-    private Task OpenAsync() => RunAsync("打开项目", () => OpenProjectCoreAsync(ProjectPath));
+    private Task OpenAsync() => RunProjectAsync("打开项目",
+        (path, context, cancellationToken) => OpenProjectCoreAsync(path, context, cancellationToken));
 
     /// <summary>Opens the project in the top-level 资源管理器 page (the Explorer sidebar + terminal
     /// sync); the workspace tree, catalog registration and project workflow stay synchronized.</summary>
@@ -259,19 +352,24 @@ public partial class ProjectsViewModel : PageViewModel, INavigationTarget
         {
             await _workspaceService.ActivateAsync(project.Path);
         }
-        await OpenProjectCoreAsync(project.Path);
+        await OpenProjectCoreAsync(project.Path, _workspaceContext ?? _workspaceService?.Current, cancellationToken: default);
     });
 
-    private async Task OpenProjectCoreAsync(string path)
+    private async Task OpenProjectCoreAsync(
+        string path,
+        ProjectWorkspaceContext? context = null,
+        CancellationToken cancellationToken = default)
     {
-        var settings = await _settingsService.GetSnapshotAsync(new(_workspaceService?.Current?.ProjectPath));
+        cancellationToken.ThrowIfCancellationRequested();
+        var settings = await _settingsService.GetSnapshotAsync(new(context?.ProjectPath ?? path), cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
         await _projectLauncher.OpenAsync(path, settings.Effective(BuiltInSettingsCatalog.ExternalEditor));
-        await _projectCatalogService.RegisterAsync(path, opened: true);
-        await LoadProjectsAsync();
+        await _projectCatalogService.RegisterAsync(path, opened: true, cancellationToken: cancellationToken);
+        await LoadProjectsAsync(cancellationToken);
     }
 
     [RelayCommand]
-    private Task RefreshProjectsAsync() => RunAsync("刷新项目列表", LoadProjectsAsync);
+    private Task RefreshProjectsAsync() => RunAsync("刷新项目列表", cancellationToken => LoadProjectsAsync(cancellationToken));
 
     protected override Task OnFirstActivatedAsync()
     {
@@ -289,11 +387,17 @@ public partial class ProjectsViewModel : PageViewModel, INavigationTarget
         await RefreshProjectsAsync();
     }
 
-    private async Task LoadProjectsAsync(CancellationToken cancellationToken = default)
+    private async Task LoadProjectsAsync(CancellationToken cancellationToken = default, long? expectedGeneration = null)
     {
         var snapshot = await _projectCatalogService.GetAllAsync(cancellationToken);
+        if (expectedGeneration is { } expected && expected != Volatile.Read(ref _workspaceGeneration)) return;
         using var performance = _performanceMetrics?.Begin("projects.list.publish", snapshot.Count, "ui-batch");
         Projects.ReplaceRange(snapshot);
+
+        if (_workspaceContext is { } context)
+        {
+            SelectedProject = snapshot.FirstOrDefault(project => PathsEqual(project.Path, context.ProjectPath));
+        }
 
         OnPropertyChanged(nameof(ProjectCount));
         OnPropertyChanged(nameof(AttentionBadge));
@@ -314,12 +418,19 @@ public partial class ProjectsViewModel : PageViewModel, INavigationTarget
 
     private bool CanCopyAllProjects() => Projects.Count > 0;
 
-    private async Task<(EnvironmentProfile Profile, IReadOnlyList<CoreRuntime> Runtimes, IReadOnlyList<EnvironmentCheckResult> Results)> EvaluateAsync(CancellationToken cancellationToken = default)
+    private async Task<(EnvironmentProfile Profile, IReadOnlyList<CoreRuntime> Runtimes, IReadOnlyList<EnvironmentCheckResult> Results)> EvaluateAsync(
+        string path,
+        ProjectWorkspaceContext? context,
+        CancellationToken cancellationToken = default)
     {
-        var profile = await _profileService.LoadAsync(ProjectPath, cancellationToken);
+        EnsureProjectContextCurrent(context, path, cancellationToken);
+        var profile = await _profileService.LoadAsync(path, cancellationToken);
+        EnsureProjectContextCurrent(context, path, cancellationToken);
         var runtimes = await _inventoryService.RefreshForcedAsync(cancellationToken);
+        EnsureProjectContextCurrent(context, path, cancellationToken);
         var results = _checkEngine.Check(profile, runtimes);
-        await _projectCatalogService.RegisterAsync(ProjectPath, profile, results, runtimes, cancellationToken: cancellationToken);
+        await _projectCatalogService.RegisterAsync(path, profile, results, runtimes, cancellationToken: cancellationToken);
+        EnsureProjectContextCurrent(context, path, cancellationToken);
         return (profile, runtimes, results);
     }
 
@@ -457,13 +568,26 @@ public partial class ProjectsViewModel : PageViewModel, INavigationTarget
             HasAutomaticRepair = false;
             RepairSummary = string.Empty;
             ApplyRepairCommand.NotifyCanExecuteChanged();
-            if (_workspaceService is not null && Directory.Exists(value.Path))
+            if (_workspaceService is not null && Directory.Exists(value.Path)
+                && !PathsEqual(value.Path, _workspaceContext?.ProjectPath))
             {
-                _ = _workspaceService.ActivateAsync(value.Path);
+                _ = ActivateWorkspaceSafelyAsync(value.Path);
             }
         }
 
         NotifyProjectCommands();
+    }
+
+    private async Task ActivateWorkspaceSafelyAsync(string path)
+    {
+        try
+        {
+            await _workspaceService!.ActivateAsync(path);
+        }
+        catch (Exception ex)
+        {
+            LogService.WriteException("ERROR", $"切换工作区失败：{path}", ex);
+        }
     }
 
     partial void OnProjectPathChanged(string value)
@@ -630,21 +754,41 @@ public partial class ProjectsViewModel : PageViewModel, INavigationTarget
 
     private async Task ActivateAndNavigateToExplorerAsync(string path)
     {
-        await _workspaceService!.ActivateAsync(path);
-        _navigationService.Navigate(NavigationTargets.Explorer, (string?)null);
+        try
+        {
+            await _workspaceService!.ActivateAsync(path);
+            _navigationService.Navigate(NavigationTargets.Explorer, (string?)null);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            LogService.Write("ERROR", $"无法打开项目 {path}：{ex.Message}");
+        }
     }
 
     private async Task ApplyWorkspaceContextAsync(ProjectWorkspaceContext? context)
     {
-        if (context is null)
+        var generation = Interlocked.Increment(ref _workspaceGeneration);
+        await _workspaceContextGate.WaitAsync();
+        try
         {
-            ResetRepairState();
-            return;
-        }
+            _workspaceContext = context;
+            if (context is null)
+            {
+                SelectedProject = null;
+                ProjectPath = string.Empty;
+                ProjectName = string.Empty;
+                ResetRepairState();
+                return;
+            }
 
-        ProjectPath = context.ProjectPath;
-        ProjectName = context.Project.Name;
-        ResetRepairState();
-        await LoadProjectsAsync();
+            ProjectPath = context.ProjectPath;
+            ProjectName = context.Project.Name;
+            ResetRepairState();
+            await LoadProjectsAsync(expectedGeneration: generation);
+        }
+        finally
+        {
+            _workspaceContextGate.Release();
+        }
     }
 }

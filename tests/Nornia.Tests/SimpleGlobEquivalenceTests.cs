@@ -7,7 +7,9 @@ namespace Nornia.Tests;
 /// <see cref="FileSystemName.MatchesSimpleExpression"/>) against semantic drift: the precompiled
 /// matcher must agree with the framework on the exact same dialect, including its quirks
 /// (\* = literal star, \? keeps the wildcard, a trailing \ matches zero or one arbitrary
-/// character, leading-* fast path is a plain case-insensitive suffix test).</summary>
+/// character, leading-* fast path is a plain case-insensitive suffix test). The product adds
+/// the conventional recursive **/ path-segment semantics used by the search UI; those vectors
+/// are covered by WorkspaceSearchServiceTests instead of this framework-equivalence suite.</summary>
 public sealed class SimpleGlobEquivalenceTests
 {
     [Fact]
@@ -43,6 +45,7 @@ public sealed class SimpleGlobEquivalenceTests
 
         foreach (var (pattern, name) in cases)
         {
+            if (pattern.Contains("**", StringComparison.Ordinal)) continue;
             var expected = FileSystemName.MatchesSimpleExpression(pattern, name, true);
             var actual = SimpleGlob.Compile(pattern)(name);
             Assert.True(actual == expected,
@@ -62,6 +65,7 @@ public sealed class SimpleGlobEquivalenceTests
         {
             var pattern = RandomString(random, patternAlphabet, 0, 6);
             var name = RandomString(random, nameAlphabet, 0, 5);
+            if (pattern.Contains("**", StringComparison.Ordinal)) continue;
             var expected = FileSystemName.MatchesSimpleExpression(pattern, name, true);
             var actual = SimpleGlob.Compile(pattern)(name);
             if (expected != actual)

@@ -63,6 +63,24 @@ public sealed class WorkspaceSearchServiceTests : IDisposable
     }
 
     [Fact]
+    public async Task SearchAsync_RecursiveGlobIncludesRootAndExcludesRootSubtree()
+    {
+        Directory.CreateDirectory(Path.Combine(_root, "src"));
+        Directory.CreateDirectory(Path.Combine(_root, "generated"));
+        await File.WriteAllTextAsync(Path.Combine(_root, "root.cs"), "needle\n");
+        await File.WriteAllTextAsync(Path.Combine(_root, "src", "nested.cs"), "needle\n");
+        await File.WriteAllTextAsync(Path.Combine(_root, "generated", "ignored.cs"), "needle\n");
+
+        var service = new WorkspaceSearchService(new FakeSettingsService());
+        var results = await CollectAsync(service.SearchAsync(new(
+            _root, "needle", new TextSearchOptions(false, false, false),
+            IncludePattern: "**/*.cs", ExcludePattern: "**/generated/**")));
+
+        Assert.Equal(new[] { "root.cs", "src/nested.cs" },
+            results.Select(result => result.RelativePath).OrderBy(path => path, StringComparer.OrdinalIgnoreCase));
+    }
+
+    [Fact]
     public async Task SearchAsync_SkipsBinaryFilesAndCapsPerFileMatches()
     {
         await File.WriteAllBytesAsync(Path.Combine(_root, "binary.dat"), [65, 0, 66, 0, 67]);

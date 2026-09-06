@@ -1,8 +1,19 @@
 using Markdig;
+using Markdig.Extensions.Abbreviations;
+using Markdig.Extensions.Alerts;
+using Markdig.Extensions.CustomContainers;
+using Markdig.Extensions.DefinitionLists;
+using Markdig.Extensions.Figures;
+using Markdig.Extensions.Footers;
+using Markdig.Extensions.Footnotes;
 using Markdig.Extensions.Mathematics;
 using Markdig.Extensions.Tables;
+using Markdig.Extensions.TaskLists;
+using Markdig.Extensions.SmartyPants;
+using Markdig.Extensions.Yaml;
 using Markdig.Syntax;
 using Markdig.Syntax.Inlines;
+using System.Globalization;
 using System.IO;
 using System.Text;
 using System.Windows;
@@ -18,7 +29,11 @@ using MarkdigInline = Markdig.Syntax.Inlines.Inline;
 using MarkdigTable = Markdig.Extensions.Tables.Table;
 using MarkdigTableCell = Markdig.Extensions.Tables.TableCell;
 using MarkdigTableRow = Markdig.Extensions.Tables.TableRow;
+using MarkdigFigure = Markdig.Extensions.Figures.Figure;
 using WpfBlock = System.Windows.Documents.Block;
+using WpfInline = System.Windows.Documents.Inline;
+using WpfList = System.Windows.Documents.List;
+using WpfListItem = System.Windows.Documents.ListItem;
 using WpfTableCell = System.Windows.Documents.TableCell;
 using WpfTableRow = System.Windows.Documents.TableRow;
 using WpfTable = System.Windows.Documents.Table;
@@ -47,6 +62,8 @@ public sealed record MarkdownLinkRequest(string Url, string BasePath, bool IsIma
 /// 渲染预算随结果对象存活到标签切回源码模式或关闭。</summary>
 public sealed class MarkdownRenderResult
 {
+    private IReadOnlyList<string> _preheatedPaths;
+
     public MarkdownRenderResult(MarkdownDocument document, string sourcePath,
         IReadOnlyList<MarkdownHeading> headings, IReadOnlyList<MarkdownDiagnostic> diagnostics,
         IReadOnlyList<string> imagePaths, MarkdownRenderBudget budget,
@@ -58,7 +75,7 @@ public sealed class MarkdownRenderResult
         Diagnostics = diagnostics;
         ImagePaths = imagePaths;
         Budget = budget;
-        PreheatedPaths = preheatedPaths ?? [];
+        _preheatedPaths = preheatedPaths ?? [];
     }
 
     /// <summary>Markdig AST;渲染完成后可为 null(已分离)。</summary>
@@ -78,10 +95,18 @@ public sealed class MarkdownRenderResult
     /// 初始批次大小与是否走增量渲染(仅调整增量调度,不改变 8MB 字节门控)。</summary>
     public MarkdownRenderBudget Budget { get; }
 
-    /// <summary>本次解析预热时 <c>Acquire</c> 过的图片路径(去重;缓存命中的复用解析为空)——
-    /// 渲染器首处嵌入渲染时逐张"消费"(Acquire 嵌入引用 + Release 预热引用),渲染失败时
-    /// 由视图按此列表整体释放,保证引用计数对称。</summary>
-    internal IReadOnlyList<string> PreheatedPaths { get; }
+    /// <summary>本次解析预热时 <c>Acquire</c> 过的图片路径(去重;缓存命中的复用解析为空)。
+    /// 渲染会话首处嵌入渲染时逐张消费;会话被取消/失败时只释放尚未消费的路径。</summary>
+    internal IReadOnlyList<string> PreheatedPaths => _preheatedPaths;
+
+    /// <summary>把解析期预热引用一次性交给一个渲染会话。一个结果对象可能被公共渲染
+    /// API 重复传入;预热所有权不能因此被重复释放而误伤其他文档的引用。</summary>
+    internal IReadOnlyList<string> TakePreheatedPaths()
+    {
+        var paths = _preheatedPaths;
+        _preheatedPaths = [];
+        return paths;
+    }
 
     public bool HasErrors => Diagnostics.Any(item => item.IsError);
 }
@@ -192,20 +217,39 @@ public sealed class MarkdownPreviewService : IMarkdownPreviewService
             // 首处嵌入渲染时"消费"交接给嵌入引用,渲染失败/文档替换时由视图按
             // PreheatedPaths 对称释放。
             var preheatedPaths = new List<string>();
-            foreach (var uniquePath in imagePaths.Distinct(StringComparer.OrdinalIgnoreCase))
+            try
             {
-                cancellationToken.ThrowIfCancellationRequested();
-                if (MarkdownImageCache.Instance.GetOrLoad(uniquePath) is not null)
+                foreach (var uniquePath in imagePaths.Distinct(StringComparer.OrdinalIgnoreCase))
                 {
-                    MarkdownImageCache.Instance.Acquire(uniquePath);
-                    preheatedPaths.Add(uniquePath);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (MarkdownImageCache.Instance.GetOrLoad(uniquePath) is not null)
+                    {
+                        MarkdownImageCache.Instance.Acquire(uniquePath);
+                        preheatedPaths.Add(uniquePath);
+                    }
                 }
-            }
 
-            var fullPath = Path.GetFullPath(sourcePath);
-            MarkdownParseCache.Instance.Put(source, fullPath, document, headings, imagePaths, budget);
-            return new MarkdownRenderResult(document, fullPath, headings, [], imagePaths, budget, preheatedPaths);
+                var fullPath = Path.GetFullPath(sourcePath);
+                MarkdownParseCache.Instance.Put(source, fullPath, document, headings, imagePaths, budget);
+                return new MarkdownRenderResult(document, fullPath, headings, [], imagePaths, budget, preheatedPaths);
+            }
+            catch
+            {
+                // Cancellation or a later parse/cache failure can happen after only part of the
+                // image set was acquired. The result will never reach the view in this case, so
+                // release the partial preheat ownership here instead of pinning those bitmaps.
+                ReleasePreheatedPaths(preheatedPaths);
+                throw;
+            }
         }, cancellationToken);
+    }
+
+    internal static void ReleasePreheatedPaths(IEnumerable<string> paths)
+    {
+        foreach (var path in paths)
+        {
+            MarkdownImageCache.Instance.Release(path);
+        }
     }
 
     /// <summary>收集文档中全部公式文本(块级 + 行内),与渲染器传给
@@ -327,7 +371,7 @@ internal sealed class MarkdownFormulaCache
 }
 
 /// <summary>M2 Markdown 解析 LRU:键 = 源码 + 绝对路径的内容哈希(FNV-1a 64),
-/// 值 = 已解析 AST + 标题列表 + 图片路径 + 渲染预算。容量 <see cref="MaxEntries"/> 篇
+/// 值 = 已解析 AST + 标题列表 + 图片路径 + 渲染预算。容量同时受篇数和估算字节数限制
 /// (超出逐出最久未用);主题切换/切回预览的重新解析请求在内容未变时直接命中,
 /// 跳过整篇 Markdig 解析。AST 由缓存持有独立引用:标签分离结果对象的 <c>Document</c>
 /// 不影响缓存,缓存逐出也不影响仍在使用的结果包装。</summary>
@@ -336,13 +380,22 @@ internal sealed class MarkdownParseCache
     /// <summary>默认容量(3–5 篇;测试可放大/隔离)。</summary>
     internal static int DefaultMaxEntries = 4;
 
+    /// <summary>解析 AST 是可观的对象图,不能只按篇数限制。该软上限避免少数大 Markdown
+    /// 文档在标签关闭后仍由进程级缓存长期保留大量托管内存。</summary>
+    internal const long DefaultMaxBytes = 32L * 1024 * 1024;
+
     /// <summary>进程级共享缓存;internal 可替换便于测试隔离(替换期间其他解析请求
     /// 只是落到新实例上 miss→全量解析,行为始终正确)。</summary>
     internal static MarkdownParseCache Instance { get; set; } = new();
 
     private readonly int _maxEntries;
+    private readonly long _maxBytes;
 
-    internal MarkdownParseCache(int? maxEntries = null) => _maxEntries = maxEntries ?? DefaultMaxEntries;
+    internal MarkdownParseCache(int? maxEntries = null, long? maxBytes = null)
+    {
+        _maxEntries = Math.Max(1, maxEntries ?? DefaultMaxEntries);
+        _maxBytes = Math.Max(0, maxBytes ?? DefaultMaxBytes);
+    }
 
     internal sealed class Entry
     {
@@ -352,15 +405,22 @@ internal sealed class MarkdownParseCache
         public required IReadOnlyList<MarkdownHeading> Headings { get; init; }
         public required IReadOnlyList<string> ImagePaths { get; init; }
         public required MarkdownRenderBudget Budget { get; init; }
+        public required long EstimatedBytes { get; init; }
     }
 
     private readonly object _gate = new();
     private readonly Dictionary<long, LinkedListNode<Entry>> _entries = new();
     private readonly LinkedList<Entry> _lru = new(); // 尾部 = 最近使用
+    private long _retainedBytes;
 
     internal int Count
     {
         get { lock (_gate) return _entries.Count; }
+    }
+
+    internal long RetainedBytes
+    {
+        get { lock (_gate) return _retainedBytes; }
     }
 
     /// <summary>内容哈希:FNV-1a 64-bit,覆盖源码与绝对路径(图片相对路径解析依赖路径)。</summary>
@@ -417,27 +477,61 @@ internal sealed class MarkdownParseCache
             Headings = headings,
             ImagePaths = imagePaths,
             Budget = budget,
+            EstimatedBytes = EstimateBytes(source, headings, imagePaths),
         };
 
         lock (_gate)
         {
             if (_entries.TryGetValue(entry.Key, out var existing))
             {
+                _retainedBytes -= existing.Value.EstimatedBytes;
+                if (entry.EstimatedBytes > _maxBytes)
+                {
+                    _entries.Remove(entry.Key);
+                    _lru.Remove(existing);
+                    return;
+                }
+
                 existing.Value = entry;
                 _lru.Remove(existing);
                 _lru.AddLast(existing);
+                _retainedBytes += entry.EstimatedBytes;
                 return;
             }
 
-            while (_entries.Count >= _maxEntries)
+            // A single oversized document is useful to the current render but not useful as a
+            // process-wide cache entry; do not evict every smaller entry just to reject it.
+            if (entry.EstimatedBytes > _maxBytes)
+            {
+                return;
+            }
+
+            while (_entries.Count >= _maxEntries
+                || _retainedBytes > _maxBytes - entry.EstimatedBytes)
             {
                 var oldest = _lru.First!;
                 _entries.Remove(oldest.Value.Key);
                 _lru.RemoveFirst();
+                _retainedBytes -= oldest.Value.EstimatedBytes;
             }
 
             _entries[entry.Key] = _lru.AddLast(entry);
+            _retainedBytes += entry.EstimatedBytes;
         }
+    }
+
+    private static long EstimateBytes(
+        string source,
+        IReadOnlyList<MarkdownHeading> headings,
+        IReadOnlyList<string> imagePaths)
+    {
+        // The source is no longer retained separately by the cache, so this is intentionally an
+        // accounting estimate for the UTF-16-like source plus Markdig nodes and small projections.
+        // Being conservative is preferable here: cache misses only cost a reparse.
+        return checked(64L * 1024
+            + (long)source.Length * 8L
+            + (long)headings.Count * 128L
+            + (long)imagePaths.Count * 128L);
     }
 
     internal void Clear()
@@ -446,6 +540,7 @@ internal sealed class MarkdownParseCache
         {
             _entries.Clear();
             _lru.Clear();
+            _retainedBytes = 0;
         }
     }
 }
@@ -484,6 +579,18 @@ internal sealed class MarkdownRenderResources
         }
     }
 
+    /// <summary>渲染会话被替换、取消或提前失败时释放仍未被首处嵌入消费的预热引用。
+    /// 已消费的路径已从集合移除，因而不会与嵌入引用重复释放。</summary>
+    internal void ReleaseUnconsumedPreheatReferences()
+    {
+        foreach (var path in PreheatReferences)
+        {
+            MarkdownImageCache.Instance.Release(path);
+        }
+
+        PreheatReferences.Clear();
+    }
+
     /// <summary>在 UI 线程(渲染会话创建时)一次性解析全部资源;无 Application 时落
     /// 与旧 <c>Resolve</c>/<c>ResolveDouble</c> 相同的缺省值。</summary>
     internal static MarkdownRenderResources Create(IEnumerable<string>? preheatPaths = null)
@@ -514,6 +621,9 @@ public static class MarkdownWpfRenderer
     /// Acquire,由 MarkdownPreviewView 在文档替换/关闭时按结果中的 <c>ImagePaths</c> 对称释放。</summary>
     public static MarkdownImageCache ImageCache { get; } = MarkdownImageCache.Instance;
 
+    // Keep list markers visually separated from item text without changing list indentation.
+    private const double ListMarkerTextGap = 6;
+
     public static FlowDocument Render(MarkdownRenderResult result, Action<MarkdownLinkRequest>? linkAction = null)
     {
         using var session = BeginRender(result, linkAction);
@@ -533,9 +643,28 @@ public static class MarkdownWpfRenderer
         ArgumentNullException.ThrowIfNull(result);
         ArgumentNullException.ThrowIfNull(result.Document,
             "MarkdownRenderResult.Document 已分离:重渲染前请先重新解析(见 FilePreviewTab.BuildMarkdownPreviewAsync)。");
-        // M7: 资源包每次渲染只解析一次(预热引用集合同步交给渲染器逐张消费)。
-        return new MarkdownFlowDocumentRenderSession(result, linkAction,
-            MarkdownRenderResources.Create(result.PreheatedPaths));
+        // M7: 资源包每次渲染只解析一次。预热引用是一次性所有权，不能在同一结果
+        // 被重复渲染时再次释放其他文档持有的缓存引用。
+        var preheatedPaths = result.TakePreheatedPaths();
+        MarkdownRenderResources? resources = null;
+        try
+        {
+            resources = MarkdownRenderResources.Create(preheatedPaths);
+            return new MarkdownFlowDocumentRenderSession(result, linkAction, resources);
+        }
+        catch
+        {
+            if (resources is not null)
+            {
+                resources.ReleaseUnconsumedPreheatReferences();
+            }
+            else
+            {
+                MarkdownPreviewService.ReleasePreheatedPaths(preheatedPaths);
+            }
+
+            throw;
+        }
     }
 
     /// <summary>Incremental FlowDocument builder. The session owns only the Markdig enumerator;
@@ -548,7 +677,7 @@ public static class MarkdownWpfRenderer
         private readonly IEnumerator<MarkdigBlock> _sourceBlocks;
         private readonly Dictionary<HeadingBlock, string> _nameByBlock;
         private IEnumerator<WpfBlock>? _renderedBlocks;
-        private bool _hasSourceBlock;
+        private bool _hasRenderedBlock;
         private bool _disposed;
 
         internal MarkdownFlowDocumentRenderSession(MarkdownRenderResult result, Action<MarkdownLinkRequest>? linkAction,
@@ -590,6 +719,7 @@ public static class MarkdownWpfRenderer
                     var block = _renderedBlocks.Current;
                     Document.Blocks.Add(block);
                     addedBlocks.Add(block);
+                    _hasRenderedBlock = true;
                     added++;
                     continue;
                 }
@@ -598,9 +728,9 @@ public static class MarkdownWpfRenderer
                 _renderedBlocks = null;
                 if (!_sourceBlocks.MoveNext())
                 {
-                    if (!_hasSourceBlock)
+                    if (!_hasRenderedBlock)
                     {
-                        var empty = new Paragraph();
+                        var empty = NewParagraph();
                         Document.Blocks.Add(empty);
                         addedBlocks.Add(empty);
                     }
@@ -610,7 +740,6 @@ public static class MarkdownWpfRenderer
                     return true;
                 }
 
-                _hasSourceBlock = true;
                 _renderedBlocks = RenderBlock(_sourceBlocks.Current, _result.SourcePath, _linkAction, 0, _nameByBlock, Resources).GetEnumerator();
             }
 
@@ -624,6 +753,7 @@ public static class MarkdownWpfRenderer
             _disposed = true;
             _renderedBlocks?.Dispose();
             _sourceBlocks.Dispose();
+            Resources.ReleaseUnconsumedPreheatReferences();
         }
 
         private static FlowDocument CreateDocument(MarkdownRenderResources resources)
@@ -635,6 +765,10 @@ public static class MarkdownWpfRenderer
                 FontSize = resources.BodyFontSize,
                 Foreground = resources.TextBrush,
                 LineHeight = resources.BodyFontSize * 1.55,
+                // The application contains centered TextBlock styles for badges and empty
+                // states. Do not let a style inherited by a FlowDocument change the reading
+                // surface's default alignment.
+                TextAlignment = TextAlignment.Left,
             };
         }
 
@@ -699,6 +833,15 @@ public static class MarkdownWpfRenderer
                 // Lines 中——读旧属性会把代码块渲染成只剩语言名一行。
                 yield return BuildCodeBlock(fenced.Lines, fenced.Info ?? string.Empty, resources);
                 yield break;
+            case YamlFrontMatterBlock:
+                // Front matter is document metadata, not rendered Markdown content.
+                yield break;
+            case CodeBlock code:
+                // Indented code blocks are represented by Markdig as the base CodeBlock
+                // type. Keeping them on the same path as fenced code preserves whitespace
+                // and avoids falling back to the AST's diagnostic string.
+                yield return BuildCodeBlock(code.Lines, string.Empty, resources);
+                yield break;
             case ThematicBreakBlock:
             {
                 var rule = NewParagraph();
@@ -708,46 +851,97 @@ public static class MarkdownWpfRenderer
                 yield return rule;
                 yield break;
             }
+            case AlertBlock alert:
+            {
+                var first = true;
+                foreach (var child in alert)
+                {
+                    foreach (var rendered in RenderBlock(child, sourcePath, linkAction, depth + 1, nameByBlock, resources))
+                    {
+                        ApplyQuoteStyle(rendered, resources);
+                        if (first && rendered is Paragraph paragraph)
+                        {
+                            var kind = alert.Kind.ToString().Trim();
+                            if (!string.IsNullOrEmpty(kind))
+                            {
+                                InsertInlineAtStart(paragraph, new Run($"[{kind}] ")
+                                {
+                                    FontWeight = FontWeights.Bold,
+                                    Foreground = resources.BrightTextBrush,
+                                });
+                            }
+                        }
+
+                        first = false;
+                        yield return rendered;
+                    }
+                }
+
+                yield break;
+            }
             case QuoteBlock quote:
             {
                 foreach (var child in quote)
                 {
                     foreach (var rendered in RenderBlock(child, sourcePath, linkAction, depth + 1, nameByBlock, resources))
                     {
-                        rendered.Margin = new Thickness(12, 2, 0, 2);
-                        rendered.Foreground = resources.MutedTextBrush;
+                        ApplyQuoteStyle(rendered, resources);
                         yield return rendered;
                     }
                 }
                 yield break;
             }
             case ListBlock list:
-            {
-                var itemIndex = 0;
-                foreach (ListItemBlock item in list)
-                {
-                    var first = true;
-                    foreach (var child in item)
-                    {
-                        foreach (var rendered in RenderBlock(child, sourcePath, linkAction, depth + 1, nameByBlock, resources))
-                        {
-                            rendered.Margin = new Thickness(18, 1, 0, 1);
-                            if (first && rendered is Paragraph paragraph)
-                            {
-                                var marker = list.IsOrdered ? $"{list.OrderedStart ?? (itemIndex + 1).ToString()}. " : "• ";
-                                paragraph.Inlines.InsertBefore(paragraph.Inlines.FirstInline, new Run(marker)
-                                {
-                                    Foreground = resources.MutedTextBrush,
-                                });
-                            }
-                            yield return rendered;
-                            first = false;
-                        }
-                    }
-                    itemIndex++;
-                }
+                yield return BuildList(list, sourcePath, linkAction, depth, nameByBlock, resources);
                 yield break;
-            }
+            case DefinitionList definitions:
+                foreach (var rendered in BuildDefinitionList(definitions, sourcePath, linkAction, depth, nameByBlock, resources))
+                {
+                    yield return rendered;
+                }
+
+                yield break;
+            case FootnoteGroup footnotes:
+                foreach (var rendered in BuildFootnotes(footnotes, sourcePath, linkAction, depth, nameByBlock, resources))
+                {
+                    yield return rendered;
+                }
+
+                yield break;
+            case MarkdigFigure figure:
+                foreach (var rendered in BuildFigure(figure, sourcePath, linkAction, depth, nameByBlock, resources))
+                {
+                    yield return rendered;
+                }
+
+                yield break;
+            case FooterBlock footer:
+                foreach (var child in footer)
+                {
+                    foreach (var rendered in RenderBlock(child, sourcePath, linkAction, depth + 1, nameByBlock, resources))
+                    {
+                        rendered.Margin = new Thickness(12, 2, 0, 2);
+                        yield return rendered;
+                    }
+                }
+
+                yield break;
+            case CustomContainer customContainer:
+                foreach (var child in customContainer)
+                {
+                    foreach (var rendered in RenderBlock(child, sourcePath, linkAction, depth + 1, nameByBlock, resources))
+                    {
+                        rendered.Margin = new Thickness(12, 2, 0, 2);
+                        yield return rendered;
+                    }
+                }
+
+                yield break;
+            case LinkReferenceDefinitionGroup:
+            case LinkReferenceDefinition:
+                // Reference definitions provide lookup data to the parser and have no
+                // visible representation in a Markdown document.
+                yield break;
             case MarkdigTable table:
                 yield return BuildTable(table, sourcePath, linkAction, depth, nameByBlock, resources);
                 yield break;
@@ -760,6 +954,227 @@ public static class MarkdownWpfRenderer
         }
     }
 
+    private static WpfList BuildList(ListBlock source, string sourcePath,
+        Action<MarkdownLinkRequest>? linkAction, int depth, Dictionary<HeadingBlock, string> nameByBlock,
+        MarkdownRenderResources resources)
+    {
+        var list = new WpfList
+        {
+            MarkerStyle = source.IsOrdered ? GetOrderedMarkerStyle(source) : GetBulletMarkerStyle(depth),
+            MarkerOffset = ListMarkerTextGap,
+            Margin = new Thickness(18, 2, 0, 6),
+            Padding = new Thickness(0),
+            TextAlignment = TextAlignment.Left,
+        };
+        if (source.IsOrdered)
+        {
+            // WPF owns marker layout and numbering. The old renderer inserted the same
+            // OrderedStart string into every paragraph, so `3.`, `3.` was produced instead
+            // of `3.`, `4.`. StartIndex lets WPF increment the marker for every item.
+            list.StartIndex = GetOrderedStart(source);
+        }
+
+        foreach (ListItemBlock sourceItem in source)
+        {
+            var item = new WpfListItem
+            {
+                Margin = new Thickness(0, 1, 0, 1),
+                Padding = new Thickness(0),
+                TextAlignment = TextAlignment.Left,
+            };
+
+            foreach (var child in sourceItem)
+            {
+                foreach (var rendered in RenderBlock(child, sourcePath, linkAction, depth + 1, nameByBlock, resources))
+                {
+                    if (rendered is Paragraph paragraph)
+                    {
+                        paragraph.Margin = new Thickness(0, source.IsLoose ? 3 : 1, 0, source.IsLoose ? 3 : 1);
+                    }
+
+                    item.Blocks.Add(rendered);
+                }
+            }
+
+            // WPF ListItem requires a block even for an empty Markdown item. Keep the
+            // item visible and make its text surface obey the preview's left alignment.
+            if (item.Blocks.Count == 0)
+            {
+                item.Blocks.Add(NewParagraph());
+            }
+
+            list.ListItems.Add(item);
+        }
+
+        return list;
+    }
+
+    private static IEnumerable<WpfBlock> BuildDefinitionList(DefinitionList source, string sourcePath,
+        Action<MarkdownLinkRequest>? linkAction, int depth, Dictionary<HeadingBlock, string> nameByBlock,
+        MarkdownRenderResources resources)
+    {
+        foreach (DefinitionItem item in source)
+        {
+            foreach (var child in item)
+            {
+                if (child is DefinitionTerm term)
+                {
+                    var paragraph = NewParagraph();
+                    paragraph.FontWeight = FontWeights.Bold;
+                    paragraph.Margin = new Thickness(0, 4, 0, 1);
+                    AppendInline(paragraph, term.Inline, sourcePath, linkAction, resources);
+                    yield return paragraph;
+                    continue;
+                }
+
+                foreach (var rendered in RenderBlock(child, sourcePath, linkAction, depth + 1, nameByBlock, resources))
+                {
+                    rendered.Margin = new Thickness(18, 1, 0, 1);
+                    yield return rendered;
+                }
+            }
+        }
+    }
+
+    private static IEnumerable<WpfBlock> BuildFootnotes(FootnoteGroup source, string sourcePath,
+        Action<MarkdownLinkRequest>? linkAction, int depth, Dictionary<HeadingBlock, string> nameByBlock,
+        MarkdownRenderResources resources)
+    {
+        foreach (Footnote footnote in source)
+        {
+            var section = new Section
+            {
+                Margin = new Thickness(0, 5, 0, 5),
+                Padding = new Thickness(8, 4, 0, 4),
+                BorderBrush = resources.BorderBrush,
+                BorderThickness = new Thickness(1, 0, 0, 0),
+                TextAlignment = TextAlignment.Left,
+            };
+            var prefixAdded = false;
+            foreach (var child in footnote)
+            {
+                foreach (var rendered in RenderBlock(child, sourcePath, linkAction, depth + 1, nameByBlock, resources))
+                {
+                    if (!prefixAdded && rendered is Paragraph paragraph)
+                    {
+                        InsertInlineAtStart(paragraph, new Run($"{GetFootnoteNumber(footnote)}. ")
+                        {
+                            FontWeight = FontWeights.Bold,
+                            Foreground = resources.MutedTextBrush,
+                        });
+                        prefixAdded = true;
+                    }
+
+                    rendered.Margin = new Thickness(0, 1, 0, 1);
+                    section.Blocks.Add(rendered);
+                }
+            }
+
+            if (!prefixAdded)
+            {
+                var empty = NewParagraph();
+                InsertInlineAtStart(empty, new Run($"{GetFootnoteNumber(footnote)}. ")
+                {
+                    FontWeight = FontWeights.Bold,
+                    Foreground = resources.MutedTextBrush,
+                });
+                section.Blocks.Add(empty);
+            }
+
+            yield return section;
+        }
+    }
+
+    private static IEnumerable<WpfBlock> BuildFigure(MarkdigFigure source, string sourcePath,
+        Action<MarkdownLinkRequest>? linkAction, int depth, Dictionary<HeadingBlock, string> nameByBlock,
+        MarkdownRenderResources resources)
+    {
+        var section = new Section
+        {
+            Margin = new Thickness(0, 6, 0, 8),
+            TextAlignment = TextAlignment.Left,
+        };
+        foreach (var child in source)
+        {
+            if (child is FigureCaption caption)
+            {
+                var paragraph = NewParagraph();
+                paragraph.FontStyle = FontStyles.Italic;
+                paragraph.Foreground = resources.MutedTextBrush;
+                paragraph.Margin = new Thickness(0, 2, 0, 2);
+                AppendInline(paragraph, caption.Inline, sourcePath, linkAction, resources);
+                section.Blocks.Add(paragraph);
+                continue;
+            }
+
+            foreach (var rendered in RenderBlock(child, sourcePath, linkAction, depth + 1, nameByBlock, resources))
+            {
+                section.Blocks.Add(rendered);
+            }
+        }
+
+        if (section.Blocks.Count == 0)
+        {
+            section.Blocks.Add(NewParagraph());
+        }
+
+        yield return section;
+    }
+
+    private static void ApplyQuoteStyle(WpfBlock block, MarkdownRenderResources resources)
+    {
+        block.Margin = new Thickness(12, 2, 0, 2);
+        block.Foreground = resources.MutedTextBrush;
+        if (block is Paragraph paragraph)
+        {
+            paragraph.Padding = new Thickness(8, 0, 0, 0);
+            paragraph.BorderBrush = resources.BorderBrush;
+            paragraph.BorderThickness = new Thickness(2, 0, 0, 0);
+        }
+    }
+
+    private static int GetOrderedStart(ListBlock source)
+    {
+        if (int.TryParse(source.OrderedStart, NumberStyles.Integer, CultureInfo.InvariantCulture, out var start)
+            && start > 0)
+        {
+            return start;
+        }
+
+        var first = source.OfType<ListItemBlock>().FirstOrDefault();
+        return first?.Order > 0 ? first.Order : 1;
+    }
+
+    private static TextMarkerStyle GetBulletMarkerStyle(int depth) => (depth % 3) switch
+    {
+        0 => TextMarkerStyle.Disc,
+        1 => TextMarkerStyle.Circle,
+        _ => TextMarkerStyle.Square,
+    };
+
+    private static TextMarkerStyle GetOrderedMarkerStyle(ListBlock source) => source.BulletType switch
+    {
+        'a' => TextMarkerStyle.LowerLatin,
+        'A' => TextMarkerStyle.UpperLatin,
+        'i' => TextMarkerStyle.LowerRoman,
+        'I' => TextMarkerStyle.UpperRoman,
+        _ => TextMarkerStyle.Decimal,
+    };
+
+    private static int GetFootnoteNumber(Footnote footnote) => footnote.Order > 0 ? footnote.Order : 1;
+
+    private static void InsertInlineAtStart(Paragraph paragraph, WpfInline inline)
+    {
+        if (paragraph.Inlines.FirstInline is { } first)
+        {
+            paragraph.Inlines.InsertBefore(first, inline);
+        }
+        else
+        {
+            paragraph.Inlines.Add(inline);
+        }
+    }
+
     private static WpfTable BuildTable(MarkdigTable source, string sourcePath, Action<MarkdownLinkRequest>? linkAction,
         int depth, Dictionary<HeadingBlock, string> nameByBlock, MarkdownRenderResources resources)
     {
@@ -769,6 +1184,7 @@ public static class MarkdownWpfRenderer
             BorderBrush = resources.BorderBrush,
             BorderThickness = new Thickness(1),
             Margin = new Thickness(0, 6, 0, 8),
+            TextAlignment = TextAlignment.Left,
         };
         var group = new TableRowGroup();
         table.RowGroups.Add(group);
@@ -776,21 +1192,51 @@ public static class MarkdownWpfRenderer
         {
             var row = new WpfTableRow();
             group.Rows.Add(row);
+            var fallbackColumnIndex = 0;
             foreach (MarkdigTableCell sourceCell in sourceRow)
             {
-                var cell = new WpfTableCell { Padding = new Thickness(7, 4, 7, 4) };
+                // Pipe tables in Markdig leave ColumnIndex at -1; grid tables populate it.
+                // Track the logical position as a fallback so alignment remains correct for
+                // both table syntaxes and for cells with a column span.
+                var columnIndex = sourceCell.ColumnIndex >= 0 ? sourceCell.ColumnIndex : fallbackColumnIndex;
+                var columnSpan = Math.Max(1, sourceCell.ColumnSpan);
+                var alignment = GetTableAlignment(source, columnIndex);
+                var cell = new WpfTableCell
+                {
+                    Padding = new Thickness(7, 4, 7, 4),
+                    TextAlignment = alignment,
+                    ColumnSpan = columnSpan,
+                    RowSpan = Math.Max(1, sourceCell.RowSpan),
+                };
                 if (sourceRow.IsHeader) cell.FontWeight = FontWeights.Bold;
                 foreach (var child in sourceCell)
                 {
                     foreach (var rendered in RenderBlock(child, sourcePath, linkAction, depth + 1, nameByBlock, resources))
                     {
+                        rendered.TextAlignment = alignment;
                         cell.Blocks.Add(rendered);
                     }
                 }
                 row.Cells.Add(cell);
+                fallbackColumnIndex += columnSpan;
             }
         }
         return table;
+    }
+
+    private static TextAlignment GetTableAlignment(MarkdigTable source, int columnIndex)
+    {
+        if (columnIndex < 0 || columnIndex >= source.ColumnDefinitions.Count)
+        {
+            return TextAlignment.Left;
+        }
+
+        return source.ColumnDefinitions[columnIndex].Alignment switch
+        {
+            TableColumnAlign.Center => TextAlignment.Center,
+            TableColumnAlign.Right => TextAlignment.Right,
+            _ => TextAlignment.Left,
+        };
     }
 
     /// <summary>M8: 代码块每 <see cref="CodeRunLineBatch"/> 行合并为一个 Run(Run 文本内嵌
@@ -883,35 +1329,138 @@ public static class MarkdownWpfRenderer
     private static void AppendInline(Paragraph target, ContainerInline? container, string sourcePath,
         Action<MarkdownLinkRequest>? linkAction, MarkdownRenderResources resources)
     {
-        if (container is null) return;
-        for (var inline = container.FirstChild; inline is not null; inline = inline.NextSibling)
+        if (container is not null)
         {
-            AppendOne(target, inline, sourcePath, linkAction, resources);
+            AppendInlineCore(target.Inlines, container, sourcePath, linkAction, resources);
         }
     }
 
-    private static void AppendOne(Paragraph target, MarkdigInline inline, string sourcePath,
+    private static void AppendInlineCore(InlineCollection target, ContainerInline container, string sourcePath,
+        Action<MarkdownLinkRequest>? linkAction, MarkdownRenderResources resources)
+    {
+        var htmlScopes = new Stack<HtmlSpanScope>();
+        for (var inline = container.FirstChild; inline is not null; inline = inline.NextSibling)
+        {
+            if (inline is HtmlInline html
+                && TryParseSafeHtmlTag(html.Tag, out var tagName, out var isClosing, out var isSelfClosing))
+            {
+                var activeTarget = htmlScopes.Count == 0 ? target : htmlScopes.Peek().Span.Inlines;
+                if (tagName.Equals("br", StringComparison.Ordinal))
+                {
+                    activeTarget.Add(new LineBreak());
+                    continue;
+                }
+
+                if (isClosing)
+                {
+                    if (htmlScopes.Count > 0
+                        && htmlScopes.Peek().Name.Equals(tagName, StringComparison.Ordinal))
+                    {
+                        var closed = htmlScopes.Pop().Span;
+                        var parentTarget = htmlScopes.Count == 0 ? target : htmlScopes.Peek().Span.Inlines;
+                        parentTarget.Add(closed);
+                    }
+                    else
+                    {
+                        // Preserve malformed or mismatched HTML as source text instead of
+                        // silently losing content.
+                        activeTarget.Add(new Run(html.Tag));
+                    }
+
+                    continue;
+                }
+
+                if (!isSelfClosing)
+                {
+                    htmlScopes.Push(new HtmlSpanScope(tagName, CreateHtmlSpan(tagName, resources)));
+                }
+
+                continue;
+            }
+
+            var currentTarget = htmlScopes.Count == 0 ? target : htmlScopes.Peek().Span.Inlines;
+            AppendOne(currentTarget, inline, sourcePath, linkAction, resources);
+        }
+
+        // Forgiving HTML handling: render the content of an unclosed safe tag and keep the
+        // document usable. Unknown/unsafe tags never enter this stack and remain escaped text.
+        while (htmlScopes.Count > 0)
+        {
+            var closed = htmlScopes.Pop().Span;
+            var parentTarget = htmlScopes.Count == 0 ? target : htmlScopes.Peek().Span.Inlines;
+            parentTarget.Add(closed);
+        }
+    }
+
+    private static void AppendOne(InlineCollection target, MarkdigInline inline, string sourcePath,
         Action<MarkdownLinkRequest>? linkAction, MarkdownRenderResources resources)
     {
         switch (inline)
         {
+            case AbbreviationInline abbreviation:
+            {
+                var label = abbreviation.Abbreviation?.Label ?? string.Empty;
+                target.Add(new Run(label));
+                break;
+            }
+            case SmartyPant smarty:
+                target.Add(new Run(GetSmartyPantText(smarty.Type)));
+                break;
+            case TaskList task:
+            {
+                // TaskList is an inline node in Markdig. Rendering the marker as a disabled
+                // checkbox keeps the item text in the same paragraph and avoids the old raw
+                // `[ ]`/`[x]` fallback while keeping the preview read-only.
+                target.Add(new InlineUIContainer(new CheckBox
+                {
+                    IsChecked = task.Checked,
+                    IsEnabled = false,
+                    IsHitTestVisible = false,
+                    Focusable = false,
+                    IsTabStop = false,
+                    Width = 13,
+                    Height = 13,
+                    Margin = new Thickness(0, 0, 4, 0),
+                    VerticalAlignment = VerticalAlignment.Center,
+                }));
+                break;
+            }
+            case HtmlEntityInline entity:
+                target.Add(new Run(entity.Transcoded.ToString()));
+                break;
             case LiteralInline literal:
-                target.Inlines.Add(new Run(literal.Content.ToString()));
+                target.Add(new Run(literal.Content.ToString()));
                 break;
             case CodeInline code:
-                target.Inlines.Add(new Span(new Run(code.Content))
+                target.Add(new Span(new Run(code.Content))
                 {
                     Background = resources.InputBrush,
                     FontFamily = resources.MonoFontFamily,
                 });
                 break;
             case MathInline math:
-                target.Inlines.Add(new InlineUIContainer(CreateFormulaElement(
+                target.Add(new InlineUIContainer(CreateFormulaElement(
                     math.Content.ToString(), resources.BodyFontSize, false, resources)));
                 break;
             case LineBreakInline:
-                target.Inlines.Add(new LineBreak());
+                target.Add(new LineBreak());
                 break;
+            case FootnoteLink footnote:
+            {
+                var number = footnote.Index > 0 ? footnote.Index : GetFootnoteNumber(footnote.Footnote);
+                var text = footnote.IsBackLink ? "↩" : $"[{number.ToString(CultureInfo.InvariantCulture)}]";
+                var reference = new Hyperlink(new Run(text)
+                {
+                    BaselineAlignment = BaselineAlignment.Superscript,
+                })
+                {
+                    Foreground = resources.LinkBrush,
+                    ToolTip = $"脚注 {number.ToString(CultureInfo.InvariantCulture)}",
+                };
+                reference.TextDecorations = TextDecorations.Underline;
+                target.Add(reference);
+                break;
+            }
             case AutolinkInline auto:
                 AddLink(target, auto.Url, auto.Url, sourcePath, linkAction, resources);
                 break;
@@ -929,12 +1478,9 @@ public static class MarkdownWpfRenderer
                 }
                 else
                 {
-                    for (var child = link.FirstChild; child is not null; child = child.NextSibling)
-                    {
-                        AppendOne(hyperlink, child, sourcePath, linkAction, resources);
-                    }
+                    AppendInlineCore(hyperlink.Inlines, link, sourcePath, linkAction, resources);
                 }
-                target.Inlines.Add(hyperlink);
+                target.Add(hyperlink);
                 break;
             }
             case EmphasisInline emphasis:
@@ -945,55 +1491,39 @@ public static class MarkdownWpfRenderer
                     FontStyle = emphasis.DelimiterCount == 1 ? FontStyles.Italic : FontStyles.Normal,
                 };
                 if (emphasis.DelimiterChar == '~') span.TextDecorations = TextDecorations.Strikethrough;
-                for (var child = emphasis.FirstChild; child is not null; child = child.NextSibling)
-                {
-                    AppendOne(span, child, sourcePath, linkAction, resources);
-                }
-                target.Inlines.Add(span);
+                AppendInlineCore(span.Inlines, emphasis, sourcePath, linkAction, resources);
+                target.Add(span);
                 break;
             }
             case ContainerInline nested:
-                AppendInline(target, nested, sourcePath, linkAction, resources);
+                AppendInlineCore(target, nested, sourcePath, linkAction, resources);
                 break;
             case HtmlInline html:
-                if (html.Tag.Trim().Equals("<br>", StringComparison.OrdinalIgnoreCase)
-                    || html.Tag.Trim().Equals("<br/>", StringComparison.OrdinalIgnoreCase))
+                if (IsHtmlLineBreak(html.Tag))
                 {
-                    target.Inlines.Add(new LineBreak());
+                    target.Add(new LineBreak());
                 }
-                else if (!IsSafeHtmlTag(html.Tag))
+                else
                 {
-                    target.Inlines.Add(new Run(html.Tag));
+                    target.Add(new Run(html.Tag));
                 }
                 break;
             default:
-                target.Inlines.Add(new Run(inline.ToString() ?? string.Empty));
+                target.Add(new Run(inline.ToString() ?? string.Empty));
                 break;
         }
     }
 
-    private static void AppendOne(Span target, MarkdigInline inline, string sourcePath,
-        Action<MarkdownLinkRequest>? linkAction, MarkdownRenderResources resources)
-    {
-        var paragraph = new Paragraph();
-        AppendOne(paragraph, inline, sourcePath, linkAction, resources);
-        foreach (var child in paragraph.Inlines.ToArray())
-        {
-            paragraph.Inlines.Remove(child);
-            target.Inlines.Add(child);
-        }
-    }
-
-    private static void AddLink(Paragraph target, string? label, string? url, string sourcePath,
+    private static void AddLink(InlineCollection target, string? label, string? url, string sourcePath,
         Action<MarkdownLinkRequest>? linkAction, MarkdownRenderResources resources)
     {
         var hyperlink = new Hyperlink(new Run(label ?? url ?? string.Empty)) { Foreground = resources.LinkBrush };
         hyperlink.TextDecorations = TextDecorations.Underline;
         hyperlink.Click += (_, _) => linkAction?.Invoke(new(url ?? string.Empty, sourcePath, false));
-        target.Inlines.Add(hyperlink);
+        target.Add(hyperlink);
     }
 
-    private static void AddImage(Paragraph target, string? url, string? alt, string sourcePath,
+    private static void AddImage(InlineCollection target, string? url, string? alt, string sourcePath,
         Action<MarkdownLinkRequest>? linkAction, MarkdownRenderResources resources)
     {
         if (MarkdownPreviewService.TryResolveLocalImage(url, sourcePath, out var imagePath)
@@ -1005,13 +1535,125 @@ public static class MarkdownWpfRenderer
             // 保持 预热 1 + 嵌入 N → 嵌入 N 的引用对称,且渲染全程条目不可被 LRU 逐出。
             resources.ConsumePreheatReference(imagePath);
             var imageControl = new Image { Source = image, MaxWidth = 720, MaxHeight = 480, Stretch = Stretch.Uniform };
-            target.Inlines.Add(new InlineUIContainer(imageControl));
+            target.Add(new InlineUIContainer(imageControl));
             return;
         }
 
         var fallback = new Hyperlink(new Run($"[图片: {alt ?? url ?? "未知"}]") { Foreground = resources.MutedTextBrush });
         fallback.Click += (_, _) => linkAction?.Invoke(new(url ?? string.Empty, sourcePath, true, alt));
-        target.Inlines.Add(fallback);
+        target.Add(fallback);
+    }
+
+    private sealed record HtmlSpanScope(string Name, Span Span);
+
+    private static Span CreateHtmlSpan(string tagName, MarkdownRenderResources resources)
+    {
+        var span = new Span();
+        switch (tagName)
+        {
+            case "b":
+            case "strong":
+                span.FontWeight = FontWeights.Bold;
+                break;
+            case "em":
+            case "i":
+                span.FontStyle = FontStyles.Italic;
+                break;
+            case "del":
+            case "s":
+            case "strike":
+                span.TextDecorations = TextDecorations.Strikethrough;
+                break;
+            case "ins":
+            case "u":
+                span.TextDecorations = TextDecorations.Underline;
+                break;
+            case "code":
+            case "kbd":
+                span.Background = resources.InputBrush;
+                span.FontFamily = resources.MonoFontFamily;
+                break;
+            case "mark":
+                span.Background = resources.InputBrush;
+                break;
+            case "sub":
+                span.BaselineAlignment = BaselineAlignment.Subscript;
+                span.FontSize = resources.BodyFontSize * 0.8;
+                break;
+            case "sup":
+                span.BaselineAlignment = BaselineAlignment.Superscript;
+                span.FontSize = resources.BodyFontSize * 0.8;
+                break;
+            case "small":
+                span.FontSize = resources.BodyFontSize * 0.85;
+                break;
+            case "big":
+                span.FontSize = resources.BodyFontSize * 1.15;
+                break;
+        }
+
+        return span;
+    }
+
+    private static string GetSmartyPantText(SmartyPantType type) => type switch
+    {
+        SmartyPantType.LeftQuote => "‘",
+        SmartyPantType.RightQuote => "’",
+        SmartyPantType.LeftDoubleQuote => "“",
+        SmartyPantType.RightDoubleQuote => "”",
+        SmartyPantType.LeftAngleQuote => "«",
+        SmartyPantType.RightAngleQuote => "»",
+        SmartyPantType.Ellipsis => "…",
+        SmartyPantType.Dash2 => "–",
+        SmartyPantType.Dash3 => "—",
+        SmartyPantType.DoubleQuote => "\"",
+        SmartyPantType.Quote => "'",
+        _ => string.Empty,
+    };
+
+    private static bool TryParseSafeHtmlTag(string rawTag, out string tagName,
+        out bool isClosing, out bool isSelfClosing)
+    {
+        tagName = string.Empty;
+        isClosing = false;
+        isSelfClosing = false;
+        var tag = rawTag.Trim();
+        if (tag.Length < 3 || tag[0] != '<' || tag[^1] != '>')
+        {
+            return false;
+        }
+
+        var index = 1;
+        if (tag[index] == '/')
+        {
+            isClosing = true;
+            index++;
+        }
+
+        var nameStart = index;
+        while (index < tag.Length - 1 && char.IsLetter(tag[index]))
+        {
+            index++;
+        }
+
+        if (index == nameStart)
+        {
+            return false;
+        }
+
+        tagName = tag[nameStart..index].ToLowerInvariant();
+        if (tagName is not ("b" or "strong" or "em" or "i" or "del" or "s" or "strike"
+            or "ins" or "u" or "code" or "kbd" or "mark" or "sub" or "sup" or "small"
+            or "big" or "span" or "br"))
+        {
+            tagName = string.Empty;
+            isClosing = false;
+            return false;
+        }
+
+        var attributes = tag.AsSpan(index, tag.Length - index - 1).Trim();
+        isSelfClosing = attributes.EndsWith("/", StringComparison.Ordinal);
+        return true;
     }
 
     private static FrameworkElement CreateFormulaElement(string formula, double scale, bool display,
@@ -1055,14 +1697,17 @@ public static class MarkdownWpfRenderer
         };
     }
 
-    private static bool IsSafeHtmlTag(string tag) => tag.Contains("<br", StringComparison.OrdinalIgnoreCase)
-        || tag.Contains("</br", StringComparison.OrdinalIgnoreCase)
-        || tag.Contains("<sub", StringComparison.OrdinalIgnoreCase)
-        || tag.Contains("<sup", StringComparison.OrdinalIgnoreCase)
-        || tag.Contains("<kbd", StringComparison.OrdinalIgnoreCase)
-        || tag.Contains("<mark", StringComparison.OrdinalIgnoreCase);
+    private static Paragraph NewParagraph() => new()
+    {
+        Margin = new Thickness(0, 3, 0, 3),
+        TextAlignment = TextAlignment.Left,
+    };
 
-    private static Paragraph NewParagraph() => new() { Margin = new Thickness(0, 3, 0, 3) };
+    private static bool IsHtmlLineBreak(string tag)
+    {
+        return TryParseSafeHtmlTag(tag, out var tagName, out _, out _)
+            && tagName.Equals("br", StringComparison.Ordinal);
+    }
 }
 
 internal static class MarkdownDelimiterNormalizer

@@ -4,6 +4,14 @@ using Markdig.Syntax;
 using Nornia.Desktop.Code;
 using Nornia.Desktop.Markdown;
 using Nornia.Desktop.ViewModels;
+using Nornia.Desktop.Views;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Documents;
+using WpfCheckBox = System.Windows.Controls.CheckBox;
+using WpfList = System.Windows.Documents.List;
+using WpfListItem = System.Windows.Documents.ListItem;
+using WpfTable = System.Windows.Documents.Table;
 using WpfParagraph = System.Windows.Documents.Paragraph;
 using WpfRun = System.Windows.Documents.Run;
 
@@ -35,7 +43,7 @@ public sealed class MarkdownPreviewServiceTests
         var document = result.Document;
         Assert.Contains(document.Descendants<MathInline>(), _ => true);
         Assert.Contains(document.Descendants<MathBlock>(), _ => true);
-        Assert.Contains(document.Descendants<Table>(), _ => true);
+        Assert.Contains(document.Descendants<Markdig.Extensions.Tables.Table>(), _ => true);
     }
 
     [Fact]
@@ -118,6 +126,237 @@ public sealed class MarkdownPreviewServiceTests
         Assert.False(resultState.InitialCompleted);
         Assert.InRange(resultState.InitialCount, 1, 8);
         Assert.True(resultState.FinalCount > resultState.InitialCount);
+    }
+
+    [Fact]
+    public async Task WpfRenderer_ListsPreserveOrderedStartNestedStructureAndLeftAlignment()
+    {
+        var result = await MarkdownPreviewService.Instance.ParseAsync("""
+            3. outer one
+            4. outer two
+               1. nested one
+                  - deeply nested
+            """, "C:\\docs\\lists.md");
+        var completion = new TaskCompletionSource<(TextAlignment Alignment, TextMarkerStyle Marker,
+            int Start, int OuterCount, int NestedCount, int DeepCount, double MarkerOffset)>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                var document = MarkdownWpfRenderer.Render(result);
+                var outer = document.Blocks.OfType<WpfList>().Single();
+                var nested = outer.ListItems.OfType<WpfListItem>().ElementAt(1).Blocks.OfType<WpfList>().Single();
+                var deep = nested.ListItems.OfType<WpfListItem>().Single().Blocks.OfType<WpfList>().Single();
+                completion.SetResult((document.TextAlignment, outer.MarkerStyle, outer.StartIndex,
+                    outer.ListItems.Count, nested.ListItems.Count, deep.ListItems.Count, outer.MarkerOffset));
+            }
+            catch (Exception ex)
+            {
+                completion.SetException(ex);
+            }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+
+        var state = await completion.Task;
+        Assert.Equal(TextAlignment.Left, state.Alignment);
+        Assert.Equal(TextMarkerStyle.Decimal, state.Marker);
+        Assert.Equal(3, state.Start);
+        Assert.Equal(2, state.OuterCount);
+        Assert.Equal(1, state.NestedCount);
+        Assert.Equal(1, state.DeepCount);
+        Assert.Equal(6, state.MarkerOffset);
+    }
+
+    [Fact]
+    public async Task MarkdownPreviewView_FindsHeadingsInsideNestedListBlocks()
+    {
+        var result = await MarkdownPreviewService.Instance.ParseAsync(
+            "- ## Nested heading", "C:\\docs\\nested-heading.md");
+        var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                var document = MarkdownWpfRenderer.Render(result);
+                completion.SetResult(MarkdownPreviewView.FindNamedBlock(
+                    document, result.Headings.Single().DocumentName) is WpfParagraph);
+            }
+            catch (Exception ex)
+            {
+                completion.SetException(ex);
+            }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+
+        Assert.True(await completion.Task);
+    }
+
+    [Fact]
+    public async Task WpfRenderer_TableUsesMarkdownColumnAlignmentAndLeftDefault()
+    {
+        var result = await MarkdownPreviewService.Instance.ParseAsync("""
+            | left | center | right | default |
+            | :--- | :---: | ---: | --- |
+            | a | b | c | d |
+            """, "C:\\docs\\table.md");
+        var completion = new TaskCompletionSource<(TextAlignment TableAlignment, TextAlignment[] Cells, TextAlignment[] Paragraphs)>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                var document = MarkdownWpfRenderer.Render(result);
+                var table = document.Blocks.OfType<WpfTable>().Single();
+                var cells = table.RowGroups[0].Rows[1].Cells.Select(cell => cell.TextAlignment).ToArray();
+                var paragraphs = table.RowGroups[0].Rows[1].Cells
+                    .SelectMany(cell => cell.Blocks.OfType<WpfParagraph>())
+                    .Select(paragraph => paragraph.TextAlignment)
+                    .ToArray();
+                completion.SetResult((table.TextAlignment, cells, paragraphs));
+            }
+            catch (Exception ex)
+            {
+                completion.SetException(ex);
+            }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+
+        var state = await completion.Task;
+        Assert.Equal(TextAlignment.Left, state.TableAlignment);
+        Assert.Equal([TextAlignment.Left, TextAlignment.Center, TextAlignment.Right, TextAlignment.Left], state.Cells);
+        Assert.Equal([TextAlignment.Left, TextAlignment.Center, TextAlignment.Right, TextAlignment.Left], state.Paragraphs);
+    }
+
+    [Fact]
+    public async Task WpfRenderer_RendersIndentedCodeEntitiesAndReadOnlyTaskChecks()
+    {
+        var result = await MarkdownPreviewService.Instance.ParseAsync(
+            "Entity &copy; &amp;\n\n    INDENTED_CODE\n\n- [ ] todo\n- [x] done",
+            "C:\\docs\\syntax.md");
+        var completion = new TaskCompletionSource<(string Text, bool[] Checks)>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                var document = MarkdownWpfRenderer.Render(result);
+                var text = string.Concat(document.Blocks.OfType<WpfParagraph>()
+                    .SelectMany(paragraph => paragraph.Inlines.OfType<WpfRun>())
+                    .Select(run => run.Text));
+                var checks = document.Blocks.OfType<WpfList>().Single().ListItems
+                    .SelectMany(item => item.Blocks.OfType<WpfParagraph>())
+                    .SelectMany(paragraph => paragraph.Inlines.OfType<InlineUIContainer>())
+                    .Select(container => ((WpfCheckBox)container.Child).IsChecked == true)
+                    .ToArray();
+                completion.SetResult((text, checks));
+            }
+            catch (Exception ex)
+            {
+                completion.SetException(ex);
+            }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+
+        var state = await completion.Task;
+        Assert.Contains("Entity © &", state.Text, StringComparison.Ordinal);
+        Assert.Contains("INDENTED_CODE", state.Text, StringComparison.Ordinal);
+        Assert.Equal([false, true], state.Checks);
+    }
+
+    [Fact]
+    public async Task WpfRenderer_RendersEnabledContainerBlocksAndFootnotesAsBlocks()
+    {
+        var result = await MarkdownPreviewService.Instance.ParseAsync("""
+            ---
+            title: preview
+            ---
+
+            > [!NOTE]
+            > alert body
+
+            ::: note
+            container body
+            :::
+
+            Body[^1]
+
+            [^1]: footnote body
+            """, "C:\\docs\\extensions.md");
+        var completion = new TaskCompletionSource<(string Body, string Footnote, int Sections)>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                var document = MarkdownWpfRenderer.Render(result);
+                var body = string.Concat(document.Blocks.OfType<WpfParagraph>()
+                    .SelectMany(paragraph => paragraph.Inlines.OfType<WpfRun>())
+                    .Select(run => run.Text));
+                var footnote = string.Concat(document.Blocks.OfType<Section>()
+                    .SelectMany(section => section.Blocks.OfType<WpfParagraph>())
+                    .SelectMany(paragraph => paragraph.Inlines.OfType<WpfRun>())
+                    .Select(run => run.Text));
+                completion.SetResult((body, footnote, document.Blocks.OfType<Section>().Count()));
+            }
+            catch (Exception ex)
+            {
+                completion.SetException(ex);
+            }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+
+        var state = await completion.Task;
+        Assert.Contains("[NOTE] alert body", state.Body, StringComparison.Ordinal);
+        Assert.Contains("container body", state.Body, StringComparison.Ordinal);
+        Assert.Contains("1. footnote body", state.Footnote, StringComparison.Ordinal);
+        Assert.Equal(1, state.Sections);
+    }
+
+    [Fact]
+    public async Task WpfRenderer_RendersSafeInlineHtmlWithoutExecutingUnknownTags()
+    {
+        var result = await MarkdownPreviewService.Instance.ParseAsync(
+            "HTML <strong>bold</strong> <em>italic</em> <sub>x</sub><br />next <script>raw</script>",
+            "C:\\docs\\html.md");
+        var completion = new TaskCompletionSource<(bool Bold, bool Italic, bool Subscript, int Breaks, string Raw)>(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                var paragraph = MarkdownWpfRenderer.Render(result).Blocks.OfType<WpfParagraph>().Single();
+                var spans = paragraph.Inlines.OfType<Span>().ToArray();
+                var raw = string.Concat(paragraph.Inlines.OfType<WpfRun>().Select(run => run.Text));
+                completion.SetResult((
+                    spans.Any(span => span.FontWeight == FontWeights.Bold
+                        && span.Inlines.OfType<WpfRun>().Any(run => run.Text == "bold")),
+                    spans.Any(span => span.FontStyle == FontStyles.Italic
+                        && span.Inlines.OfType<WpfRun>().Any(run => run.Text == "italic")),
+                    spans.Any(span => span.BaselineAlignment == BaselineAlignment.Subscript
+                        && span.Inlines.OfType<WpfRun>().Any(run => run.Text == "x")),
+                    paragraph.Inlines.OfType<LineBreak>().Count(),
+                    raw));
+            }
+            catch (Exception ex)
+            {
+                completion.SetException(ex);
+            }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+
+        var state = await completion.Task;
+        Assert.True(state.Bold);
+        Assert.True(state.Italic);
+        Assert.True(state.Subscript);
+        Assert.Equal(1, state.Breaks);
+        Assert.Contains("<script>raw</script>", state.Raw, StringComparison.Ordinal);
     }
 
     /// <summary>渲染围栏代码块段落的全部 Run 文本(拼接);按内容特征定位代码段落,

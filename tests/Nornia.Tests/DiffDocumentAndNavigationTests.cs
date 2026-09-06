@@ -46,7 +46,8 @@ public sealed class MinimapLayoutTests
     [Fact]
     public void MapY_And_DragInverse_RoundTrip()
     {
-        var map = MinimapLayout.Compute(500, LineHeight, editorViewportHeight: 300, mapStripHeight: 200, editorScrollOffset: 0);
+        const double viewport = 300.0;
+        var map = MinimapLayout.Compute(500, LineHeight, viewport, mapStripHeight: 200, editorScrollOffset: 0);
 
         var targetLine = 230.0;
         var mapY = MinimapLayout.MapY((int)targetLine, map);
@@ -54,8 +55,19 @@ public sealed class MinimapLayoutTests
         var restored = MinimapLayout.EditorLineFromMapY(mapY, map);
         Assert.Equal(targetLine, restored, 4);
 
-        var offset = MinimapLayout.ScrollOffsetForLine(restored, LineHeight);
-        Assert.Equal(230 * LineHeight, offset, 4);
+        // 点击跳转语义:目标行显示在视口垂直居中位置 → 偏移 = 行像素位置 − 视口高度/2。
+        var offset = MinimapLayout.ScrollOffsetForLine(restored, LineHeight, viewport);
+        Assert.Equal(targetLine * LineHeight - viewport / 2, offset, 4);
+    }
+
+    [Fact]
+    public void ScrollOffsetForLine_CentersTargetAndClampsAtDocumentStart()
+    {
+        // 顶部附近的行:居中偏移为负 → 钳制到文档顶部(0)。
+        Assert.Equal(0, MinimapLayout.ScrollOffsetForLine(2, LineHeight, viewportHeight: 300));
+
+        // 中部行:精确居中(行像素位置 − 视口高度/2)。
+        Assert.Equal(100 * LineHeight - 300 / 2, MinimapLayout.ScrollOffsetForLine(100, LineHeight, viewportHeight: 300));
     }
 
     [Fact]

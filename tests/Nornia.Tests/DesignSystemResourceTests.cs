@@ -1417,6 +1417,10 @@ public sealed class DesignSystemResourceTests
         // Global list/tab shortcuts leave the code area alone (focus isolation).
         Assert.Contains("ICSharpCode.AvalonEdit.Editing.TextArea", mainWindow);
         Assert.Contains("FindAncestor<CodeDocumentView>", mainWindow);
+        Assert.Contains("FindAncestor<DiffDocumentView>", mainWindow);
+        Assert.Contains("FrameworkContentElement content =>", mainWindow);
+        Assert.Contains("ContentOperations.GetParent", mainWindow);
+        Assert.Contains("UpdateFocusContext();\n        if (await _keybindings.DispatchAsync", mainWindow);
         // Ctrl+F with a selection in the document auto-fills the find box; the prev/next
         // buttons re-evaluate their enabled state when the match count changes.
         Assert.Contains("_tab.Content[segment.Offset..(segment.Offset + segment.Length)]", previewCode);

@@ -409,6 +409,7 @@ internal sealed class FakeSettingsService : ISettingsService
 /// <see cref="Current"/> directly when a context is required.</summary>
 internal sealed class FakeProjectWorkspaceService : IProjectWorkspaceService
 {
+    private long _generation;
     public ProjectWorkspaceContext? Current { get; set; }
     public bool IsStartupAutoRestore { get; set; }
     public event Func<ProjectWorkspaceContext?, Task>? ContextChanged;
@@ -420,7 +421,9 @@ internal sealed class FakeProjectWorkspaceService : IProjectWorkspaceService
         ActivatedPaths.Add(path);
         if (ActivateResultFactory is not null)
         {
-            Current = ActivateResultFactory(path);
+            Current = ActivateResultFactory(path) is { } next
+                ? next with { Generation = Interlocked.Increment(ref _generation) }
+                : null;
         }
 
         return ContextChanged?.Invoke(Current) ?? Task.CompletedTask;

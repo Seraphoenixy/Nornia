@@ -18,6 +18,7 @@ public partial class ExplorerPageViewModel : PageViewModel, INavigationTarget
     private readonly IDesktopNavigationService _navigation;
     private IProjectWorkspaceService? _workspaceService;
     private GitRepositoryStatus? _latestGitStatus;
+    private ProjectWorkspaceContext? _latestGitStatusContext;
     private CancellationTokenSource? _activeEditorRevealCancellation;
 
     public WorkspaceViewModel Explorer { get; }
@@ -54,24 +55,14 @@ public partial class ExplorerPageViewModel : PageViewModel, INavigationTarget
         Explorer.FileOpenRequested += (_, path) => _ = OpenExplorerFileAsync(path);
         Explorer.FileOpenPermanentRequested += (_, path) => _ = OpenExplorerFileAsync(path, permanent: true);
         Editor.SelectedTabChanged += (_, _) => QueueActiveEditorReveal();
-        Explorer.DiffOpenRequested += async (_, node) =>
-        {
-            var info = Explorer.GetGitInfo(node.RelativePath);
-            if (info is null)
-            {
-                return;
-            }
-
-            await Editor.OpenDiffAsync(new GitDiffRequest(
-                Git.RepositoryPath, ToRepositoryRelativePath(node.RelativePath), info.Value.IsStaged, info.Value.IsUntracked));
-        };
+        Explorer.DiffOpenRequested += (_, node) => _ = OpenExplorerDiffAsync(node);
         Git.StatusRefreshed += OnGitStatusRefreshed;
         Git.RevealRequested += (_, path) =>
         {
             var projectPath = ToProjectRelativePath(path);
             if (projectPath is null) return;
             _navigation.Navigate(NavigationTargets.Explorer, (string?)null);
-            _ = Explorer.RevealNodeAsync(projectPath);
+            _ = RevealExplorerNodeAsync(projectPath);
         };
     }
 
@@ -95,6 +86,7 @@ public partial class ExplorerPageViewModel : PageViewModel, INavigationTarget
     }
 
     public bool HasCurrentProject => CurrentProject is not null;
+    public ProjectWorkspaceContext? CurrentWorkspaceContext => _workspaceService?.Current;
     public string CurrentProjectName => CurrentProject?.Name ?? "未打开项目";
     public string CurrentProjectPath => CurrentProject?.Path ?? string.Empty;
     public EnvironmentHealthStatus CurrentProjectStatus => CurrentProject?.LastEnvironmentStatus ?? EnvironmentHealthStatus.Unknown;
@@ -140,6 +132,8 @@ public partial class ExplorerPageViewModel : PageViewModel, INavigationTarget
                 return;
             }
 
+            _latestGitStatus = null;
+            _latestGitStatusContext = null;
             await Explorer.OpenWorkspaceAsync(path);
             if (_latestGitStatus is { } status)
             {
@@ -154,7 +148,7 @@ public partial class ExplorerPageViewModel : PageViewModel, INavigationTarget
             await Projects.RefreshCatalogAsync();
             LogService.Write("INFO", $"已打开项目：{project.Name} ({path})");
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        catch (Exception ex)
         {
             LogService.Write("ERROR", $"无法打开项目 {path}：{ex.Message}");
         }
@@ -243,7 +237,11 @@ public partial class ExplorerPageViewModel : PageViewModel, INavigationTarget
                 await Explorer.RevealNodeAsync(relativePath, cancellation.Token);
             }
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+            // A newer active tab owns the next reveal request.
+        }
+        catch (Exception ex)
         {
             LogService.Write("WARNING", $"无法在资源管理器中定位活动文件：{ex.Message}");
         }
@@ -291,13 +289,45 @@ public partial class ExplorerPageViewModel : PageViewModel, INavigationTarget
         {
             await Editor.OpenFileAsync(path, permanent);
         }
-        catch (Exception ex) when (ex is IOException
-            or UnauthorizedAccessException
-            or ArgumentException
-            or NotSupportedException
-            or System.Security.SecurityException)
+        catch (Exception ex)
         {
             LogService.Write("ERROR", $"无法打开文件 {path}：{ex.Message}");
+        }
+    }
+
+    private async Task OpenExplorerDiffAsync(WorkspaceNode node)
+    {
+        try
+        {
+            var info = Explorer.GetGitInfo(node.RelativePath);
+            if (info is null)
+            {
+                return;
+            }
+
+            await Editor.OpenDiffAsync(new GitDiffRequest(
+                Git.RepositoryPath, ToRepositoryRelativePath(node.RelativePath), info.Value.IsStaged, info.Value.IsUntracked,
+                WorkspaceContext: _workspaceService?.Current));
+        }
+        catch (Exception ex)
+        {
+            LogService.Write("ERROR", $"无法打开文件 Diff：{ex.Message}");
+        }
+    }
+
+    private async Task RevealExplorerNodeAsync(string relativePath)
+    {
+        try
+        {
+            await Explorer.RevealNodeAsync(relativePath);
+        }
+        catch (OperationCanceledException)
+        {
+            // A later reveal request superseded this one.
+        }
+        catch (Exception ex)
+        {
+            LogService.Write("WARNING", $"无法定位资源管理器文件：{ex.Message}");
         }
     }
 
@@ -308,18 +338,31 @@ public partial class ExplorerPageViewModel : PageViewModel, INavigationTarget
 
         await Explorer.OpenWorkspaceAsync(context.ProjectPath);
         // Git may publish its status before this handler opens the explorer tree because both
-        // listen to the same workspace-context event. Reapply the latest status after the tree
-        // exists; OpenWorkspaceAsync clears the previous repository's decorations by design.
-        if (_latestGitStatus is { } status)
+        // listen to the same workspace-context event. Reapply only a status produced for this
+        // exact workspace generation; OpenWorkspaceAsync clears the previous repository's
+        // decorations by design.
+        if (ReferenceEquals(_latestGitStatusContext, context) && _latestGitStatus is { } status)
         {
             Explorer.ApplyGitStatus(ProjectRelativeStatus(status));
+        }
+        else
+        {
+            _latestGitStatus = null;
+            _latestGitStatusContext = null;
         }
         Terminal.WorkingDirectory = context.ProjectPath;
     }
 
     private void OnGitStatusRefreshed(object? sender, GitRepositoryStatus status)
     {
+        var statusContext = sender is GitViewModel git ? git.WorkspaceContext : _workspaceService?.Current;
+        if (_workspaceService is not null && !ReferenceEquals(statusContext, _workspaceService.Current))
+        {
+            return; // delayed status from the previous project generation
+        }
+
         _latestGitStatus = status;
+        _latestGitStatusContext = statusContext;
         Explorer.ApplyGitStatus(ProjectRelativeStatus(status));
     }
 

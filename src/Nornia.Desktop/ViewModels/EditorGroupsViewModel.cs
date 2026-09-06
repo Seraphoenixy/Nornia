@@ -834,6 +834,7 @@ public sealed partial class EditorGroupsViewModel : ObservableObject
         }
 
         _groups.Clear();
+        _groupMru.Clear();
         _groups[group.GroupId] = group;
         TrackGroupTabs(group);
         _root = new EditorGroupNode(group);

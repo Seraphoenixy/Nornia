@@ -95,7 +95,7 @@ public partial class MainViewModel : ObservableObject
         Terminal = terminal;
         // The terminal is a shell-level bottom panel now (no workbench page owns it); discover its
         // profiles once at startup.
-        _ = terminal.ActivateAsync();
+        _ = ActivatePageSafelyAsync(terminal);
         // 统一标签条:内容页标签与文件/diff 文档标签同条混排(视图页永不产生标签)。
         Workbench = new WorkbenchViewModel(explorer.Editor, navigationItems);
         Workbench.ShowOperationLogCommand = new RelayCommand(() => SelectPanel(WorkbenchPanel.Output));
@@ -310,7 +310,7 @@ public partial class MainViewModel : ObservableObject
 
     partial void OnSelectedNavigationItemChanged(NavigationItem? value)
     {
-        if (_preloadEnabled && !_preloading)
+        if (_preloadEnabled && _preloading)
         {
             _preloadCancellation.Cancel();
         }
@@ -321,10 +321,10 @@ public partial class MainViewModel : ObservableObject
         OnPropertyChanged(nameof(ShowViewPageWelcome));
         OnPropertyChanged(nameof(OperationPage));
         // 标签→活动栏同步中不重开页面标签(它已打开,重复打开会循环)。
-        if (CurrentPage is not null && !_syncingActivitySelection)
+        if (CurrentPage is { } page && !_syncingActivitySelection)
         {
-            _ = CurrentPage.ActivateAsync();
-            if (CurrentPage is ExplorerPageViewModel or GitViewModel or SearchViewModel)
+            _ = ActivatePageSafelyAsync(page);
+            if (page is ExplorerPageViewModel or GitViewModel or SearchViewModel)
             {
                 // 视图页永不产生页面标签;且视图页下页面标签不得处于选中态。
                 Workbench?.ClearNonDocumentSelection();
@@ -335,6 +335,18 @@ public partial class MainViewModel : ObservableObject
             }
         }
         RecordNavigation();
+    }
+
+    private async Task ActivatePageSafelyAsync(PageViewModel page)
+    {
+        try
+        {
+            await page.ActivateAsync();
+        }
+        catch (Exception ex)
+        {
+            _logService.WriteException("ERROR", $"页面“{page.Title}”初始化失败", ex);
+        }
     }
 
     /// <summary>视图页欢迎层:资源管理器 / 源代码管理且无文档标签选中时显示各自欢迎页,
@@ -606,7 +618,11 @@ public partial class MainViewModel : ObservableObject
     // ===== QuickInput overlay: command palette (Ctrl+Shift+P) / quick open (Ctrl+P) =====
 
     [RelayCommand]
-    private void ShowCommandPalette() => QuickInput.Open("输入命令", BuildPaletteItems());
+    private void ShowCommandPalette()
+    {
+        DetachQuickOpenPrefixMode();
+        QuickInput.Open("输入命令", BuildPaletteItems());
+    }
 
     [RelayCommand]
     private async Task ShowQuickOpenAsync()
@@ -618,12 +634,21 @@ public partial class MainViewModel : ObservableObject
             await explorer.ActivateAsync();
         }
 
+        var invocationGeneration = GetQuickOpenCacheGeneration();
+        DetachQuickOpenPrefixMode();
         QuickInput.Open("打开文件", [new QuickPickItem("正在扫描工作区…", "文件索引准备中", Codicons.Loading, static () => { })]);
         AttachQuickOpenPrefixMode();
+        var invocationSession = _quickOpenSession;
 
         var items = await BuildQuickOpenItemsAsync();
-        if (!QuickInput.IsOpen)
+        if (!QuickInput.IsOpen || !IsQuickOpenGenerationCurrent(invocationGeneration) ||
+            !ReferenceEquals(_quickOpenSession, invocationSession))
         {
+            if (ReferenceEquals(_quickOpenSession, invocationSession))
+            {
+                DetachQuickOpenPrefixMode();
+                QuickInput.Close();
+            }
             return;
         }
 
@@ -646,6 +671,7 @@ public partial class MainViewModel : ObservableObject
             return;
         }
 
+        DetachQuickOpenPrefixMode();
         var items = CodeFileTypeRegistry.Instance.All.Select(type => new QuickPickItem(
             type.DisplayName,
             $"语言 ID: {type.LanguageId}",
@@ -690,6 +716,7 @@ public partial class MainViewModel : ObservableObject
     /// <summary>把当前已经打开的 QuickInput(文件/符号)接入前缀模式切换;关闭时自动解绑。</summary>
     private void AttachQuickOpenPrefixMode()
     {
+        DetachQuickOpenPrefixMode();
         var tab = Workbench?.Editor.SelectedTab as FilePreviewTab;
         _quickOpenSession = new QuickOpenSession
         {
@@ -710,6 +737,12 @@ public partial class MainViewModel : ObservableObject
         QuickInput.PropertyChanged += OnQuickInputForPrefixChanged;
     }
 
+    private void DetachQuickOpenPrefixMode()
+    {
+        QuickInput.PropertyChanged -= OnQuickInputForPrefixChanged;
+        _quickOpenSession = null;
+    }
+
     private static void JumpToSymbol(FilePreviewTab tab, CodeOutlineEntry entry)
     {
         if (!string.IsNullOrEmpty(entry.Id) && tab.SymbolDocument.FindById(entry.Id) is { } symbol)
@@ -726,8 +759,7 @@ public partial class MainViewModel : ObservableObject
     {
         if (e.PropertyName == nameof(QuickInputViewModel.IsOpen) && !QuickInput.IsOpen)
         {
-            QuickInput.PropertyChanged -= OnQuickInputForPrefixChanged;
-            _quickOpenSession = null;
+            DetachQuickOpenPrefixMode();
             return;
         }
 
@@ -777,6 +809,7 @@ public partial class MainViewModel : ObservableObject
             return;
         }
 
+        DetachQuickOpenPrefixMode();
         var items = editors.Select(tab => new QuickPickItem(
             tab.Name,
             tab.Path,
@@ -873,14 +906,17 @@ public partial class MainViewModel : ObservableObject
             return [];
         }
 
-        var files = QuickOpenFiles(root).ToList();
+        var workspaceContext = explorer.CurrentWorkspaceContext;
+        var fullRoot = Path.GetFullPath(root);
+        var files = QuickOpenFiles(fullRoot).ToList();
         var items = new List<QuickPickItem>(files.Count);
         foreach (var path in files)
         {
             var name = System.IO.Path.GetFileName(path);
-            var relative = path.Length > root.Length + 1 ? path[(root.Length + 1)..] : name;
+            var relative = QuickOpenRelativePath(fullRoot, path);
             var glyph = Codicons.File;
-            items.Add(new QuickPickItem(name, relative, glyph, () => _ = explorer.Editor.OpenFileAsync(path)));
+            items.Add(new QuickPickItem(name, relative, glyph,
+                () => _ = explorer.Editor.OpenFileAsync(path, expectedWorkspaceContext: workspaceContext)));
         }
 
         return items;
@@ -900,6 +936,7 @@ public partial class MainViewModel : ObservableObject
         }
 
         var fullRoot = Path.GetFullPath(root);
+        var workspaceContext = explorer.CurrentWorkspaceContext;
         IReadOnlyList<string>? files = null;
         Task<IReadOnlyList<string>>? buildTask = null;
         long cacheGeneration;
@@ -949,23 +986,38 @@ public partial class MainViewModel : ObservableObject
             }
         }
 
-        return BuildQuickOpenItems(explorer, fullRoot, files);
+        return BuildQuickOpenItems(explorer, fullRoot, files, workspaceContext);
     }
 
     private IReadOnlyList<QuickPickItem> BuildQuickOpenItems(
         ExplorerPageViewModel explorer,
         string root,
-        IReadOnlyList<string> files)
+        IReadOnlyList<string> files,
+        ProjectWorkspaceContext? workspaceContext = null)
     {
         var items = new List<QuickPickItem>(files.Count);
         foreach (var path in files)
         {
             var name = Path.GetFileName(path);
-            var relative = path.Length > root.Length + 1 ? path[(root.Length + 1)..] : name;
-            items.Add(new QuickPickItem(name, relative, Codicons.File, () => _ = explorer.Editor.OpenFileAsync(path)));
+            var relative = QuickOpenRelativePath(root, path);
+            items.Add(new QuickPickItem(name, relative, Codicons.File,
+                () => _ = explorer.Editor.OpenFileAsync(path, expectedWorkspaceContext: workspaceContext)));
         }
 
         return items;
+    }
+
+    private static string QuickOpenRelativePath(string root, string path)
+    {
+        try
+        {
+            var relative = Path.GetRelativePath(root, path);
+            return relative == "." ? Path.GetFileName(path) : relative;
+        }
+        catch (Exception ex) when (ex is ArgumentException or IOException or NotSupportedException)
+        {
+            return Path.GetFileName(path);
+        }
     }
 
     /// <summary>Bounded, generated-folder-aware file enumeration for quick open. Skips VCS and build
@@ -1086,6 +1138,19 @@ public partial class MainViewModel : ObservableObject
     {
         if (e.PropertyName == nameof(WorkspaceViewModel.WorkspacePath))
         {
+            // Navigation history stores document paths. A path from the previous project must not
+            // be replayed after a project switch, where the same relative file name may resolve to
+            // a different document (or the old absolute file may be opened outside the project).
+            _backStack.Clear();
+            _forwardStack.Clear();
+            _historyAnchor = null;
+            GoBackCommand.NotifyCanExecuteChanged();
+            GoForwardCommand.NotifyCanExecuteChanged();
+            // A quick-open item captures an absolute path and its background index may still be
+            // running. Close the old overlay and invalidate its session before the new workspace
+            // can publish another file list.
+            DetachQuickOpenPrefixMode();
+            QuickInput.Close();
             InvalidateQuickOpenCache();
             OnPropertyChanged(nameof(WorkspaceTitle));
         }
@@ -1100,6 +1165,22 @@ public partial class MainViewModel : ObservableObject
             _quickOpenCacheGeneration++;
             _quickOpenCacheRoot = null;
             _quickOpenFilesCache = null;
+        }
+    }
+
+    private long GetQuickOpenCacheGeneration()
+    {
+        lock (_quickOpenCacheGate)
+        {
+            return _quickOpenCacheGeneration;
+        }
+    }
+
+    private bool IsQuickOpenGenerationCurrent(long generation)
+    {
+        lock (_quickOpenCacheGate)
+        {
+            return generation == _quickOpenCacheGeneration;
         }
     }
 

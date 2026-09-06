@@ -123,7 +123,14 @@ public sealed class WorkspaceFileWatcher : IWorkspaceFileWatcher
             return;
         }
 
-        rootPath = Path.GetFullPath(rootPath);
+        try
+        {
+            rootPath = Path.GetFullPath(rootPath);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return;
+        }
 
         lock (_gate)
         {
@@ -348,12 +355,29 @@ public sealed class WorkspaceFileWatcher : IWorkspaceFileWatcher
             return;
         }
 
-        watcher.Created += OnFileSystemEvent;
-        watcher.Deleted += OnFileSystemEvent;
-        watcher.Renamed += OnRenamedEvent;
-        watcher.Error += OnWatcherError;
-        watcher.EnableRaisingEvents = true;
-        _watchers.Add(directory, watcher);
+        try
+        {
+            watcher.Created += OnFileSystemEvent;
+            watcher.Deleted += OnFileSystemEvent;
+            watcher.Renamed += OnRenamedEvent;
+            watcher.Error += OnWatcherError;
+            watcher.EnableRaisingEvents = true;
+            _watchers.Add(directory, watcher);
+        }
+        catch (Exception ex) when (ex is ArgumentException
+            or IOException
+            or UnauthorizedAccessException
+            or NotSupportedException
+            or InvalidOperationException
+            or System.Security.SecurityException)
+        {
+            watcher.Created -= OnFileSystemEvent;
+            watcher.Deleted -= OnFileSystemEvent;
+            watcher.Renamed -= OnRenamedEvent;
+            watcher.Error -= OnWatcherError;
+            watcher.Dispose();
+            // Directory removal can race a tree reconciliation. The next refresh/expand retries.
+        }
     }
 
     private void DisposeWatcherNoLock(string directory)
@@ -363,7 +387,14 @@ public sealed class WorkspaceFileWatcher : IWorkspaceFileWatcher
             return;
         }
 
-        watcher.EnableRaisingEvents = false;
+        try
+        {
+            watcher.EnableRaisingEvents = false;
+        }
+        catch (Exception)
+        {
+            // The native handle may already have failed or been torn down.
+        }
         watcher.Created -= OnFileSystemEvent;
         watcher.Deleted -= OnFileSystemEvent;
         watcher.Renamed -= OnRenamedEvent;

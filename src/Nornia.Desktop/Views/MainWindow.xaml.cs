@@ -11,6 +11,7 @@ using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Data;
+using System.Windows.Documents;
 using System.Windows.Input;
 using System.Windows.Interop;
 using System.Windows.Media;
@@ -230,14 +231,13 @@ public partial class MainWindow : Window
         MinHeight = WorkbenchLayoutMetrics.WindowMinimumHeight;
         _settings = settings;
         _stateStore = stateStore;
-        _stateStore.Changed += (_, _) => Dispatcher.BeginInvoke(async () =>
-            await RestoreLayoutAsync(clampWindow: false));
+        _stateStore.Changed += (_, _) => QueueLayoutRestore();
         _keybindings = keybindings;
         _contextKeys = contextKeys;
         _shutdownCoordinator = shutdownCoordinator;
         commands.WindowAction = action => ExecuteWindowActionAsync(action, viewModel);
         commands.Register(viewModel);
-        _ = _keybindings.ReloadAsync();
+        _ = ReloadKeybindingsSafelyAsync();
         _keybindings.PendingChordChanged += (_, _) => Dispatcher.BeginInvoke(() =>
             viewModel.PendingChordText = _keybindings.PendingChord is { } chord
                 ? $"正在等待第二个按键（{chord}）" : string.Empty);
@@ -282,24 +282,16 @@ public partial class MainWindow : Window
             MarkLayoutDirty();
         };
         _layoutSaveTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(600) };
-        _layoutSaveTimer.Tick += async (_, _) =>
+        _layoutSaveTimer.Tick += (_, _) =>
         {
             _layoutSaveTimer.Stop();
             if (_layoutDirty)
             {
                 _layoutDirty = false;
-                await SaveLayoutAsync();
+                _ = SaveLayoutSafelyAsync();
             }
         };
-        Loaded += async (_, _) =>
-        {
-            await RestoreLayoutAsync(clampWindow: true);
-            await BindLayoutSettingsAsync();
-            viewModel.UpdateResponsiveLayout(ActualWidth);
-            ApplyLayout();
-            UpdateFocusContext();
-            UpdateWorkbenchContext(viewModel);
-        };
+        Loaded += (_, _) => _ = InitializeLoadedLayoutSafelyAsync(viewModel);
         Closing += MainWindow_Closing;
         ApplyDpi();
         // 壳先行:窗口壳(标题栏/活动栏/侧栏列/面板框架/状态栏)首建即渲染;
@@ -429,6 +421,60 @@ public partial class MainWindow : Window
         }
     }
 
+    private void QueueLayoutRestore()
+    {
+        try
+        {
+            Dispatcher.BeginInvoke(new Action(() => _ = RestoreLayoutSafelyAsync(clampWindow: false)));
+        }
+        catch (InvalidOperationException)
+        {
+            // The state store can publish during dispatcher shutdown; there is no live window
+            // left that could consume the late layout update.
+        }
+    }
+
+    private async Task ReloadKeybindingsSafelyAsync()
+    {
+        try
+        {
+            await _keybindings.ReloadAsync();
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Failed to reload keybindings during window construction.");
+        }
+    }
+
+    private async Task RestoreLayoutSafelyAsync(bool clampWindow)
+    {
+        try
+        {
+            await RestoreLayoutAsync(clampWindow);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Failed to apply a live window-layout update.");
+        }
+    }
+
+    private async Task InitializeLoadedLayoutSafelyAsync(MainViewModel viewModel)
+    {
+        try
+        {
+            await RestoreLayoutAsync(clampWindow: true);
+            await BindLayoutSettingsAsync();
+            viewModel.UpdateResponsiveLayout(ActualWidth);
+            ApplyLayout();
+            UpdateFocusContext();
+            UpdateWorkbenchContext(viewModel);
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, "Failed to initialize the main window layout.");
+        }
+    }
+
     /// <summary>Restores the persisted sidebar/panel dimensions and (only on the initial restore)
     /// the window placement. 坏损的 settings.json(反序列化失败)不得让窗口恢复阶段崩溃:降级为默认布局。
     /// <para><paramref name="clampWindow"/> 只在启动恢复(<c>Loaded</c>)为 <c>true</c>:窗口位置只在此刻
@@ -488,14 +534,27 @@ public partial class MainWindow : Window
     private async Task BindLayoutSettingsAsync()
     {
         if (_layoutSettingsSession is not null) return;
-        _layoutSettingsSession = await _settings.OpenSessionAsync(new(),
+        var session = await _settings.OpenSessionAsync(new(),
         [
             BuiltInSettingsCatalog.SidebarDefaultWidth.Id,
             BuiltInSettingsCatalog.PanelDefaultHeight.Id,
             BuiltInSettingsCatalog.PanelStartExpanded.Id,
         ]);
-        _layoutSettingsSession.Changed += (_, _) => ApplyLayoutSettings(_layoutSettingsSession.Current);
-        ApplyLayoutSettings(_layoutSettingsSession.Current);
+        _layoutSettingsSession = session;
+        session.Changed += (_, _) => ApplyLayoutSettingsSafely(session);
+        ApplyLayoutSettings(session.Current);
+    }
+
+    private void ApplyLayoutSettingsSafely(ISettingsSession session)
+    {
+        try
+        {
+            ApplyLayoutSettings(session.Current);
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Failed to apply live layout settings.");
+        }
     }
 
     private void ApplyLayoutSettings(SettingsSnapshot? snapshot)
@@ -510,11 +569,23 @@ public partial class MainWindow : Window
         viewModel.SetPanelHeight(snapshot.Effective(BuiltInSettingsCatalog.PanelDefaultHeight), viewModel.SelectedPanel);
         viewModel.IsPanelExpanded = snapshot.Effective(BuiltInSettingsCatalog.PanelStartExpanded);
         // 清除对应机器状态覆盖;属性变更已触发 ApplyLayout 重排。
-        _ = _stateStore.CommitAsync(new([
-            new(ApplicationStateField.SidebarWidth, null, Reset: true),
-            new(ApplicationStateField.PanelHeight, null, Reset: true),
-            new(ApplicationStateField.PanelVisible, null, Reset: true),
-        ]));
+        _ = ResetLayoutOverridesSafelyAsync();
+    }
+
+    private async Task ResetLayoutOverridesSafelyAsync()
+    {
+        try
+        {
+            await _stateStore.CommitAsync(new([
+                new(ApplicationStateField.SidebarWidth, null, Reset: true),
+                new(ApplicationStateField.PanelHeight, null, Reset: true),
+                new(ApplicationStateField.PanelVisible, null, Reset: true),
+            ]));
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Failed to reset live layout overrides.");
+        }
     }
 
     private void MarkLayoutDirty()
@@ -555,7 +626,19 @@ public partial class MainWindow : Window
             viewModel.SidebarWidth = SidebarColumn.ActualWidth;
         }
 
-        _ = SaveLayoutAsync();
+        _ = SaveLayoutSafelyAsync();
+    }
+
+    private async Task SaveLayoutSafelyAsync()
+    {
+        try
+        {
+            await SaveLayoutAsync();
+        }
+        catch (Exception ex)
+        {
+            Log.Warning(ex, "Failed to persist window layout.");
+        }
     }
 
     // ===== 活动栏:重复点击当前一级按钮切换左侧栏展开/折叠(VS Code 活动栏行为) =====
@@ -603,19 +686,7 @@ public partial class MainWindow : Window
     }
 
     private static ListBoxItem? TryFindAncestorListBoxItem(DependencyObject source)
-    {
-        while (source is not null && source is not ListBox)
-        {
-            if (source is ListBoxItem item)
-            {
-                return item;
-            }
-
-            source = VisualTreeHelper.GetParent(source);
-        }
-
-        return null;
-    }
+        => FindAncestor<ListBoxItem>(source);
 
     private void PanelSplitter_DragCompleted(object sender, DragCompletedEventArgs e)
     {
@@ -625,7 +696,7 @@ public partial class MainWindow : Window
                 MaximumPanelHeightForCurrentWindow(viewModel.SelectedPanel)), viewModel.SelectedPanel);
         }
 
-        _ = SaveLayoutAsync();
+        _ = SaveLayoutSafelyAsync();
     }
 
     protected override void OnSourceInitialized(EventArgs e)
@@ -809,9 +880,23 @@ public partial class MainWindow : Window
             return;
         }
 
-        if (await _keybindings.DispatchAsync(NormalizeKeyStroke(e)))
+        // Focus events are routed before WPF commits Keyboard.FocusedElement, and the deferred
+        // focus refresh can still be pending when the user double-clicks a word and immediately
+        // presses Ctrl+C. Refresh from the actual focused element at dispatch time so the global
+        // list-copy binding cannot swallow a native text-editor copy.
+        UpdateFocusContext();
+        try
         {
-            e.Handled = true;
+            if (await _keybindings.DispatchAsync(NormalizeKeyStroke(e)))
+            {
+                e.Handled = true;
+            }
+        }
+        catch (Exception ex)
+        {
+            // PreviewKeyDown is an async void WPF event. Observe command-dispatch failures so a
+            // malformed binding cannot escape through the dispatcher and take down the UI loop.
+            Log.Error(ex, "全局快捷键处理失败");
         }
     }
 
@@ -914,8 +999,8 @@ public partial class MainWindow : Window
             return true;
         }
 
-        // The read-only code editor owns its shortcuts (Ctrl+F / F3 / Ctrl+G / Ctrl+C / zoom):
-        // global list/tab shortcuts must not intercept keys while the code area is focused.
+        // Read-only AvalonEdit surfaces own native text-selection shortcuts (including Ctrl+C):
+        // global list/tab shortcuts must not intercept keys while any editor surface is focused.
         if (element is ICSharpCode.AvalonEdit.TextEditor or ICSharpCode.AvalonEdit.Editing.TextArea)
         {
             return true;
@@ -929,6 +1014,7 @@ public partial class MainWindow : Window
         // 交互式终端表面拥有全部按键(数字、F5、方向键等直达 shell),同文本输入豁免,
         // 否则数字 1-8 会被全局导航劫持、打字直接切走页面。
         if (FindAncestor<CodeDocumentView>(dependency) is not null
+            || FindAncestor<DiffDocumentView>(dependency) is not null
             || FindAncestor<MarkdownPreviewView>(dependency) is not null
             || IsInsideTerminalView(dependency))
         {
@@ -1050,7 +1136,17 @@ public partial class MainWindow : Window
                 return match;
             }
 
-            current = VisualTreeHelper.GetParent(current) ?? LogicalTreeHelper.GetParent(current);
+            // Markdown inline elements (for example Hyperlink) are ContentElements rather
+            // than Visuals. They can become the focused/event source, so walk the WPF content
+            // tree first instead of passing them to VisualTreeHelper, which throws.
+            current = current switch
+            {
+                FrameworkContentElement content => content.Parent ?? ContentOperations.GetParent(content),
+                ContentElement content => ContentOperations.GetParent(content),
+                Visual or System.Windows.Media.Media3D.Visual3D =>
+                    VisualTreeHelper.GetParent(current) ?? LogicalTreeHelper.GetParent(current),
+                _ => LogicalTreeHelper.GetParent(current),
+            };
         }
 
         return null;

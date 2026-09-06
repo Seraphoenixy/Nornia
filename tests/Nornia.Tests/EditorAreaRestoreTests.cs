@@ -72,6 +72,39 @@ public sealed class EditorAreaRestoreTests : IDisposable
     private static async Task ActivateWorkspaceAsync(FakeProjectWorkspaceService workspace) =>
         await workspace.ActivateAsync(workspace.Current!.ProjectPath);
 
+    [Fact]
+    public async Task SwitchingWorkspaces_ClearsTabsAndRestoresEachWorkspaceIndependently()
+    {
+        var (editor, _, workspace, _, _) = Create();
+        var secondWorkspace = Path.Combine(_tempDir, "workspace-b");
+        Directory.CreateDirectory(secondWorkspace);
+        var firstFile = Path.Combine(_workspace, "first.txt");
+        var secondFile = Path.Combine(secondWorkspace, "second.txt");
+        File.WriteAllText(firstFile, "A");
+        File.WriteAllText(secondFile, "B");
+
+        static ProjectWorkspaceContext Context(string path) => new(
+            new ProjectAsset(Guid.NewGuid(), new DirectoryInfo(path).Name, path,
+                ProjectPathStatus.Available, 0, null, null, EnvironmentHealthStatus.Unknown),
+            path, null);
+
+        workspace.ActivateResultFactory = Context;
+        await editor.OpenFileAsync(firstFile);
+        editor.SelectedTab!.IsPreview = false;
+
+        await workspace.ActivateAsync(secondWorkspace);
+
+        Assert.Empty(editor.Groups.AllTabs);
+        await editor.OpenFileAsync(secondFile);
+        editor.SelectedTab!.IsPreview = false;
+
+        await workspace.ActivateAsync(_workspace);
+
+        var restored = Assert.Single(editor.Groups.AllTabs);
+        Assert.Equal(firstFile, restored.Path);
+        Assert.DoesNotContain(editor.Groups.AllTabs, tab => tab.Path == secondFile);
+    }
+
     // ===== 跨组去重 / 激活 =====
 
     [Fact]

@@ -266,6 +266,42 @@ public sealed class MarkdownTabReleaseTests : IDisposable
     }
 
     [Fact]
+    public async Task UnloadContentForCache_ReleasesPayload_AndReloadsLatestContent()
+    {
+        var path = Path.Combine(_directory, "evict.md");
+        await File.WriteAllTextAsync(path, Document);
+        var tab = new FilePreviewTab(path, TextDocumentDecoder.Instance, CodeFileTypeRegistry.Instance);
+        await tab.LoadAsync();
+
+        tab.SetMarkdownHeading("deep", 5);
+        tab.ViewState = new EditorViewState(42, 5, 2);
+        Assert.True(tab.IsPayloadLoaded);
+        Assert.True(tab.RetainedMemoryBytes > 0);
+
+        tab.UnloadContentForCache();
+
+        Assert.False(tab.IsPayloadLoaded);
+        Assert.False(tab.IsLoadFinished);
+        Assert.Equal(string.Empty, tab.Content);
+        Assert.Null(tab.MarkdownRenderResult);
+        Assert.Empty(tab.MarkdownHeadings);
+        Assert.Equal("deep", tab.MarkdownAnchor);
+        Assert.Equal(5, tab.MarkdownHeadingLine);
+        Assert.Equal(42, tab.ViewState?.VerticalOffset);
+
+        await File.WriteAllTextAsync(path, "# Latest\n\nnew content\n");
+        await tab.ReloadAsync(); // Unloaded entries must not eagerly rehydrate on file events.
+        Assert.Equal(string.Empty, tab.Content);
+
+        await tab.LoadAsync();
+
+        Assert.True(tab.IsPayloadLoaded);
+        Assert.Contains("Latest", tab.Content);
+        Assert.Contains("new content", tab.Content);
+        tab.ReleaseResources();
+    }
+
+    [Fact]
     public async Task SourceModeReleasesRenderResult_CaretSyncSurvives_PreviewRebuilds()
     {
         var tab = await LoadTabAsync("mode.md");
@@ -489,14 +525,18 @@ public sealed class MarkdownPreviewMemoryViewTests : IDisposable
             // 与并行测试的全局快照差分解耦)。
             var imageKey = tab.MarkdownRenderResult!.ImagePaths[0];
             Assert.True(MarkdownImageCache.Instance.ContainsKey(imageKey));
-            Assert.Equal(2, MarkdownImageCache.Instance.ReferenceCount(imageKey));
+            // Keep an independent owner alive while this tab switches documents. If rendering
+            // accidentally releases the full preheat list after the renderer already consumed
+            // it, that owner would be stolen and this assertion would expose the regression.
+            MarkdownImageCache.Instance.Acquire(imageKey);
+            Assert.Equal(3, MarkdownImageCache.Instance.ReferenceCount(imageKey));
 
             // 切源码:FlowDocument 清空,图片引用归零(条目可留缓存作零引用)。
             tab.ShowMarkdownSourceCommand.Execute(null);
             PumpQueue();
             docSource = view.MarkdownViewControl.Document;
             Assert.Null(docSource);
-            Assert.Equal(0, MarkdownImageCache.Instance.ReferenceCount(imageKey));
+            Assert.Equal(1, MarkdownImageCache.Instance.ReferenceCount(imageKey));
 
             // 切回预览:重新解析 + 渲染(异步,泵驱动),引用恢复。
             tab.ShowMarkdownPreviewCommand.Execute(null);
@@ -506,10 +546,12 @@ public sealed class MarkdownPreviewMemoryViewTests : IDisposable
             docRebuilt = view.MarkdownViewControl.Document;
             Assert.NotNull(docRebuilt);
             var imageKeyRebuilt = tab.MarkdownRenderResult!.ImagePaths[0];
-            Assert.Equal(2, MarkdownImageCache.Instance.ReferenceCount(imageKeyRebuilt));
+            Assert.Equal(3, MarkdownImageCache.Instance.ReferenceCount(imageKeyRebuilt));
 
             tab.ReleaseResources();
             PumpQueue();
+            MarkdownImageCache.Instance.Release(imageKey);
+            Assert.Equal(0, MarkdownImageCache.Instance.ReferenceCount(imageKey));
         });
 
         Assert.NotNull(docRendered);

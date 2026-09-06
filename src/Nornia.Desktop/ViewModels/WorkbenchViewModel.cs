@@ -196,6 +196,13 @@ public partial class WorkbenchViewModel : ObservableObject
         {
             SelectedTab = match;
         }
+        else if (SelectedTab is EditorWorkbenchTab selectedEditor
+                 && live.All(tab => !ReferenceEquals(tab, selectedEditor.EditorTab)))
+        {
+            // A context switch can clear the shared editor before the projection receives its
+            // collection notifications. Do not leave the workbench pointing at a detached tab.
+            SelectedTab = null;
+        }
     }
 
     private void SyncEditorTabProjection()

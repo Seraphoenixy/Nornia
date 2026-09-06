@@ -40,6 +40,29 @@ public partial class App : Application
 
     protected override async void OnStartup(StartupEventArgs e)
     {
+        try
+        {
+            await OnStartupCoreAsync(e);
+        }
+        catch (Exception exception)
+        {
+            // OnStartup is an async-void framework override. Keep failures from escaping through
+            // the dispatcher, especially when settings, DI or database setup fails before the
+            // main window has been shown.
+            Log.Fatal(exception, "Nornia 启动失败");
+            try
+            {
+                Shutdown(1);
+            }
+            catch (Exception shutdownException)
+            {
+                Log.Error(shutdownException, "启动失败后退出应用失败");
+            }
+        }
+    }
+
+    private async Task OnStartupCoreAsync(StartupEventArgs e)
+    {
         ShutdownMode = ShutdownMode.OnMainWindowClose;
         // Windows 右键菜单"Nornia 打开"传入的路径(目录或文件,取首个确实存在的参数)。
         var contextArg = e.Args.FirstOrDefault(arg => Directory.Exists(arg) || File.Exists(arg));
@@ -252,6 +275,10 @@ public partial class App : Application
             catch (UnauthorizedAccessException)
             {
                 // The logger will report any actual file creation failure after configuration.
+            }
+            catch (Exception exception)
+            {
+                Log.Warning(exception, "日志保留清理失败");
             }
         });
     }

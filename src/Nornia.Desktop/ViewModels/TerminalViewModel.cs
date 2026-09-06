@@ -16,6 +16,9 @@ public partial class TerminalViewModel : PageViewModel
     private ISettingsSession? _settingsSession;
     private readonly IClipboardService _clipboard;
     private readonly SemaphoreSlim _defaultProfileSaveGate = new(1, 1);
+    private readonly SemaphoreSlim _workspaceContextGate = new(1, 1);
+    private ProjectWorkspaceContext? _workspaceContext;
+    private long _workspaceGeneration;
     private bool _profilesLoaded;
     private readonly RevisionGate _settingsRevisionGate = new();
     public ObservableCollection<ShellProfile> Profiles { get; } = [];
@@ -37,6 +40,7 @@ public partial class TerminalViewModel : PageViewModel
         _scopedSettings = settings;
         _workspace = workspace;
         _clipboard = clipboard;
+        _workspaceContext = workspace.Current;
         Sessions.CollectionChanged += (_, _) => OnPropertyChanged(nameof(HasSessions));
         _workspace.ContextChanged += OnWorkspaceChangedAsync;
     }
@@ -55,44 +59,91 @@ public partial class TerminalViewModel : PageViewModel
 
     private async Task LoadProfilesAsync(bool useSavedDefault)
     {
-        _settingsSession ??= await _scopedSettings.OpenSessionAsync(new(_workspace.Current?.ProjectPath),
+        var generation = Volatile.Read(ref _workspaceGeneration);
+        var context = _workspaceContext;
+        var session = _settingsSession;
+        if (session is null)
+        {
+            session = await _scopedSettings.OpenSessionAsync(new(context?.ProjectPath),
             [
                 BuiltInSettingsCatalog.TerminalFontSize.Id, BuiltInSettingsCatalog.TerminalFontFamily.Id,
                 BuiltInSettingsCatalog.TerminalSidebarVisible.Id,
                 BuiltInSettingsCatalog.TerminalSidebarWidth.Id, BuiltInSettingsCatalog.TerminalDefaultProfile.Id,
                 BuiltInSettingsCatalog.TerminalCustomShells.Id,
             ]);
-            _settingsSession.Changed -= OnScopedSettingsChanged;
-            _settingsSession.Changed += OnScopedSettingsChanged;
-            var snapshot = _settingsSession.Current!;
-            ApplyTerminalSettings(snapshot);
-            var previous = SelectedProfile?.Id;
-            _profilesLoaded = false;
-            Profiles.Clear();
-            foreach (var profile in _terminalService.DiscoverProfiles()) Profiles.Add(profile);
-            foreach (var path in snapshot.Effective(BuiltInSettingsCatalog.TerminalCustomShells))
-                if (File.Exists(path) && Profiles.All(profile => !string.Equals(profile.Executable, path, StringComparison.OrdinalIgnoreCase)))
-                    Profiles.Add(new($"custom-{path.GetHashCode(StringComparison.OrdinalIgnoreCase):X8}", Path.GetFileNameWithoutExtension(path), path));
-            _profilesLoaded = true;
-            var preferred = useSavedDefault ? snapshot.Effective(BuiltInSettingsCatalog.TerminalDefaultProfile) : previous;
-            SelectedProfile = Profiles.FirstOrDefault(profile => profile.Id == preferred)
-                ?? Profiles.FirstOrDefault(profile => profile.Id == "pwsh") ?? Profiles.FirstOrDefault();
-            if (_workspace.Current?.ProjectPath is { } root) WorkingDirectory = root;
+            if (generation != Volatile.Read(ref _workspaceGeneration)
+                || !ReferenceEquals(_workspaceContext, context))
+            {
+                await session.DisposeAsync();
+                return;
+            }
+
+            _settingsSession = session;
+            session.Changed += OnScopedSettingsChanged;
+        }
+
+        if (generation != Volatile.Read(ref _workspaceGeneration)
+            || !ReferenceEquals(_workspaceContext, context)
+            || !ReferenceEquals(_settingsSession, session))
+        {
+            return;
+        }
+
+        if (session.Current is not { } snapshot)
+        {
+            return;
+        }
+        ApplyTerminalSettings(snapshot);
+        var previous = SelectedProfile?.Id;
+        _profilesLoaded = false;
+        Profiles.Clear();
+        foreach (var profile in _terminalService.DiscoverProfiles()) Profiles.Add(profile);
+        foreach (var path in snapshot.Effective(BuiltInSettingsCatalog.TerminalCustomShells))
+            if (File.Exists(path) && Profiles.All(profile => !string.Equals(profile.Executable, path, StringComparison.OrdinalIgnoreCase)))
+                Profiles.Add(new($"custom-{path.GetHashCode(StringComparison.OrdinalIgnoreCase):X8}", Path.GetFileNameWithoutExtension(path), path));
+
+        if (generation != Volatile.Read(ref _workspaceGeneration)
+            || !ReferenceEquals(_workspaceContext, context)
+            || !ReferenceEquals(_settingsSession, session))
+        {
+            return;
+        }
+
+        _profilesLoaded = true;
+        var preferred = useSavedDefault ? snapshot.Effective(BuiltInSettingsCatalog.TerminalDefaultProfile) : previous;
+        SelectedProfile = Profiles.FirstOrDefault(profile => profile.Id == preferred)
+            ?? Profiles.FirstOrDefault(profile => profile.Id == "pwsh") ?? Profiles.FirstOrDefault();
+        if (context?.ProjectPath is { } root) WorkingDirectory = root;
     }
 
     private void OnScopedSettingsChanged(object? sender, SettingsChangeSet change)
     {
-        if (_settingsSession?.Current is not { } snapshot) return;
+        if (sender is not ISettingsSession session || !ReferenceEquals(_settingsSession, session)
+            || session.Current is not { } snapshot) return;
         ApplyTerminalSettings(snapshot);
         if (change.Changes.Any(item => item.Key is "nornia.terminal.defaultProfile" or "nornia.terminal.customShells"))
-            _ = LoadProfilesAsync(useSavedDefault: true);
+            _ = LoadProfilesSafelyAsync(useSavedDefault: true);
+    }
+
+    private async Task LoadProfilesSafelyAsync(bool useSavedDefault)
+    {
+        try
+        {
+            await LoadProfilesAsync(useSavedDefault);
+        }
+        catch (Exception ex)
+        {
+            LogService.Write("WARNING", $"刷新终端配置文件失败：{ex.Message}");
+        }
     }
 
     private void ApplyTerminalSettings(SettingsSnapshot snapshot)
     {
+        if (!IsSettingsContextCurrent(snapshot.Context)) return;
         if (!_settingsRevisionGate.TryAccept(snapshot)) return;
         void Apply()
         {
+            if (!IsSettingsContextCurrent(snapshot.Context)) return;
             FontSize = snapshot.Effective(BuiltInSettingsCatalog.TerminalFontSize);
             var family = snapshot.Effective(BuiltInSettingsCatalog.TerminalFontFamily);
             FontFamily = string.IsNullOrWhiteSpace(family) ? FontCatalog.DefaultTerminalFamily : family.Trim();
@@ -105,9 +156,45 @@ public partial class TerminalViewModel : PageViewModel
 
     private async Task OnWorkspaceChangedAsync(ProjectWorkspaceContext? context)
     {
-        if (_settingsSession is not null) await _settingsSession.DisposeAsync();
-        _settingsSession = null;
-        await LoadProfilesAsync(useSavedDefault: true);
+        Interlocked.Increment(ref _workspaceGeneration);
+        var oldSettings = Interlocked.Exchange(ref _settingsSession, null);
+        if (oldSettings is not null) await oldSettings.DisposeAsync();
+
+        await _workspaceContextGate.WaitAsync();
+        try
+        {
+            _workspaceContext = context;
+            var oldSessions = Sessions.ToArray();
+            Sessions.Clear();
+            SelectedSession = null;
+            foreach (var tab in oldSessions)
+            {
+                try
+                {
+                    await _terminalService.StopAsync(tab.Session);
+                }
+                catch (Exception ex) when (ex is IOException or InvalidOperationException)
+                {
+                    LogService.Write("WARNING", $"关闭旧终端会话失败：{ex.Message}");
+                }
+            }
+
+            WorkingDirectory = context?.ProjectPath ?? Environment.CurrentDirectory;
+            await LoadProfilesAsync(useSavedDefault: true);
+        }
+        finally
+        {
+            _workspaceContextGate.Release();
+        }
+    }
+
+    private bool IsSettingsContextCurrent(SettingsContext context)
+    {
+        var workspace = _workspaceContext?.ProjectPath;
+        return string.Equals(context.NormalizedWorkspacePath,
+            workspace is null ? null : Path.GetFullPath(workspace)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+            StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>Shell 下拉切换即更新默认配置文件(持久化);已有会话不受影响。</summary>
@@ -120,16 +207,28 @@ public partial class TerminalViewModel : PageViewModel
         }
 
         LogService.Write("Debug", $"OnSelectedProfileChanged: persisting profile {value.Id}");
-        _ = PersistDefaultShellAsync(value.Id);
+        _ = PersistDefaultShellSafelyAsync(value.Id, _settingsSession);
     }
 
-    private async Task PersistDefaultShellAsync(string profileId)
+    private async Task PersistDefaultShellSafelyAsync(string profileId, ISettingsSession? session)
     {
-        if (_settingsSession is null) return;
+        try
+        {
+            await PersistDefaultShellAsync(profileId, session);
+        }
+        catch (Exception ex)
+        {
+            LogService.Write("WARNING", $"无法保存终端默认配置文件：{ex.Message}");
+        }
+    }
+
+    private async Task PersistDefaultShellAsync(string profileId, ISettingsSession? session)
+    {
+        if (session is null) return;
         await _defaultProfileSaveGate.WaitAsync();
         try
         {
-            var result = await _settingsSession.CommitAsync(SettingScope.User,
+            var result = await session.CommitAsync(SettingScope.User,
                 [new(BuiltInSettingsCatalog.TerminalDefaultProfile.Id, System.Text.Json.Nodes.JsonValue.Create(profileId))]);
             if (!result.IsSuccess)
                 LogService.Write("Warning", $"Failed to persist default shell: {result.Status} - {result.ErrorMessage}");
@@ -144,17 +243,35 @@ public partial class TerminalViewModel : PageViewModel
     [RelayCommand]
     private async Task NewTerminalAsync()
     {
-        if (SelectedProfile is null) return;
-        await RunAsync($"启动 {SelectedProfile.Name}", async token =>
+        await _workspaceContextGate.WaitAsync();
+        try
         {
-            var session = await _terminalService.StartAsync(SelectedProfile, WorkingDirectory, token);
-            var tab = new TerminalTab(session);
-            // 渲染由 TerminalSurfaceControl 订阅 Screen.Changed 驱动;侧栏只反映会话状态,
-            // 因此无需在每次输出块时刷新(旧的 per-chunk Refresh 会全量重建 ToPlainText 造成卡顿)。
-            session.Exited += (_, _) => tab.Refresh();
-            Sessions.Add(tab);
-            SelectedSession = tab;
-        }, canCancel: false);
+            var profile = SelectedProfile;
+            var context = _workspaceContext;
+            var directory = WorkingDirectory;
+            if (profile is null) return;
+
+            await RunAsync($"启动 {profile.Name}", async token =>
+            {
+                var session = await _terminalService.StartAsync(profile, directory, token);
+                if (!ReferenceEquals(_workspaceContext, context))
+                {
+                    await _terminalService.StopAsync(session);
+                    return;
+                }
+
+                var tab = new TerminalTab(session);
+                // 渲染由 TerminalSurfaceControl 订阅 Screen.Changed 驱动;侧栏只反映会话状态,
+                // 因此无需在每次输出块时刷新(旧的 per-chunk Refresh 会全量重建 ToPlainText 造成卡顿)。
+                session.Exited += (_, _) => tab.Refresh();
+                Sessions.Add(tab);
+                SelectedSession = tab;
+            }, canCancel: false);
+        }
+        finally
+        {
+            _workspaceContextGate.Release();
+        }
     }
 
     /// <summary>切换会话(侧栏点选 / 关闭后自动选相邻)也请求聚焦终端表面:焦点不再留在
@@ -171,11 +288,20 @@ public partial class TerminalViewModel : PageViewModel
     private async Task CloseAsync(TerminalTab? tab)
     {
         if (tab is null) return;
-        // 关闭后自动选择相邻会话:原位置还在则取原位,否则取左侧最后一个。
-        var index = Sessions.IndexOf(tab);
-        await _terminalService.StopAsync(tab.Session);
-        Sessions.Remove(tab);
-        SelectedSession = Sessions.Count == 0 ? null : Sessions[Math.Min(index, Sessions.Count - 1)];
+        await _workspaceContextGate.WaitAsync();
+        try
+        {
+            if (!Sessions.Contains(tab)) return;
+            // 关闭后自动选择相邻会话:原位置还在则取原位,否则取左侧最后一个。
+            var index = Sessions.IndexOf(tab);
+            await _terminalService.StopAsync(tab.Session);
+            Sessions.Remove(tab);
+            SelectedSession = Sessions.Count == 0 ? null : Sessions[Math.Min(index, Sessions.Count - 1)];
+        }
+        finally
+        {
+            _workspaceContextGate.Release();
+        }
     }
 
     [RelayCommand(CanExecute = nameof(CanClear))]
@@ -191,19 +317,36 @@ public partial class TerminalViewModel : PageViewModel
             return;
         }
 
-        await RunAsync($"重试启动 {tab.Title}", async token =>
+        await _workspaceContextGate.WaitAsync();
+        try
         {
-            var replacement = new TerminalTab(await _terminalService.StartAsync(tab.Session.Profile, tab.Session.WorkingDirectory, token));
-            replacement.Session.Exited += (_, _) => replacement.Refresh();
-            var index = Sessions.IndexOf(tab);
-            if (index >= 0)
+            if (!Sessions.Contains(tab)) return;
+            var context = _workspaceContext;
+            await RunAsync($"重试启动 {tab.Title}", async token =>
             {
-                Sessions[index] = replacement;
-                SelectedSession = replacement;
-            }
+                var replacementSession = await _terminalService.StartAsync(tab.Session.Profile, tab.Session.WorkingDirectory, token);
+                if (!ReferenceEquals(_workspaceContext, context))
+                {
+                    await _terminalService.StopAsync(replacementSession);
+                    return;
+                }
 
-            await _terminalService.StopAsync(tab.Session);
-        }, canCancel: false);
+                var replacement = new TerminalTab(replacementSession);
+                replacement.Session.Exited += (_, _) => replacement.Refresh();
+                var index = Sessions.IndexOf(tab);
+                if (index >= 0)
+                {
+                    Sessions[index] = replacement;
+                    SelectedSession = replacement;
+                }
+
+                await _terminalService.StopAsync(tab.Session);
+            }, canCancel: false);
+        }
+        finally
+        {
+            _workspaceContextGate.Release();
+        }
     }
 
     /// <summary>复制输出: copies the terminal tab's captured output to the clipboard.</summary>

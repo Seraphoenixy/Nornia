@@ -8,7 +8,11 @@ namespace Nornia.Desktop.Services;
 /// <summary>Single source of truth for the directory currently open in the desktop workbench.
 /// The project directory is deliberately distinct from the Git root: a project may live inside a
 /// larger repository.</summary>
-public sealed record ProjectWorkspaceContext(ProjectAsset Project, string ProjectPath, string? GitRepositoryPath);
+public sealed record ProjectWorkspaceContext(
+    ProjectAsset Project,
+    string ProjectPath,
+    string? GitRepositoryPath,
+    long Generation = 0);
 
 public interface IProjectWorkspaceService
 {
@@ -30,6 +34,7 @@ public sealed class ProjectWorkspaceService(
     IApplicationStateStore stateStore) : IProjectWorkspaceService
 {
     private readonly SemaphoreSlim _gate = new(1, 1);
+    private long _generation;
     private bool _initialized;
     private ISettingsSession? _restoreSession;
     private bool _restoreSessionBound;
@@ -44,9 +49,9 @@ public sealed class ProjectWorkspaceService(
         try
         {
             if (_initialized) return;
-            _initialized = true;
             await BindRestoreSessionAsync(cancellationToken);
             await TryRestoreLastWorkspaceAsync(cancellationToken);
+            _initialized = true;
         }
         finally
         {
@@ -59,10 +64,16 @@ public sealed class ProjectWorkspaceService(
     private async Task BindRestoreSessionAsync(CancellationToken cancellationToken)
     {
         if (_restoreSessionBound) return;
-        _restoreSessionBound = true;
-        _restoreSession = await settingsService.OpenSessionAsync(new(),
+        var session = await settingsService.OpenSessionAsync(new(),
             [BuiltInSettingsCatalog.RestoreLastWorkspace.Id], cancellationToken);
-        _restoreSession.Changed += async (_, _) =>
+        _restoreSession = session;
+        _restoreSessionBound = true;
+        session.Changed += (_, _) => _ = HandleRestoreSessionChangedAsync();
+    }
+
+    private async Task HandleRestoreSessionChangedAsync()
+    {
+        try
         {
             if (_restoreSession?.Current is not { } snapshot ||
                 !snapshot.Effective(BuiltInSettingsCatalog.RestoreLastWorkspace) ||
@@ -81,7 +92,14 @@ public sealed class ProjectWorkspaceService(
             {
                 _gate.Release();
             }
-        };
+        }
+        catch (Exception ex)
+        {
+            // Settings notifications are synchronous .NET events. Keep the async continuation
+            // self-observing so a transient settings/file-system failure cannot become an
+            // unhandled async-void exception or poison future manual activation.
+            System.Diagnostics.Trace.WriteLine($"自动恢复工作区失败：{ex}");
+        }
     }
 
     private async Task TryRestoreLastWorkspaceAsync(CancellationToken cancellationToken)
@@ -104,7 +122,15 @@ public sealed class ProjectWorkspaceService(
         {
             // 自动恢复(启动或会话中开关打开):标记来源,让编辑器区跳过"回放源码文件标签"。
             IsStartupAutoRestore = true;
-            await ActivateCoreAsync(fallback, cancellationToken);
+            try
+            {
+                await ActivateCoreAsync(fallback, cancellationToken);
+            }
+            catch
+            {
+                IsStartupAutoRestore = false;
+                throw;
+            }
         }
     }
 
@@ -114,10 +140,12 @@ public sealed class ProjectWorkspaceService(
         await _gate.WaitAsync(cancellationToken);
         try
         {
-            _initialized = true;
             // 用户主动激活 → 清除启动标记,恢复编辑器布局回放。
             IsStartupAutoRestore = false;
             await ActivateCoreAsync(path, cancellationToken);
+            // 只有一次完整激活成功后才阻止后续的自动初始化;无效路径或失败的上下文
+            // 发布仍允许下一次 EnsureInitializedAsync 重试。
+            _initialized = true;
         }
         finally
         {
@@ -135,12 +163,51 @@ public sealed class ProjectWorkspaceService(
 
         var project = await projectCatalogService.RegisterAsync(projectPath, opened: true, cancellationToken: cancellationToken);
         var gitRoot = FindGitRoot(projectPath);
-        var next = new ProjectWorkspaceContext(project, projectPath, gitRoot);
+        var next = new ProjectWorkspaceContext(project, projectPath, gitRoot,
+            Interlocked.Increment(ref _generation));
         await stateStore.CommitAsync(new([
             new(ApplicationStateField.LastWorkspace, projectPath),
         ]), cancellationToken);
+
+        var previous = Current;
         Current = next;
-        await PublishAsync(next);
+        try
+        {
+            await PublishAsync(next);
+        }
+        catch
+        {
+            // Context consumers update several independent projections. If one consumer fails,
+            // leave the service and the persisted last-workspace value on the same context and
+            // give every consumer a fresh rollback generation so in-flight work from the failed
+            // context cannot be accepted after the rollback.
+            var rollback = previous is null
+                ? null
+                : previous with { Generation = Interlocked.Increment(ref _generation) };
+            Current = rollback;
+            try
+            {
+                await stateStore.CommitAsync(new([
+                    new(ApplicationStateField.LastWorkspace, rollback?.ProjectPath),
+                ]), CancellationToken.None);
+            }
+            catch
+            {
+                // The in-memory rollback is still valuable when the state file is unavailable.
+            }
+
+            try
+            {
+                await PublishAsync(rollback);
+            }
+            catch
+            {
+                // Preserve the original activation failure; consumers are best-effort during
+                // rollback and the service remains on the rollback context above.
+            }
+
+            throw;
+        }
     }
 
     private async Task PublishAsync(ProjectWorkspaceContext? context)
@@ -148,9 +215,29 @@ public sealed class ProjectWorkspaceService(
         var handlers = ContextChanged;
         if (handlers is null) return;
 
+        List<Exception>? failures = null;
         foreach (var handler in handlers.GetInvocationList().Cast<Func<ProjectWorkspaceContext?, Task>>())
         {
-            await handler(context);
+            try
+            {
+                await handler(context);
+            }
+            catch (Exception ex)
+            {
+                // A single page must not prevent the remaining projections from moving to the
+                // same context. The caller still receives the failure and can roll back.
+                (failures ??= []).Add(ex);
+            }
+        }
+
+        if (failures is { Count: 1 })
+        {
+            throw failures[0];
+        }
+
+        if (failures is { Count: > 1 })
+        {
+            throw new AggregateException("一个或多个工作区上下文订阅者切换失败。", failures);
         }
     }
 

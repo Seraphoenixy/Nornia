@@ -66,7 +66,18 @@ public static class MinimapLayout
     /// <summary>Converts a map Y (0..1) into a fractional editor line number for viewport dragging.</summary>
     public static double EditorLineFromMapY(double mapY, Map map) => mapY / map.DocumentLineHeight;
 
-    /// <summary>Editor scroll offset (document pixels) for a fractional editor line.</summary>
-    public static double ScrollOffsetForLine(double editorLine, double lineHeight) =>
-        Math.Max(0, editorLine * lineHeight);
+    /// <summary>Editor scroll offset (document pixels) that places a fractional editor line at
+    /// the vertical center of the viewport: minimap click/drag navigation shows the target line
+    /// in the middle of the screen (VS Code parity). Lines near the document start clamp to 0;
+    /// callers additionally clamp against the real scrollable extent (ScrollToVerticalOffset does).</summary>
+    public static double ScrollOffsetForLine(double editorLine, double lineHeight, double viewportHeight)
+    {
+        if (lineHeight <= 0)
+        {
+            return 0;
+        }
+
+        var visibleLines = Math.Max(0, viewportHeight) / lineHeight;
+        return Math.Max(0, (editorLine - visibleLines / 2) * lineHeight);
+    }
 }

@@ -7,6 +7,7 @@ using Nornia.Core.Models;
 using Nornia.Desktop.Code;
 using Nornia.Desktop.Services;
 using Nornia.Desktop.ViewModels;
+using Serilog;
 using System.Collections.Specialized;
 using System.ComponentModel;
 using System.Windows;
@@ -568,7 +569,7 @@ public partial class DiffDocumentView : UserControl
             }
 
             var item = new MenuItem { Header = header, Tag = "diff-hunk-action", ToolTip = $"对第 {hunkIndex + 1} 个 Diff 块执行“{header}”" };
-            item.Click += async (_, _) => await ExecuteHunkOperationAsync(hunkIndex, operation);
+            item.Click += (_, _) => _ = ExecuteHunkOperationSafelyAsync(hunkIndex, operation);
             menu.Items.Insert(insertAt++, item);
         }
 
@@ -586,12 +587,12 @@ public partial class DiffDocumentView : UserControl
         return displayIndex >= 0 && displayIndex < lines.Count ? lines[displayIndex].HunkIndex : -1;
     }
 
-    private async void InlineStageHunk_Click(object sender, RoutedEventArgs e) => await ExecuteHunkOperationAsync(GetActionHunkIndex(sender), GitHunkOperation.Stage);
-    private async void InlineRestoreHunk_Click(object sender, RoutedEventArgs e) => await ExecuteHunkOperationAsync(GetActionHunkIndex(sender), GitHunkOperation.Restore);
-    private async void InlineUnstageHunk_Click(object sender, RoutedEventArgs e) => await ExecuteHunkOperationAsync(GetActionHunkIndex(sender), GitHunkOperation.Unstage);
-    private async void SideStageHunk_Click(object sender, RoutedEventArgs e) => await ExecuteHunkOperationAsync(GetActionHunkIndex(sender), GitHunkOperation.Stage);
-    private async void SideRestoreHunk_Click(object sender, RoutedEventArgs e) => await ExecuteHunkOperationAsync(GetActionHunkIndex(sender), GitHunkOperation.Restore);
-    private async void SideUnstageHunk_Click(object sender, RoutedEventArgs e) => await ExecuteHunkOperationAsync(GetActionHunkIndex(sender), GitHunkOperation.Unstage);
+    private void InlineStageHunk_Click(object sender, RoutedEventArgs e) => _ = ExecuteHunkOperationSafelyAsync(GetActionHunkIndex(sender), GitHunkOperation.Stage);
+    private void InlineRestoreHunk_Click(object sender, RoutedEventArgs e) => _ = ExecuteHunkOperationSafelyAsync(GetActionHunkIndex(sender), GitHunkOperation.Restore);
+    private void InlineUnstageHunk_Click(object sender, RoutedEventArgs e) => _ = ExecuteHunkOperationSafelyAsync(GetActionHunkIndex(sender), GitHunkOperation.Unstage);
+    private void SideStageHunk_Click(object sender, RoutedEventArgs e) => _ = ExecuteHunkOperationSafelyAsync(GetActionHunkIndex(sender), GitHunkOperation.Stage);
+    private void SideRestoreHunk_Click(object sender, RoutedEventArgs e) => _ = ExecuteHunkOperationSafelyAsync(GetActionHunkIndex(sender), GitHunkOperation.Restore);
+    private void SideUnstageHunk_Click(object sender, RoutedEventArgs e) => _ = ExecuteHunkOperationSafelyAsync(GetActionHunkIndex(sender), GitHunkOperation.Unstage);
 
     private int GetActionHunkIndex(object sender)
     {
@@ -604,12 +605,36 @@ public partial class DiffDocumentView : UserControl
                     return hunkIndex;
                 }
 
-                current = VisualTreeHelper.GetParent(current);
+                current = current switch
+                {
+                    FrameworkContentElement content => content.Parent ?? ContentOperations.GetParent(content),
+                    ContentElement content => ContentOperations.GetParent(content),
+                    Visual or System.Windows.Media.Media3D.Visual3D =>
+                        VisualTreeHelper.GetParent(current) ?? LogicalTreeHelper.GetParent(current),
+                    _ => LogicalTreeHelper.GetParent(current),
+                };
             }
         }
 
         return _hoverHunkIndex;
     }
+    private async Task ExecuteHunkOperationSafelyAsync(int hunkIndex, GitHunkOperation operation)
+    {
+        try
+        {
+            await ExecuteHunkOperationAsync(hunkIndex, operation);
+        }
+        catch (OperationCanceledException)
+        {
+            // The diff tab may be disposed while the Git operation or the final
+            // scroll restoration is still in flight.
+        }
+        catch (Exception exception)
+        {
+            Log.Error(exception, "Diff 块操作完成后的视图更新失败");
+        }
+    }
+
     private async Task ExecuteHunkOperationAsync(int hunkIndex, GitHunkOperation operation)
     {
         if (_tab is null || ! _tab.CanApplyHunk(hunkIndex, operation))
@@ -1124,7 +1149,8 @@ public partial class DiffDocumentView : UserControl
         }
 
         var lineNumber = matchIndex + 1;
-        InlineEditor.ScrollTo(lineNumber, 0);
+        // 查找跳转(上一处/下一处匹配按钮点击):目标行居中显示。
+        CenterLine(InlineEditor, lineNumber);
         InlineEditor.CaretOffset = InlineEditor.Document.GetLineByNumber(lineNumber).Offset + column;
         InlineEditor.SelectionStart = InlineEditor.CaretOffset;
         InlineEditor.SelectionLength = Math.Min(_tab.FindText?.Length ?? 0, Math.Max(0, text.Length - column));
@@ -1133,11 +1159,11 @@ public partial class DiffDocumentView : UserControl
         var line = _inlineLines[matchIndex];
         if (line.OldLineNumber is { } oldLine && OldEditor.Document is { } oldDoc && oldLine <= oldDoc.LineCount)
         {
-            OldEditor.ScrollTo(oldLine, 0);
+            CenterLine(OldEditor, oldLine);
         }
         if (line.NewLineNumber is { } newLine && NewEditor.Document is { } newDoc && newLine <= newDoc.LineCount)
         {
-            NewEditor.ScrollTo(newLine, 0);
+            CenterLine(NewEditor, newLine);
         }
 
         var segments = new List<(int Start, int Length)>();
@@ -1712,7 +1738,8 @@ public partial class DiffDocumentView : UserControl
         var muted = Brush("MutedTextBrush") ?? Brushes.Gray;
         var hover = Brush("HoverBrush") ?? Brushes.Transparent;
         var row = new Border { Cursor = Cursors.Hand, Background = Brushes.Transparent, Padding = new Thickness(8, 2, 8, 2) };
-        row.MouseLeftButtonUp += (_, _) => InlineEditor.ScrollTo(headerStart, 0);
+        // sticky 段头点击:跳转到段首行并居中显示。
+        row.MouseLeftButtonUp += (_, _) => CenterLine(InlineEditor, headerStart);
         var panel = new StackPanel { Orientation = Orientation.Horizontal };
         panel.Children.Add(new TextBlock
         {

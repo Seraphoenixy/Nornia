@@ -79,7 +79,19 @@ public partial class EnvironmentManagementViewModel : PageViewModel
         OnPropertyChanged(nameof(CurrentPage));
         if (value is not null)
         {
-            _ = value.Page.ActivateAsync();
+            _ = ActivateSectionSafelyAsync(value.Page);
+        }
+    }
+
+    private async Task ActivateSectionSafelyAsync(PageViewModel page)
+    {
+        try
+        {
+            await page.ActivateAsync();
+        }
+        catch (Exception ex)
+        {
+            LogService.WriteException("ERROR", $"环境页面“{page.Title}”初始化失败", ex);
         }
     }
 }

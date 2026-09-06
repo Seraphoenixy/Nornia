@@ -57,6 +57,8 @@ public partial class WorkspaceViewModel : PageViewModel
     private readonly Nornia.Core.Coalescing.RunOnceScheduler _selectionOpenScheduler = new(100);
     private readonly object _pendingSelectionOpenGate = new();
     private WorkspaceFileRow? _pendingSelectionOpenRow;
+    private long _workspaceGeneration;
+    private long _pendingSelectionOpenGeneration;
 
     /// <summary>当前紧凑文件夹投影开关(设置驱动;内部供测试断言实际接线)。</summary>
     internal bool CompactFoldersEnabled => _compactFoldersEnabled;
@@ -129,19 +131,49 @@ public partial class WorkspaceViewModel : PageViewModel
 
     private async Task BindSettingsAsync()
     {
-        if (_settingsSession is not null) await _settingsSession.DisposeAsync();
-        _settingsSession = await _scopedSettings.OpenSessionAsync(new(_workspaceService.Current?.ProjectPath),
+        var generation = Volatile.Read(ref _workspaceGeneration);
+        var context = _workspaceService.Current;
+        var session = await _scopedSettings.OpenSessionAsync(new(context?.ProjectPath),
             [BuiltInSettingsCatalog.ExplorerTreeGuides.Id, BuiltInSettingsCatalog.FilesExclude.Id,
                 BuiltInSettingsCatalog.ExplorerCompactFolders.Id]);
-        _settingsSession.Changed += (_, _) => ApplyScopedSettings(_settingsSession.Current!);
-        ApplyScopedSettings(_settingsSession.Current!);
+        if (generation != Volatile.Read(ref _workspaceGeneration)
+            || !ReferenceEquals(_workspaceService.Current, context))
+        {
+            await session.DisposeAsync();
+            return;
+        }
+
+        var previous = _settingsSession;
+        _settingsSession = session;
+        if (previous is not null) await previous.DisposeAsync();
+        session.Changed += (_, _) => ApplyScopedSettingsSafely(session);
+        ApplyScopedSettingsSafely(session);
+    }
+
+    private void ApplyScopedSettingsSafely(ISettingsSession session)
+    {
+        if (session.Current is not { } snapshot)
+        {
+            return;
+        }
+
+        try
+        {
+            ApplyScopedSettings(snapshot);
+        }
+        catch (Exception ex)
+        {
+            LogService.Write("WARNING", $"资源管理器设置应用失败：{ex.Message}");
+        }
     }
 
     private void ApplyScopedSettings(SettingsSnapshot snapshot)
     {
+        if (!IsSettingsContextCurrent(snapshot.Context)) return;
         if (!_settingsRevisionGate.TryAccept(snapshot)) return;
         void Apply()
         {
+            if (!IsSettingsContextCurrent(snapshot.Context)) return;
             AreTreeGuidesVisible = snapshot.Effective(BuiltInSettingsCatalog.ExplorerTreeGuides);
             var compactChanged = _compactFoldersEnabled != snapshot.Effective(BuiltInSettingsCatalog.ExplorerCompactFolders);
             _compactFoldersEnabled = snapshot.Effective(BuiltInSettingsCatalog.ExplorerCompactFolders);
@@ -170,7 +202,108 @@ public partial class WorkspaceViewModel : PageViewModel
         }
     }
 
-    private Task OnWorkspaceSettingsChangedAsync(ProjectWorkspaceContext? context) => BindSettingsAsync();
+    private async Task OnWorkspaceSettingsChangedAsync(ProjectWorkspaceContext? context)
+    {
+        var generation = Interlocked.Increment(ref _workspaceGeneration);
+        CancelPendingSelectionOpen();
+        lock (_pendingTreeGate)
+        {
+            _pendingTreePaths.Clear();
+        }
+
+        Interlocked.Exchange(ref _treeRefreshPending, 0);
+        await _treeMutationGate.WaitAsync();
+        try
+        {
+            if (generation == Volatile.Read(ref _workspaceGeneration))
+            {
+                ClearTreeProjection(clearWorkspacePath: context is null);
+            }
+        }
+        finally
+        {
+            _treeMutationGate.Release();
+        }
+
+        await BindSettingsAsync();
+    }
+
+    private bool IsSettingsContextCurrent(SettingsContext context)
+    {
+        var current = _workspaceService.Current;
+        return string.Equals(context.NormalizedWorkspacePath,
+            current?.ProjectPath is { } path ? NormalizePath(path) : null,
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool IsCurrentGeneration(long generation) => generation == Volatile.Read(ref _workspaceGeneration);
+
+    private bool IsCurrentTreeNode(WorkspaceNode node)
+    {
+        var root = node;
+        while (root.Parent is not null)
+        {
+            root = root.Parent;
+        }
+
+        return RootNodes.Any(candidate => ReferenceEquals(candidate, root));
+    }
+
+    private static string NormalizePath(string path) =>
+        Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+
+    private static bool PathsEqual(string? left, string? right)
+    {
+        if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right)) return false;
+        try
+        {
+            return string.Equals(NormalizePath(left), NormalizePath(right), StringComparison.OrdinalIgnoreCase);
+        }
+        catch (ArgumentException)
+        {
+            return string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    private void ClearTreeProjection(bool clearWorkspacePath)
+    {
+        CancelPendingSelectionOpen();
+        lock (_pendingTreeGate)
+        {
+            _pendingTreePaths.Clear();
+        }
+
+        foreach (var root in RootNodes.ToArray())
+        {
+            DropTreeRecursive(root);
+        }
+
+        foreach (var row in _rowCache.Values.ToArray())
+        {
+            row.Detach();
+        }
+
+        _rowCache.Clear();
+        _suppressTreeSelectionOpen = true;
+        try
+        {
+            SelectedTreeRow = null;
+            WorkspaceTreeRows.Clear();
+        }
+        finally
+        {
+            _suppressTreeSelectionOpen = false;
+        }
+
+        RootNodes.Clear();
+        _statusSource.Clear();
+        _lastStatusMap = null;
+        _fileWatcher.UpdateDirectories([]);
+        if (clearWorkspacePath)
+        {
+            WorkspacePath = string.Empty;
+        }
+    }
 
     [RelayCommand]
     private async Task ChooseWorkspaceAsync()
@@ -184,28 +317,38 @@ public partial class WorkspaceViewModel : PageViewModel
 
     public async Task OpenWorkspaceAsync(string path)
     {
-        WorkspacePath = path;
-        RootNodes.Clear();
-        _statusSource.Clear();
-        // 状态源已清空、树被整体重建:diff 基线必须同时作废,否则下一次 ApplyGitStatus 若与
-        // 旧工作区的状态 map 恰好相等会被等值跳过,新树节点将永远缺少 git 装饰(后续增量
-        // 刷新只覆盖变化路径,未变化文件依然不上色)。
-        _lastStatusMap = null;
-        var root = new WorkspaceNode(path, true, path, _statusSource);
-        root.CompactFolders = _compactFoldersEnabled;
-        RootNodes.Add(root);
-        // V4 诊断计数器随工作区重置。
-        IncrementalSpliceCount = 0;
-        FullSyncCount = 0;
-        // VS Code opens a workspace with the root folder expanded so the tree is visible at once.
-        root.IsExpanded = true;
-        // Attach before the first enumeration: otherwise a file created between enumeration and
-        // Attach remains absent until a manual refresh.
-        _fileWatcher.Attach(path);
-        await root.LoadChildrenAsync();
-        SyncTreeRows();
-        RefreshWatchedDirectories();
-        WorkspaceOpened?.Invoke(this, path);
+        var generation = Interlocked.Increment(ref _workspaceGeneration);
+        CancelPendingSelectionOpen();
+        await _treeMutationGate.WaitAsync();
+        try
+        {
+            if (generation != Volatile.Read(ref _workspaceGeneration)) return;
+
+            WorkspacePath = path;
+            ClearTreeProjection(clearWorkspacePath: false);
+            var root = new WorkspaceNode(path, true, path, _statusSource);
+            root.CompactFolders = _compactFoldersEnabled;
+            RootNodes.Add(root);
+            // V4 诊断计数器随工作区重置。
+            IncrementalSpliceCount = 0;
+            FullSyncCount = 0;
+            // VS Code opens a workspace with the root folder expanded so the tree is visible at once.
+            root.IsExpanded = true;
+            // Attach before the first enumeration: otherwise a file created between enumeration and
+            // Attach remains absent until a manual refresh.
+            _fileWatcher.Attach(path);
+            await root.LoadChildrenAsync();
+            if (generation != Volatile.Read(ref _workspaceGeneration)
+                || RootNodes.Count == 0 || !ReferenceEquals(RootNodes[0], root)) return;
+
+            SyncTreeRows();
+            RefreshWatchedDirectories();
+            WorkspaceOpened?.Invoke(this, path);
+        }
+        finally
+        {
+            _treeMutationGate.Release();
+        }
     }
 
     /// <summary>Selection-driven open: folders are expanded/collapsed by the row click or the chevron
@@ -214,7 +357,7 @@ public partial class WorkspaceViewModel : PageViewModel
     [RelayCommand]
     private Task OpenNodeAsync(WorkspaceNode? node)
     {
-        if (node is null || _suppressSelectionOpen || node.IsDirectory)
+        if (node is null || !IsCurrentTreeNode(node) || _suppressSelectionOpen || node.IsDirectory)
         {
             return Task.CompletedTask;
         }
@@ -237,16 +380,18 @@ public partial class WorkspaceViewModel : PageViewModel
         if (row is null) return;
 
         var node = row.Node;
+        var generation = Volatile.Read(ref _workspaceGeneration);
+        if (!IsCurrentTreeNode(node)) return;
 
         // 防御兜底:"chevron 显示已展开但子树未加载"的不一致状态(IsExpanded=true 且只剩占位符)——
         // 旧刷新行为的遗留(现由 DropChildren 同步重置),或未来某条 drop 路径忘记重置展开态。
         // 此状态下按正常逻辑翻转只会切换空展开(delta=0,无可见变化),用户需点两次才生效;而用户
         // 心智模型是"该目录未展开"(chevron 朝下但无子行),故本次点击直接加载并重投影,一次生效。
-        // 正常流程中加载在启动瞬间即置 IsLoaded=true(CoreAsync 首个 await 前),在途展开不会命中
-        // 本分支。
+        // 正常流程中 LoadChildrenAsync 会先登记进行中的任务再枚举;在途展开不会命中本分支。
         if (node.IsExpanded && !node.IsLoaded)
         {
             await node.LoadChildrenAsync();
+            if (!IsCurrentGeneration(generation) || !IsCurrentTreeNode(node)) return;
             SyncTreeRows();
             RefreshWatchedDirectories();
             return;
@@ -267,6 +412,8 @@ public partial class WorkspaceViewModel : PageViewModel
                 await node.LoadChildrenAsync();
             }
         }
+
+        if (!IsCurrentGeneration(generation) || !IsCurrentTreeNode(node)) return;
 
         RefreshWatchedDirectories();
 
@@ -471,7 +618,7 @@ public partial class WorkspaceViewModel : PageViewModel
     private Task OpenTreeFilePermanentAsync(WorkspaceFileRow? row)
     {
         var node = row?.Node;
-        if (node is null || node.IsDirectory)
+        if (node is null || !IsCurrentTreeNode(node) || node.IsDirectory)
         {
             return Task.CompletedTask;
         }
@@ -485,7 +632,7 @@ public partial class WorkspaceViewModel : PageViewModel
     [RelayCommand(CanExecute = nameof(CanRequestDiff))]
     private void RequestDiff(WorkspaceNode? node)
     {
-        if (node is null || node.IsDirectory || _statusSource.Lookup(node.RelativePath) is null)
+        if (node is null || !IsCurrentTreeNode(node) || node.IsDirectory || _statusSource.Lookup(node.RelativePath) is null)
         {
             return;
         }
@@ -539,9 +686,11 @@ public partial class WorkspaceViewModel : PageViewModel
     [RelayCommand]
     private async Task ExpandAllAsync(WorkspaceNode? node)
     {
-        if (node is not null)
+        var generation = Volatile.Read(ref _workspaceGeneration);
+        if (node is not null && IsCurrentTreeNode(node))
         {
             await ExpandRecursiveAsync(node);
+            if (!IsCurrentGeneration(generation) || !IsCurrentTreeNode(node)) return;
             SyncTreeRows();
             RefreshWatchedDirectories();
         }
@@ -550,7 +699,7 @@ public partial class WorkspaceViewModel : PageViewModel
     [RelayCommand]
     private void CollapseAll(WorkspaceNode? node)
     {
-        if (node is not null)
+        if (node is not null && IsCurrentTreeNode(node))
         {
             CollapseRecursive(node);
             SyncTreeRows();
@@ -562,7 +711,9 @@ public partial class WorkspaceViewModel : PageViewModel
     [RelayCommand]
     private async Task RefreshAsync()
     {
-        if (RootNodes.Count == 0)
+        var generation = Volatile.Read(ref _workspaceGeneration);
+        var workspacePath = WorkspacePath;
+        if (RootNodes.Count == 0 || string.IsNullOrWhiteSpace(workspacePath))
         {
             return;
         }
@@ -570,14 +721,17 @@ public partial class WorkspaceViewModel : PageViewModel
         await _treeMutationGate.WaitAsync();
         try
         {
-            _fileWatcher.Attach(WorkspacePath);
-            foreach (var root in RootNodes.ToArray())
-            {
-                DropTreeRecursive(root);
-            }
+            if (!IsCurrentGeneration(generation) || RootNodes.Count == 0
+                || !PathsEqual(WorkspacePath, workspacePath)) return;
 
-            RootNodes[0].IsExpanded = true;
-            await RootNodes[0].LoadChildrenAsync();
+            _fileWatcher.Attach(workspacePath);
+            var root = RootNodes[0];
+            DropTreeRecursive(root);
+            root.IsExpanded = true;
+            await root.LoadChildrenAsync();
+            if (!IsCurrentGeneration(generation) || RootNodes.Count == 0
+                || !ReferenceEquals(RootNodes[0], root)) return;
+
             SyncTreeRows();
             RefreshWatchedDirectories();
         }
@@ -742,11 +896,13 @@ public partial class WorkspaceViewModel : PageViewModel
     /// should. Expansion state is preserved: this is an in-place update, not a refresh-reset.</summary>
     private async Task RunTreeRefreshAsync()
     {
+        var generation = Volatile.Read(ref _workspaceGeneration);
         var gateHeld = false;
         try
         {
             await _treeMutationGate.WaitAsync();
             gateHeld = true;
+            if (!IsCurrentGeneration(generation)) return;
             HashSet<string> paths;
             lock (_pendingTreeGate)
             {
@@ -816,6 +972,7 @@ public partial class WorkspaceViewModel : PageViewModel
             }
 
             await Task.WhenAll(loads);
+            if (!IsCurrentGeneration(generation)) return;
             SyncTreeRows();
             RefreshWatchedDirectories();
         }
@@ -834,22 +991,29 @@ public partial class WorkspaceViewModel : PageViewModel
         }
     }
 
-    /// <summary>Watch only directories whose children are currently materialized. Collapsed lazy
-    /// folders reconcile on their next expansion, so they do not need native watchers.</summary>
+    /// <summary>Watch directories whose children are currently materialized. Never-loaded lazy
+    /// folders reconcile on their next expansion; loaded descendants remain watched because the
+    /// native watchers are non-recursive and compact-folder rows can expose a deeper directory
+    /// through a collapsed ancestor.</summary>
     private void RefreshWatchedDirectories()
     {
         var directories = new List<string>();
         foreach (var root in RootNodes)
         {
-            CollectWatchedDirectories(root, directories, isRoot: true);
+            CollectWatchedDirectories(root, directories);
         }
 
         _fileWatcher.UpdateDirectories(directories);
     }
 
-    private static void CollectWatchedDirectories(WorkspaceNode node, List<string> directories, bool isRoot)
+    private static void CollectWatchedDirectories(WorkspaceNode node, List<string> directories)
     {
-        if (!node.IsDirectory || !node.IsLoaded || (!isRoot && !node.IsExpanded))
+        // Watch every materialized directory, not only expanded ones. Watchers are
+        // non-recursive, and a loaded child can still be represented by a compact-folder
+        // row while one of its ancestors is collapsed. Keeping all loaded directories watched
+        // prevents changes in that effective row from being missed; never-loaded folders remain
+        // lazy and are still not watched.
+        if (!node.IsDirectory || !node.IsLoaded)
         {
             return;
         }
@@ -859,7 +1023,7 @@ public partial class WorkspaceViewModel : PageViewModel
         {
             if (child.IsDirectory && !child.IsPlaceholder)
             {
-                CollectWatchedDirectories(child, directories, isRoot: false);
+                CollectWatchedDirectories(child, directories);
             }
         }
     }
@@ -1065,7 +1229,10 @@ public partial class WorkspaceViewModel : PageViewModel
     /// the node so the user can see where the change lives. Used by source-control reveal and active-editor sync.</summary>
     public async Task<bool> RevealNodeAsync(string relativePath, CancellationToken cancellationToken = default)
     {
-        if (cancellationToken.IsCancellationRequested || string.IsNullOrWhiteSpace(relativePath) || RootNodes.Count == 0)
+        var generation = Volatile.Read(ref _workspaceGeneration);
+        var root = RootNodes.FirstOrDefault();
+        if (cancellationToken.IsCancellationRequested || string.IsNullOrWhiteSpace(relativePath)
+            || root is null)
         {
             return false;
         }
@@ -1076,11 +1243,12 @@ public partial class WorkspaceViewModel : PageViewModel
             return false;
         }
 
-        var current = RootNodes[0];
+        var current = root;
         for (var index = 0; index < segments.Length; index++)
         {
             await current.LoadChildrenAsync();
-            if (cancellationToken.IsCancellationRequested)
+            if (cancellationToken.IsCancellationRequested || !IsCurrentGeneration(generation)
+                || !IsCurrentTreeNode(current))
             {
                 return false;
             }
@@ -1096,9 +1264,11 @@ public partial class WorkspaceViewModel : PageViewModel
             {
                 match.IsExpanded = true;
                 current = match;
+                if (!IsCurrentGeneration(generation) || !IsCurrentTreeNode(current)) return false;
             }
             else
             {
+                if (!IsCurrentGeneration(generation) || !IsCurrentTreeNode(match)) return false;
                 _suppressSelectionOpen = true;
                 try
                 {
@@ -1207,6 +1377,15 @@ public partial class WorkspaceViewModel : PageViewModel
             return;
         }
 
+        if (!IsCurrentTreeNode(value.Node) || !WorkspaceTreeRows.Contains(value))
+        {
+            CancelPendingSelectionOpen();
+            _suppressTreeSelectionOpen = true;
+            SelectedTreeRow = null;
+            _suppressTreeSelectionOpen = false;
+            return;
+        }
+
         if (value is WorkspaceFolderRow)
         {
             _suppressTreeSelectionOpen = true;
@@ -1224,6 +1403,7 @@ public partial class WorkspaceViewModel : PageViewModel
             lock (_pendingSelectionOpenGate)
             {
                 _pendingSelectionOpenRow = fileRow;
+                _pendingSelectionOpenGeneration = Volatile.Read(ref _workspaceGeneration);
             }
 
             _selectionOpenScheduler.Schedule();
@@ -1236,19 +1416,24 @@ public partial class WorkspaceViewModel : PageViewModel
         lock (_pendingSelectionOpenGate)
         {
             _pendingSelectionOpenRow = null;
+            _pendingSelectionOpenGeneration = 0;
         }
     }
 
     private void RunPendingSelectionOpen()
     {
         WorkspaceFileRow? row;
+        long generation;
         lock (_pendingSelectionOpenGate)
         {
             row = _pendingSelectionOpenRow;
             _pendingSelectionOpenRow = null;
+            generation = _pendingSelectionOpenGeneration;
+            _pendingSelectionOpenGeneration = 0;
         }
 
-        if (row is null || _suppressTreeSelectionOpen)
+        if (row is null || _suppressTreeSelectionOpen || !IsCurrentGeneration(generation)
+            || !IsCurrentTreeNode(row.Node) || !WorkspaceTreeRows.Contains(row))
         {
             return;
         }
@@ -1304,6 +1489,20 @@ public partial class WorkspaceViewModel : PageViewModel
         finally
         {
             _suppressTreeSelectionOpen = false;
+        }
+
+        if (SelectedTreeRow is not null && !desired.Contains(SelectedTreeRow, ReferenceEqualityComparer.Instance))
+        {
+            CancelPendingSelectionOpen();
+            _suppressTreeSelectionOpen = true;
+            try
+            {
+                SelectedTreeRow = null;
+            }
+            finally
+            {
+                _suppressTreeSelectionOpen = false;
+            }
         }
 
         // 选区:被移除的选中项会清空 ListBox 选区,按节点身份重新指回同一行对象。
@@ -1803,6 +2002,8 @@ public sealed partial class WorkspaceNode : ObservableObject
     }
 
     private Task? _pendingLoad;
+    private int _pendingLoadGeneration;
+    private int _childrenLoadGeneration;
 
     /// <summary>枚举目录内容(枚举在 ThreadPool 执行:.NET 无异步目录枚举 API,超大目录的
     /// 枚举不再阻塞 UI 线程——展开/打开卡顿的修复点之一)。并发调用加入进行中的同一次加载
@@ -1814,9 +2015,11 @@ public sealed partial class WorkspaceNode : ObservableObject
             return Task.CompletedTask;
         }
 
-        // 进行中的加载优先:CoreAsync 在首个 await 前就置 IsLoaded=true,
-        // 若先判 IsLoaded,并发调用者会误以为已加载而拿到空 Children。
-        if (_pendingLoad is not null)
+        // 进行中的加载优先:CoreAsync 在首个 await 前即登记 _pendingLoad,
+        // 若先判 IsLoaded,并发调用者会误以为已加载而拿到空 Children。DropChildren
+        // 会推进代次,因此刷新期间不能复用已经失效的枚举任务。
+        var generation = Volatile.Read(ref _childrenLoadGeneration);
+        if (_pendingLoad is not null && _pendingLoadGeneration == generation)
         {
             return _pendingLoad;
         }
@@ -1826,19 +2029,28 @@ public sealed partial class WorkspaceNode : ObservableObject
             return Task.CompletedTask;
         }
 
-        return _pendingLoad ??= LoadChildrenCoreAsync();
+        var task = LoadChildrenCoreAsync(generation);
+        _pendingLoad = task;
+        _pendingLoadGeneration = generation;
+        return task;
     }
 
-    private async Task LoadChildrenCoreAsync()
+    private async Task LoadChildrenCoreAsync(int generation)
     {
-        IsLoaded = true;
-        Children.Clear();
         try
         {
             var (directories, files) = await EnumerateChildrenCoreAsync();
 
+            // 刷新/切换工作区可能在磁盘枚举期间丢弃了该节点。旧结果不能重新物化到
+            // 已经失效的节点,否则新一轮加载会被旧任务覆盖。
+            if (generation != Volatile.Read(ref _childrenLoadGeneration))
+            {
+                return;
+            }
+
             // Children 的变更回到 UI 线程(续延捕获自 UI 上下文);顺序与旧同步版一致:
             // 排序后的目录在前,排序后的文件在后。
+            Children.Clear();
             foreach (var directory in directories)
             {
                 Children.Add(CreateChildNode(directory, true));
@@ -1848,17 +2060,42 @@ public sealed partial class WorkspaceNode : ObservableObject
             {
                 Children.Add(CreateChildNode(file, false));
             }
+
+            // 只有完整枚举并成功物化后才标记为已加载。这样临时的权限/IO/删除竞态
+            // 不会把失败结果永久缓存成“空目录”。
+            IsLoaded = true;
         }
         catch (Exception)
         {
-            // 与旧行为一致:枚举失败时节点保持空/占位状态。
+            if (generation != Volatile.Read(ref _childrenLoadGeneration))
+            {
+                return;
+            }
+
+            // 保留旧的物化子节点；首次加载失败时补回占位节点，下一次展开仍可重试。
+            IsLoaded = false;
+            if (Children.Count == 0)
+            {
+                Children.Add(new WorkspaceNode(string.Empty, false, _rootPath, _statusSource)
+                {
+                    IsPlaceholder = true,
+                    Parent = this,
+                });
+            }
         }
         finally
         {
-            _pendingLoad = null;
+            if (_pendingLoadGeneration == generation)
+            {
+                _pendingLoad = null;
+            }
+
             // V4: 子节点集合变化(占位符 → 真实子树)可能改变紧凑链形态与可见行数,
             // 重算自身并向父链传播(未展开/枚举失败时计数不变,传播即刻停止)。
-            RecomputeVisibleRowCountChain();
+            if (generation == Volatile.Read(ref _childrenLoadGeneration))
+            {
+                RecomputeVisibleRowCountChain();
+            }
         }
     }
 
@@ -1898,9 +2135,15 @@ public sealed partial class WorkspaceNode : ObservableObject
             return; // 未加载目录保持惰性:下次展开时按磁盘实况枚举
         }
 
+        var generation = Volatile.Read(ref _childrenLoadGeneration);
         if (_pendingLoad is not null)
         {
             await _pendingLoad; // 序列化:进行中的展开加载完成后按同一磁盘实况收敛
+        }
+
+        if (generation != Volatile.Read(ref _childrenLoadGeneration) || !IsLoaded)
+        {
+            return;
         }
 
         string[] directories;
@@ -1912,6 +2155,11 @@ public sealed partial class WorkspaceNode : ObservableObject
         catch (Exception)
         {
             return; // 枚举失败:保留既有子树,下一次刷新重试
+        }
+
+        if (generation != Volatile.Read(ref _childrenLoadGeneration) || !IsLoaded)
+        {
+            return;
         }
 
         // 存活节点按全路径索引(同一目录下文件与目录不可能同名同路径)。
@@ -1970,6 +2218,7 @@ public sealed partial class WorkspaceNode : ObservableObject
             IsExpanded = false;
         }
 
+        Interlocked.Increment(ref _childrenLoadGeneration);
         IsLoaded = false;
         Children.Clear();
         Children.Add(new WorkspaceNode(string.Empty, false, _rootPath, _statusSource) { IsPlaceholder = true, Parent = this });
