@@ -880,13 +880,13 @@ public partial class MainWindow : Window
             return;
         }
 
-        // Focus events are routed before WPF commits Keyboard.FocusedElement, and the deferred
-        // focus refresh can still be pending when the user double-clicks a word and immediately
-        // presses Ctrl+C. Refresh from the actual focused element at dispatch time so the global
-        // list-copy binding cannot swallow a native text-editor copy.
-        UpdateFocusContext();
         try
         {
+            // Focus events are routed before WPF commits Keyboard.FocusedElement, and the deferred
+            // focus refresh can still be pending when the user double-clicks a word and immediately
+            // presses Ctrl+C. Refresh from the actual focused element at dispatch time so the global
+            // list-copy binding cannot swallow a native text-editor copy.
+            UpdateFocusContext();
             if (await _keybindings.DispatchAsync(NormalizeKeyStroke(e)))
             {
                 e.Handled = true;

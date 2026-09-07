@@ -1420,7 +1420,13 @@ public sealed class DesignSystemResourceTests
         Assert.Contains("FindAncestor<DiffDocumentView>", mainWindow);
         Assert.Contains("FrameworkContentElement content =>", mainWindow);
         Assert.Contains("ContentOperations.GetParent", mainWindow);
-        Assert.Contains("UpdateFocusContext();\n        if (await _keybindings.DispatchAsync", mainWindow);
+        // Focus must be refreshed before keybinding dispatch. Keep this assertion independent of
+        // the exception-handling block's indentation so adding a dispatch guard does not make the
+        // source-wiring test fail for formatting alone.
+        var focusRefresh = mainWindow.LastIndexOf("UpdateFocusContext();", StringComparison.Ordinal);
+        var keybindingDispatch = mainWindow.IndexOf("await _keybindings.DispatchAsync", StringComparison.Ordinal);
+        Assert.True(focusRefresh >= 0 && keybindingDispatch > focusRefresh,
+            "PreviewKeyDown must refresh focus context before dispatching keybindings.");
         // Ctrl+F with a selection in the document auto-fills the find box; the prev/next
         // buttons re-evaluate their enabled state when the match count changes.
         Assert.Contains("_tab.Content[segment.Offset..(segment.Offset + segment.Length)]", previewCode);

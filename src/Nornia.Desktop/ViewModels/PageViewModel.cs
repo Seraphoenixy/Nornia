@@ -1,6 +1,9 @@
 using CommunityToolkit.Mvvm.ComponentModel;
 using Nornia.Desktop.Localization;
 using Nornia.Desktop.Services;
+using Nornia.Core.Models;
+using System.Globalization;
+using System.Text.RegularExpressions;
 
 namespace Nornia.Desktop.ViewModels;
 
@@ -35,8 +38,40 @@ public abstract partial class PageViewModel(string title, IUiLogService logServi
     private OperationResult? lastOperationResult;
 
     public bool HasOperation => CurrentOperation is not null;
-    protected IProgress<Nornia.Core.Models.ProcessOutput> OperationProgress =>
-        LogService.CreateProcessProgress(CurrentOperation?.CorrelationId);
+    protected IProgress<ProcessOutput> OperationProgress
+    {
+        get
+        {
+            var operation = CurrentOperation;
+            var logProgress = LogService.CreateProcessProgress(operation?.CorrelationId);
+            return new Progress<ProcessOutput>(output =>
+            {
+                logProgress.Report(output);
+                if (operation is null
+                    || !ReferenceEquals(CurrentOperation, operation)
+                    || operation.Phase != OperationPhase.Running)
+                {
+                    return;
+                }
+
+                if (!OperationProgressParser.TryGetPercentage(output.Text, out var percentage))
+                {
+                    return;
+                }
+
+                // A process can merge stdout/stderr progress lines out of order. Do not let an
+                // older line make a visible download bar move backwards.
+                if (operation.Progress is { } previous && percentage < previous)
+                {
+                    return;
+                }
+
+                operation.Progress = percentage;
+                operation.Detail = $"{operation.Title} {operation.ProgressDisplay}";
+                StatusMessage = operation.Detail;
+            });
+        }
+    }
 
     public async Task ActivateAsync()
     {
@@ -224,9 +259,56 @@ public partial class OperationState : ObservableObject
 
     [ObservableProperty] private OperationPhase phase = OperationPhase.Running;
     [ObservableProperty] private string detail = string.Empty;
+    /// <summary>Latest parsed process percentage in the 0-100 range; null means indeterminate.</summary>
     [ObservableProperty] private double? progress;
     [ObservableProperty] private bool canCancel;
     [ObservableProperty] private string recommendedNextStep = string.Empty;
+
+    public bool HasProgress => Progress is not null;
+    public string ProgressDisplay => Progress is { } value
+        ? $"{value.ToString("0.#", CultureInfo.CurrentCulture)}%"
+        : string.Empty;
+
+    partial void OnProgressChanged(double? value)
+    {
+        OnPropertyChanged(nameof(HasProgress));
+        OnPropertyChanged(nameof(ProgressDisplay));
+    }
+}
+
+/// <summary>Extracts percentages from winget/scoop/chocolatey output. Package managers use both
+/// integer and decimal percentages, and winget may emit several carriage-return updates in one
+/// line, so the last valid match is the current progress value.</summary>
+internal static class OperationProgressParser
+{
+    private static readonly Regex PercentagePattern = new(
+        @"(?<!\d)(?<value>\d{1,3}(?:[.,]\d+)?)\s*%",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+
+    public static bool TryGetPercentage(string? text, out double percentage)
+    {
+        percentage = 0;
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return false;
+        }
+
+        var matches = PercentagePattern.Matches(text);
+        for (var index = matches.Count - 1; index >= 0; index--)
+        {
+            var token = matches[index].Groups["value"].Value.Replace(',', '.');
+            if (!double.TryParse(token, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out var value)
+                || value is < 0 or > 100)
+            {
+                continue;
+            }
+
+            percentage = value;
+            return true;
+        }
+
+        return false;
+    }
 }
 
 public sealed record OperationResult(

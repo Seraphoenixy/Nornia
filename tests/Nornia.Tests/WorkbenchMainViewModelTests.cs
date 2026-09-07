@@ -89,21 +89,37 @@ public sealed class WorkbenchMainViewModelTests
         return new Fixture(main, logs, navigation, terminal, terminalService, editor);
     }
 
-    // ===== Startup: construction opens no page tab; the idle preload opens the default =====
+    // ===== Startup: explorer is selected; content pages open only on navigation =====
 
     [Fact]
-    public void Startup_OpensNoPageTab_ActivityBarStillDefaultsToEnvironment()
+    public void Startup_OpensNoPageTab_ActivityBarDefaultsToExplorer()
     {
         var fixture = Create();
 
-        // 构造期不打开页面标签(壳先行,条带为空);默认页(环境管理)的标签由 PreloadPagesAsync
-        // 在首帧后的 ApplicationIdle 续延中补开——测试进程不泵空闲优先级,该续延不执行,
-        // 因此这里断言的仍是构造后的即时状态。
+        // 启动显示资源管理器欢迎页，不自动打开环境管理标签。
         Assert.Empty(fixture.Main.Workbench.Tabs);
         Assert.False(fixture.Main.Workbench.HasTabs);
         Assert.Null(fixture.Main.Workbench.SelectedTab);
-        // 活动栏/二级左侧栏仍默认定位环境管理。
+        // 环境管理位于项目管理之后，默认选中资源管理器。
+        Assert.Equal(
+            new[] { NavigationTargets.Explorer, NavigationTargets.Git, NavigationTargets.Projects, NavigationTargets.Dashboard, NavigationTargets.Settings },
+            fixture.Main.NavigationItems.Select(item => item.NavigationIds.First()));
         Assert.Same(fixture.Main.NavigationItems[0], fixture.Main.SelectedNavigationItem);
+        Assert.True(fixture.Main.ShowViewPageWelcome);
+    }
+
+    [Fact]
+    public void EnvironmentNavigation_FirstClickOpensPage()
+    {
+        var fixture = Create();
+        var environment = fixture.Main.NavigationItems.Single(item => item.Page is EnvironmentManagementViewModel);
+
+        fixture.Main.SelectedNavigationItem = environment;
+
+        var tab = Assert.Single(fixture.Main.Workbench.Tabs);
+        Assert.Same(environment.Page, tab.Content);
+        Assert.Same(tab, fixture.Main.Workbench.SelectedTab);
+        Assert.Same(environment.Page, fixture.Main.CurrentPage);
     }
 
     // ===== Content pages open as tabs; view pages never do =====
@@ -113,14 +129,14 @@ public sealed class WorkbenchMainViewModelTests
     {
         var fixture = Create();
 
-        fixture.Main.NavigateByIndexCommand.Execute(3); // 项目管理
+        fixture.Main.NavigateByIndexCommand.Execute(2); // 项目管理
         fixture.Main.NavigateByIndexCommand.Execute(4); // 设置
-        fixture.Main.NavigateByIndexCommand.Execute(3); // 项目管理(重复导航)
+        fixture.Main.NavigateByIndexCommand.Execute(2); // 项目管理(重复导航)
 
         // 启动不再自动打开环境管理页:导航仅产生 项目管理 + 设置 两个标签。
         Assert.Equal(2, fixture.Main.Workbench.Tabs.Count);
-        Assert.Same(fixture.Main.NavigationItems[3].Page, fixture.Main.CurrentPage);
-        var projectsTab = fixture.Main.Workbench.Tabs.Single(tab => ReferenceEquals(tab.Content, fixture.Main.NavigationItems[3].Page));
+        Assert.Same(fixture.Main.NavigationItems[2].Page, fixture.Main.CurrentPage);
+        var projectsTab = fixture.Main.Workbench.Tabs.Single(tab => ReferenceEquals(tab.Content, fixture.Main.NavigationItems[2].Page));
         Assert.Same(projectsTab, fixture.Main.Workbench.SelectedTab);
     }
 
@@ -130,8 +146,8 @@ public sealed class WorkbenchMainViewModelTests
         var fixture = Create();
         var tabsBefore = fixture.Main.Workbench.Tabs.Count;
 
-        fixture.Main.NavigateByIndexCommand.Execute(1); // 资源管理器
-        fixture.Main.NavigateByIndexCommand.Execute(2); // 源代码管理
+        fixture.Main.NavigateByIndexCommand.Execute(0); // 资源管理器
+        fixture.Main.NavigateByIndexCommand.Execute(1); // 源代码管理
 
         // 视图页永不产生标签。
         Assert.Equal(tabsBefore, fixture.Main.Workbench.Tabs.Count);
@@ -147,7 +163,7 @@ public sealed class WorkbenchMainViewModelTests
         await OpenEditorTabsAsync(fixture, "a.cs");
         var document = Assert.IsType<EditorWorkbenchTab>(fixture.Main.Workbench.SelectedTab);
 
-        fixture.Main.NavigateByIndexCommand.Execute(2); // 源代码管理
+        fixture.Main.NavigateByIndexCommand.Execute(1); // 源代码管理
 
         // 活动文档保持选中 → 欢迎层不出现。
         Assert.Same(document, fixture.Main.Workbench.SelectedTab);
@@ -161,15 +177,15 @@ public sealed class WorkbenchMainViewModelTests
     {
         var fixture = Create();
         // 启动不再自动打开环境管理页标签,先显式打开(重复导航不复制)。
-        fixture.Main.Workbench.OpenOrActivatePage(fixture.Main.NavigationItems[0].Page);
-        fixture.Main.NavigateByIndexCommand.Execute(3); // 项目管理标签打开并选中
-        var environmentTab = fixture.Main.Workbench.Tabs.Single(tab => ReferenceEquals(tab.Content, fixture.Main.NavigationItems[0].Page));
+        fixture.Main.Workbench.OpenOrActivatePage(fixture.Main.NavigationItems[3].Page);
+        fixture.Main.NavigateByIndexCommand.Execute(2); // 项目管理标签打开并选中
+        var environmentTab = fixture.Main.Workbench.Tabs.Single(tab => ReferenceEquals(tab.Content, fixture.Main.NavigationItems[3].Page));
 
         fixture.Main.Workbench.OpenOrActivateTab(environmentTab);
 
         // 标签→活动栏:高亮所属活动项,页面标签不重复打开。
-        Assert.Same(fixture.Main.NavigationItems[0], fixture.Main.SelectedNavigationItem);
-        Assert.Same(fixture.Main.NavigationItems[0].Page, fixture.Main.CurrentPage);
+        Assert.Same(fixture.Main.NavigationItems[3], fixture.Main.SelectedNavigationItem);
+        Assert.Same(fixture.Main.NavigationItems[3].Page, fixture.Main.CurrentPage);
         Assert.Equal(2, fixture.Main.Workbench.Tabs.Count);
         Assert.Same(environmentTab, fixture.Main.Workbench.SelectedTab);
     }
@@ -180,7 +196,7 @@ public sealed class WorkbenchMainViewModelTests
     public void OperationPage_FollowsSelectionAndEnvironmentSection()
     {
         var fixture = Create();
-        var environment = Assert.IsType<EnvironmentManagementViewModel>(fixture.Main.NavigationItems[0].Page);
+        var environment = Assert.IsType<EnvironmentManagementViewModel>(fixture.Main.NavigationItems[3].Page);
 
         // 启动不再自动打开环境管理页标签,先显式打开(反馈源跟随其当前小节)。
         fixture.Main.Workbench.OpenOrActivatePage(environment);
@@ -194,11 +210,11 @@ public sealed class WorkbenchMainViewModelTests
         Assert.IsType<RuntimeViewModel>(fixture.Main.OperationPage);
 
         // 其它内容页标签选中 → 反馈源是该页本身。
-        fixture.Main.NavigateByIndexCommand.Execute(3); // 项目管理
-        Assert.Same(fixture.Main.NavigationItems[3].Page, fixture.Main.OperationPage);
+        fixture.Main.NavigateByIndexCommand.Execute(2); // 项目管理
+        Assert.Same(fixture.Main.NavigationItems[2].Page, fixture.Main.OperationPage);
 
         // 视图页 → 反馈源回落到当前活动栏页。
-        fixture.Main.NavigateByIndexCommand.Execute(1); // 资源管理器
+        fixture.Main.NavigateByIndexCommand.Execute(0); // 资源管理器
         Assert.Same(fixture.Main.CurrentPage, fixture.Main.OperationPage);
     }
 

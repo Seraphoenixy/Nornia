@@ -68,4 +68,7 @@ public sealed class WingetException : InvalidOperationException
 
     /// <summary>Whether the package installer was cancelled while requesting elevation.</summary>
     public bool IsInstallerCancelled => WingetExitCodes.IsInstallerCancelled(ExitCode, OutputDetail);
+
+    /// <summary>Whether the process runner failed before winget could be started.</summary>
+    public bool IsProcessStartFailure => ExitCode == -1;
 }

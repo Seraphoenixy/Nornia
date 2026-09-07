@@ -352,7 +352,12 @@ public sealed class SettingsSession : ISettingsSession
     {
         try
         {
-            await foreach (var change in _service.WatchAsync(Context, _lifetime.Token))
+            // A settings session is a background notification pump. It must not inherit the
+            // caller's synchronization context: callers may create a session from a test
+            // scheduler or from a non-pumping context, and posting every watch continuation
+            // back there would silently stop live updates under load. UI consumers can marshal
+            // their own property updates at the boundary where they own the dispatcher.
+            await foreach (var change in _service.WatchAsync(Context, _lifetime.Token).ConfigureAwait(false))
             {
                 // 过滤是纯内存运算,放在守护之外;唯一可能抛异常的是快照重读(瞬时文件锁/IO)。
                 var filtered = SubscribedKeys is null ? [.. change.Changes] :

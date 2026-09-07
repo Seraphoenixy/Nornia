@@ -383,12 +383,33 @@ public partial class WorkspaceViewModel : PageViewModel
         var generation = Volatile.Read(ref _workspaceGeneration);
         if (!IsCurrentTreeNode(node)) return;
 
-        // 防御兜底:"chevron 显示已展开但子树未加载"的不一致状态(IsExpanded=true 且只剩占位符)——
-        // 旧刷新行为的遗留(现由 DropChildren 同步重置),或未来某条 drop 路径忘记重置展开态。
-        // 此状态下按正常逻辑翻转只会切换空展开(delta=0,无可见变化),用户需点两次才生效;而用户
-        // 心智模型是"该目录未展开"(chevron 朝下但无子行),故本次点击直接加载并重投影,一次生效。
-        // 正常流程中 LoadChildrenAsync 会先登记进行中的任务再枚举;在途展开不会命中本分支。
-        if (node.IsExpanded && !node.IsLoaded)
+        var loadingStaleState = false;
+        var previousCount = 0;
+        var shouldLoad = false;
+        // A command may be invoked concurrently when a large directory is being enumerated.
+        // Serialize the read-modify-write of IsExpanded so two clicks cannot both observe false
+        // and turn the node on. The node's load method uses the same re-entrant gate to publish
+        // its pending task before any asynchronous work can race the next click.
+        lock (node.ChildrenLoadGate)
+        {
+            // 防御兜底:"chevron 显示已展开但子树未加载"的不一致状态(IsExpanded=true 且只剩占位符)——
+            // 旧刷新行为的遗留(现由 DropChildren 同步重置),或未来某条 drop 路径忘记重置展开态。
+            // 此状态下按正常逻辑翻转只会切换空展开(delta=0,无可见变化),用户需点两次才生效;而用户
+            // 心智模型是"该目录未展开"(chevron 朝下但无子行),故本次点击直接加载并重投影,一次生效。
+            // 正常流程中 LoadChildrenAsync 会先登记进行中的任务再枚举;在途展开不会命中本分支。
+            if (node.IsExpanded && !node.IsLoaded && !node.IsLoadingChildren)
+            {
+                loadingStaleState = true;
+            }
+            else
+            {
+                previousCount = node.VisibleRowCount;
+                node.IsExpanded = !node.IsExpanded;
+                shouldLoad = node.IsExpanded;
+            }
+        }
+
+        if (loadingStaleState)
         {
             await node.LoadChildrenAsync();
             if (!IsCurrentGeneration(generation) || !IsCurrentTreeNode(node)) return;
@@ -397,9 +418,7 @@ public partial class WorkspaceViewModel : PageViewModel
             return;
         }
 
-        var previousCount = node.VisibleRowCount;
-        node.IsExpanded = !node.IsExpanded;
-        if (node.IsExpanded)
+        if (shouldLoad)
         {
             if (node.IsLoaded)
             {
@@ -2001,9 +2020,23 @@ public sealed partial class WorkspaceNode : ObservableObject
         }
     }
 
+    private readonly object _childrenLoadGate = new();
     private Task? _pendingLoad;
     private int _pendingLoadGeneration;
     private int _childrenLoadGeneration;
+
+    internal object ChildrenLoadGate => _childrenLoadGate;
+
+    internal bool IsLoadingChildren
+    {
+        get
+        {
+            lock (_childrenLoadGate)
+            {
+                return _pendingLoad is not null;
+            }
+        }
+    }
 
     /// <summary>枚举目录内容(枚举在 ThreadPool 执行:.NET 无异步目录枚举 API,超大目录的
     /// 枚举不再阻塞 UI 线程——展开/打开卡顿的修复点之一)。并发调用加入进行中的同一次加载
@@ -2015,27 +2048,31 @@ public sealed partial class WorkspaceNode : ObservableObject
             return Task.CompletedTask;
         }
 
-        // 进行中的加载优先:CoreAsync 在首个 await 前即登记 _pendingLoad,
-        // 若先判 IsLoaded,并发调用者会误以为已加载而拿到空 Children。DropChildren
+        // 进行中的加载优先:先发布 pending task,再启动 CoreAsync。这样即使 CoreAsync
+        // 很快完成,也不会在 finally 清理之前被另一次调用插入第二个枚举。DropChildren
         // 会推进代次,因此刷新期间不能复用已经失效的枚举任务。
-        var generation = Volatile.Read(ref _childrenLoadGeneration);
-        if (_pendingLoad is not null && _pendingLoadGeneration == generation)
+        lock (_childrenLoadGate)
         {
-            return _pendingLoad;
-        }
+            var generation = _childrenLoadGeneration;
+            if (_pendingLoad is not null && _pendingLoadGeneration == generation)
+            {
+                return _pendingLoad;
+            }
 
-        if (IsLoaded)
-        {
-            return Task.CompletedTask;
-        }
+            if (IsLoaded)
+            {
+                return Task.CompletedTask;
+            }
 
-        var task = LoadChildrenCoreAsync(generation);
-        _pendingLoad = task;
-        _pendingLoadGeneration = generation;
-        return task;
+            var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            _pendingLoad = completion.Task;
+            _pendingLoadGeneration = generation;
+            _ = LoadChildrenCoreAsync(generation, completion);
+            return completion.Task;
+        }
     }
 
-    private async Task LoadChildrenCoreAsync(int generation)
+    private async Task LoadChildrenCoreAsync(int generation, TaskCompletionSource completion)
     {
         try
         {
@@ -2085,16 +2122,26 @@ public sealed partial class WorkspaceNode : ObservableObject
         }
         finally
         {
-            if (_pendingLoadGeneration == generation)
+            lock (_childrenLoadGate)
             {
-                _pendingLoad = null;
+                if (ReferenceEquals(_pendingLoad, completion.Task) && _pendingLoadGeneration == generation)
+                {
+                    _pendingLoad = null;
+                }
             }
 
             // V4: 子节点集合变化(占位符 → 真实子树)可能改变紧凑链形态与可见行数,
             // 重算自身并向父链传播(未展开/枚举失败时计数不变,传播即刻停止)。
-            if (generation == Volatile.Read(ref _childrenLoadGeneration))
+            try
             {
-                RecomputeVisibleRowCountChain();
+                if (generation == Volatile.Read(ref _childrenLoadGeneration))
+                {
+                    RecomputeVisibleRowCountChain();
+                }
+            }
+            finally
+            {
+                completion.TrySetResult();
             }
         }
     }
@@ -2218,7 +2265,10 @@ public sealed partial class WorkspaceNode : ObservableObject
             IsExpanded = false;
         }
 
-        Interlocked.Increment(ref _childrenLoadGeneration);
+        lock (_childrenLoadGate)
+        {
+            Interlocked.Increment(ref _childrenLoadGeneration);
+        }
         IsLoaded = false;
         Children.Clear();
         Children.Add(new WorkspaceNode(string.Empty, false, _rootPath, _statusSource) { IsPlaceholder = true, Parent = this });

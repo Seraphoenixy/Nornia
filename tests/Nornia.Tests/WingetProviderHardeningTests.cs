@@ -98,6 +98,20 @@ public sealed class WingetProviderHardeningTests
     }
 
     [Fact]
+    public async Task UpgradeAsync_ProcessStartFailureIsNotRetriedAndExplainsAppInstallerRepair()
+    {
+        var runner = new FakeProcessRunner((_, _) =>
+            new ProcessResult(-1, "", "系统无法访问此文件。"));
+        var provider = new WingetProvider(runner);
+
+        var exception = await Assert.ThrowsAsync<WingetException>(() => provider.UpgradeAsync("Microsoft.DotNet.SDK.10"));
+
+        Assert.True(exception.IsProcessStartFailure);
+        Assert.Single(runner.Calls);
+        Assert.Contains(WingetText.Get("Winget_ProcessStartHint"), exception.Message);
+    }
+
+    [Fact]
     public async Task UninstallAsync_IdNoMatchFallsBackToNameForLocalEntries()
     {
         // 本机安装(ARP)的应用不在 winget 目录中,--id 精确匹配得到 0x8A150014;

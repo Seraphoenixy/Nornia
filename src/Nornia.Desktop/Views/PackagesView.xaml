@@ -38,6 +38,7 @@
           <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
             <RowDefinition Height="*" />
             <RowDefinition Height="Auto" />
           </Grid.RowDefinitions>
@@ -115,11 +116,45 @@
             </StackPanel>
             <WrapPanel Grid.Column="1" Style="{StaticResource ToolbarActionsStyle}">
               <Button Content="安装所选" Command="{Binding InstallSelectedCommand}" Style="{StaticResource PrimaryButton}" ToolTip="选择未安装的搜索结果后可安装" />
+              <Button Content="卸载所选" Command="{Binding UninstallCommand}" Style="{StaticResource DangerButton}" ToolTip="选择搜索结果中已安装的软件包后卸载；执行前会确认" />
             </WrapPanel>
           </Grid>
 
+          <!-- Package operation progress: determinate when the package manager emits a percentage,
+               otherwise indeterminate while it is resolving metadata or launching an installer. -->
+          <Border Grid.Row="2" Margin="{StaticResource GapVerticalSm}" Padding="{StaticResource InsetCompactRow}"
+                  Background="{DynamicResource EditorBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1"
+                  Visibility="{Binding IsBusy, Converter={StaticResource BooleanToVisibilityConverter}}">
+            <Grid>
+              <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+              <DockPanel LastChildFill="False">
+                <Button DockPanel.Dock="Right" Content="取消" Command="{Binding CancelOperationCommand}" Style="{StaticResource LinkButton}"
+                        ToolTip="取消当前软件包操作" />
+                <TextBlock Text="{Binding CurrentOperation.Detail}" Foreground="{DynamicResource MutedTextBrush}"
+                           FontSize="{DynamicResource TypeBody}" TextTrimming="CharacterEllipsis" />
+                <TextBlock Text="{Binding CurrentOperation.ProgressDisplay}" Foreground="{DynamicResource InfoAccentBrush}"
+                           FontSize="{DynamicResource TypeBadge}" Margin="{StaticResource GapLeftSm}"
+                           Visibility="{Binding CurrentOperation.HasProgress, Converter={StaticResource BooleanToVisibilityConverter}}" />
+              </DockPanel>
+              <ProgressBar Grid.Row="1" Height="4" Margin="0,4,0,0" Maximum="100"
+                           Value="{Binding CurrentOperation.Progress, TargetNullValue=0}"
+                           BorderThickness="0" Background="{DynamicResource BorderBrush}" Foreground="{DynamicResource AccentBrush}">
+                <ProgressBar.Style>
+                  <Style TargetType="ProgressBar">
+                    <Setter Property="IsIndeterminate" Value="True" />
+                    <Style.Triggers>
+                      <DataTrigger Binding="{Binding CurrentOperation.HasProgress}" Value="True">
+                        <Setter Property="IsIndeterminate" Value="False" />
+                      </DataTrigger>
+                    </Style.Triggers>
+                  </Style>
+                </ProgressBar.Style>
+              </ProgressBar>
+            </Grid>
+          </Border>
+
           <!-- Installed / updates grid -->
-          <Grid Grid.Row="2">
+          <Grid Grid.Row="3">
             <Grid.Style>
               <Style TargetType="Grid">
                 <Setter Property="Visibility" Value="Visible" />
@@ -139,6 +174,8 @@
                 <ContextMenu>
                   <MenuItem Header="复制选中" Command="{Binding CopySelectedPackagesCommand}" InputGestureText="Ctrl+C" />
                   <MenuItem Header="复制全部" Command="{Binding CopyAllPackagesCommand}" />
+                  <Separator />
+                  <MenuItem Header="卸载" Command="{Binding UninstallCommand}" />
                 </ContextMenu>
               </DataGrid.ContextMenu>
               <DataGrid.Columns>
@@ -167,7 +204,7 @@
           </Grid>
 
           <!-- Search grid -->
-          <Grid Grid.Row="2">
+          <Grid Grid.Row="3">
             <Grid.Style>
               <Style TargetType="Grid">
                 <Setter Property="Visibility" Value="Collapsed" />
@@ -187,6 +224,8 @@
                 <ContextMenu>
                   <MenuItem Header="复制选中" Command="{Binding CopySelectedPackagesCommand}" InputGestureText="Ctrl+C" />
                   <MenuItem Header="复制全部搜索结果" Command="{Binding CopyAllSearchResultsCommand}" />
+                  <Separator />
+                  <MenuItem Header="卸载" Command="{Binding UninstallCommand}" />
                 </ContextMenu>
               </DataGrid.ContextMenu>
               <DataGrid.Columns>
@@ -225,7 +264,7 @@
           </Grid>
 
           <!-- Selection summary -->
-          <TextBlock Grid.Row="3" Margin="{StaticResource GapSm}" Text="{Binding SelectedPackageSummary}" ToolTip="{Binding SelectedPackageSummary}">
+          <TextBlock Grid.Row="4" Margin="{StaticResource GapSm}" Text="{Binding SelectedPackageSummary}" ToolTip="{Binding SelectedPackageSummary}">
             <TextBlock.Style>
               <Style TargetType="TextBlock" BasedOn="{StaticResource SelectionSummaryStyle}">
                 <Setter Property="Visibility" Value="Visible" />

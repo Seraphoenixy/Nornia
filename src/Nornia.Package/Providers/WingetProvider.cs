@@ -30,8 +30,25 @@ public sealed partial class WingetProvider(IProcessRunner processRunner, WingetP
 
     public string Name => "winget";
 
-    public async Task<bool> IsAvailableAsync(CancellationToken cancellationToken = default) =>
-        (await processRunner.RunAsync("where.exe", ["winget.exe"], cancellationToken: cancellationToken)).IsSuccess;
+    public async Task<bool> IsAvailableAsync(CancellationToken cancellationToken = default)
+    {
+        // `where.exe` does not resolve Windows App Execution Aliases. A functional winget
+        // installation can therefore be reported as missing, while a stale alias can be
+        // reported as present. Starting the harmless version command is the capability check
+        // that matches the operation path used by every package command.
+        try
+        {
+            return (await processRunner.RunAsync("winget.exe", ["--version"], cancellationToken: cancellationToken)).IsSuccess;
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return false;
+        }
+        catch (Exception exception) when (exception is IOException or System.ComponentModel.Win32Exception or InvalidOperationException)
+        {
+            return false;
+        }
+    }
 
     public async Task<IReadOnlyList<PackageInfo>> SearchAsync(
         string query,
@@ -245,7 +262,7 @@ public sealed partial class WingetProvider(IProcessRunner processRunner, WingetP
                 // A declined UAC request ultimately appears as installer exit 1602. Retrying it
                 // automatically just opens another elevation prompt and makes the operation look
                 // stuck; return immediately so ThrowIfFailed can give an actionable explanation.
-                if (result.IsSuccess || WingetExitCodes.IsNoMatch(result.ExitCode) ||
+                if (result.IsSuccess || result.ExitCode == -1 || WingetExitCodes.IsNoMatch(result.ExitCode) ||
                     WingetExitCodes.IsInstallerCancelled(result.ExitCode, result.StandardOutput + Environment.NewLine + result.StandardError) ||
                     attempt == 2)
                 {
@@ -304,6 +321,15 @@ public sealed partial class WingetProvider(IProcessRunner processRunner, WingetP
         // stderr 通常干净,同样过一遍保持一致。
         var raw = string.IsNullOrWhiteSpace(result.StandardError) ? result.StandardOutput : result.StandardError;
         var detail = WingetOutputText.SanitizeDetail(raw);
+        if (result.ExitCode == -1)
+        {
+            if (detail.Length > 0)
+            {
+                detail += Environment.NewLine;
+            }
+
+            detail += WingetText.Get("Winget_ProcessStartHint");
+        }
         if (WingetExitCodes.IsInstallerCancelled(result.ExitCode, detail))
         {
             if (detail.Length > 0)

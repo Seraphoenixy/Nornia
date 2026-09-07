@@ -725,6 +725,10 @@
               <TextBlock Text="{Binding OperationPage.StatusMessage}" FontSize="{DynamicResource TypeBody}"
                          Foreground="{Binding OperationPage.StatusKind, Converter={StaticResource StatusKindToBrushConverter}}"
                          VerticalAlignment="Center" MaxWidth="220" TextTrimming="CharacterEllipsis" />
+              <TextBlock Text="{Binding OperationPage.CurrentOperation.ProgressDisplay}" FontSize="{DynamicResource TypeBadge}"
+                         Foreground="{Binding OperationPage.StatusKind, Converter={StaticResource StatusKindToBrushConverter}}"
+                         VerticalAlignment="Center" Margin="6,0,0,0"
+                         Visibility="{Binding OperationPage.CurrentOperation.HasProgress, Converter={StaticResource BooleanToVisibilityConverter}}" />
             </StackPanel>
           </Button>
           <Button Style="{StaticResource StatusBarItem}" Command="{Binding Commands[workbench.action.togglePanel]}" ToolTip="{loc:StringLoc Key=TogglePanel}">
@@ -735,84 +739,102 @@
           </Button>
         </StackPanel>
         </DockPanel>
-        <!-- Indeterminate progress hairline overlaying the status bar top edge; does not consume bar height -->
+        <!-- Package managers stream percentage lines when downloading. Keep the progress hairline
+             over the status bar, switching from indeterminate to determinate once a percentage is parsed. -->
         <Border Height="2" HorizontalAlignment="Stretch" VerticalAlignment="Top" Background="{DynamicResource StatusBarBackgroundBrush}"
                 IsHitTestVisible="False"
                 Visibility="{Binding OperationPage.IsBusy, Converter={StaticResource BooleanToVisibilityConverter}}">
-          <ProgressBar Height="2" IsIndeterminate="True" BorderThickness="0" Background="Transparent"
-                       Foreground="{DynamicResource StatusBarForegroundBrush}" />
+          <ProgressBar Height="2" Maximum="100" Value="{Binding OperationPage.CurrentOperation.Progress, TargetNullValue=0}"
+                       BorderThickness="0" Background="Transparent" Foreground="{DynamicResource StatusBarForegroundBrush}">
+            <ProgressBar.Style>
+              <Style TargetType="ProgressBar">
+                <Setter Property="IsIndeterminate" Value="True" />
+                <Style.Triggers>
+                  <DataTrigger Binding="{Binding OperationPage.CurrentOperation.HasProgress}" Value="True">
+                    <Setter Property="IsIndeterminate" Value="False" />
+                  </DataTrigger>
+                </Style.Triggers>
+              </Style>
+            </ProgressBar.Style>
+          </ProgressBar>
         </Border>
       </Grid>
     </Border>
 
     <!-- QuickInput (VS Code command palette / quick open):
-         全窗口遮罩压暗整个壳层(标题栏/侧栏/编辑器/状态栏,VS Code 行为),调色板浮于顶部居中。
+         全窗口遮罩压暗整个壳层(标题栏/侧栏/编辑器/状态栏,VS Code 行为),调色板从顶栏中部项目框下方展开。
          遮罩与承载面板必须是根 Grid 的最后子元素:遮罩盖过状态栏,承载面板再盖过遮罩,
          否则状态栏(按绘制顺序在其后)会盖在遮罩之上、标题栏/状态栏不会被压暗;
-         点击遮罩空白处关闭(QuickInputBackdrop_MouseLeftButtonDown)。 -->
+         点击遮罩空白处关闭(QuickInputBackdrop_MouseLeftButtonDown)。
+         Popup 以 CommandCenterButton 为 PlacementTarget,避免窗口左右两侧控件宽度变化造成水平错位。 -->
     <Border Grid.RowSpan="3" Background="{DynamicResource QuickInputBackdropBrush}"
             Visibility="{Binding QuickInput.IsOpen, Converter={StaticResource BooleanToVisibilityConverter}}"
             MouseLeftButtonDown="QuickInputBackdrop_MouseLeftButtonDown" />
     <Border Grid.RowSpan="3" x:Name="QuickInputOverlay"
             Visibility="{Binding QuickInput.IsOpen, Converter={StaticResource BooleanToVisibilityConverter}}"
             PreviewKeyDown="QuickInputOverlay_PreviewKeyDown">
-      <!-- 72 = SizeTitleBar(35) + 36 + 1(标题栏底边):命令面板定位在标题栏下方 36px -->
-      <Border Width="{DynamicResource SizeCommandPalette}" MaxHeight="400" HorizontalAlignment="Center" VerticalAlignment="Top" Margin="0,72,0,0"
-              Background="{DynamicResource QuickInputBackgroundBrush}" BorderBrush="{DynamicResource StrongBorderBrush}"
-              BorderThickness="1" CornerRadius="{StaticResource RadiusMd}">
-        <StackPanel>
-          <Grid>
-            <TextBlock Text="{StaticResource CodiconSearch}" FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconInline}" Foreground="{DynamicResource MutedTextBrush}"
-                       VerticalAlignment="Center" Margin="12,0,0,0" IsHitTestVisible="False" />
-            <TextBox x:Name="QuickInputBox" BorderThickness="0" Background="Transparent" Padding="32,8"
-                     FontSize="{DynamicResource TypeBody}" Foreground="{DynamicResource TextBrush}"
-                     Text="{Binding QuickInput.FilterText, UpdateSourceTrigger=PropertyChanged}"
-                     IsVisibleChanged="QuickInputBox_IsVisibleChanged" />
-          </Grid>
-          <Border Background="{DynamicResource BorderBrush}" Height="1" />
-          <ListBox MaxHeight="320" ItemsSource="{Binding QuickInput.View}" SelectedItem="{Binding QuickInput.SelectedItem}"
-                   Background="Transparent" BorderThickness="0" Padding="0,2"
-                   KeyboardNavigation.TabNavigation="None"
-                   ScrollViewer.HorizontalScrollBarVisibility="Disabled">
-            <ListBox.ItemContainerStyle>
-              <Style TargetType="ListBoxItem">
-                <Setter Property="HorizontalContentAlignment" Value="Stretch" />
-                <Setter Property="Padding" Value="8,4" />
-                <Setter Property="FocusVisualStyle" Value="{StaticResource AppFocusRing}" />
-                <Setter Property="Template">
-                  <Setter.Value>
-                    <ControlTemplate TargetType="ListBoxItem">
-                      <Border x:Name="Row" Background="Transparent" Padding="{TemplateBinding Padding}">
-                        <ContentPresenter />
-                      </Border>
-                      <ControlTemplate.Triggers>
-                        <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Row" Property="Background" Value="{DynamicResource HoverBrush}" /></Trigger>
-                        <Trigger Property="IsSelected" Value="True"><Setter TargetName="Row" Property="Background" Value="{DynamicResource SelectionBrush}" /></Trigger>
-                        <Trigger Property="IsMouseCaptured" Value="True"><Setter TargetName="Row" Property="Background" Value="{DynamicResource PressedBrush}" /></Trigger>
-                      </ControlTemplate.Triggers>
-                    </ControlTemplate>
-                  </Setter.Value>
-                </Setter>
-              </Style>
-            </ListBox.ItemContainerStyle>
-            <ListBox.ItemTemplate>
-              <DataTemplate>
-                <Grid>
-                  <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
-                  <TextBlock Grid.Column="0" Text="{Binding Glyph}" FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconInline}"
-                             Foreground="{DynamicResource NavGlyphBrush}" VerticalAlignment="Center" Margin="4,0,12,0" />
-                  <TextBlock Grid.Column="1" Text="{Binding Title}" FontSize="{DynamicResource TypeBody}" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
-                  <TextBlock Grid.Column="2" Text="{Binding Detail}" FontSize="{DynamicResource TypeBody}" Foreground="{DynamicResource MutedTextBrush}"
-                             VerticalAlignment="Center" Margin="12,0,4,0" TextTrimming="CharacterEllipsis" MaxWidth="200"
-                             Visibility="{Binding Detail, Converter={StaticResource NullToCollapsedConverter}}" />
-                </Grid>
-              </DataTemplate>
-            </ListBox.ItemTemplate>
-          </ListBox>
-          <TextBlock Text="{Binding QuickInput.Title}" FontSize="{DynamicResource TypeBody}" Foreground="{DynamicResource MutedTextBrush}"
-                     Margin="12,4,12,8" />
-        </StackPanel>
-      </Border>
+      <Popup x:Name="QuickInputPopup" AllowsTransparency="True" Focusable="False"
+             PlacementTarget="{Binding ElementName=CommandCenterButton}" Placement="Bottom"
+             HorizontalOffset="0" VerticalOffset="6" PopupAnimation="Fade" StaysOpen="True"
+             IsOpen="{Binding QuickInput.IsOpen}">
+        <Border Width="{DynamicResource SizeCommandPalette}" MaxHeight="400"
+                PreviewKeyDown="QuickInputOverlay_PreviewKeyDown"
+                Background="{DynamicResource QuickInputBackgroundBrush}" BorderBrush="{DynamicResource StrongBorderBrush}"
+                BorderThickness="1" CornerRadius="{StaticResource RadiusMd}">
+          <StackPanel>
+            <Grid>
+              <TextBlock Text="{StaticResource CodiconSearch}" FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconInline}" Foreground="{DynamicResource MutedTextBrush}"
+                         VerticalAlignment="Center" Margin="12,0,0,0" IsHitTestVisible="False" />
+              <TextBox x:Name="QuickInputBox" BorderThickness="0" Background="Transparent" Padding="32,8"
+                       FontSize="{DynamicResource TypeBody}" Foreground="{DynamicResource TextBrush}"
+                       Text="{Binding QuickInput.FilterText, UpdateSourceTrigger=PropertyChanged}"
+                       IsVisibleChanged="QuickInputBox_IsVisibleChanged" />
+            </Grid>
+            <Border Background="{DynamicResource BorderBrush}" Height="1" />
+            <ListBox MaxHeight="320" ItemsSource="{Binding QuickInput.View}" SelectedItem="{Binding QuickInput.SelectedItem}"
+                     Background="Transparent" BorderThickness="0" Padding="0,2"
+                     KeyboardNavigation.TabNavigation="None"
+                     ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+              <ListBox.ItemContainerStyle>
+                <Style TargetType="ListBoxItem">
+                  <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                  <Setter Property="Padding" Value="8,4" />
+                  <Setter Property="FocusVisualStyle" Value="{StaticResource AppFocusRing}" />
+                  <Setter Property="Template">
+                    <Setter.Value>
+                      <ControlTemplate TargetType="ListBoxItem">
+                        <Border x:Name="Row" Background="Transparent" Padding="{TemplateBinding Padding}">
+                          <ContentPresenter />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                          <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Row" Property="Background" Value="{DynamicResource HoverBrush}" /></Trigger>
+                          <Trigger Property="IsSelected" Value="True"><Setter TargetName="Row" Property="Background" Value="{DynamicResource SelectionBrush}" /></Trigger>
+                          <Trigger Property="IsMouseCaptured" Value="True"><Setter TargetName="Row" Property="Background" Value="{DynamicResource PressedBrush}" /></Trigger>
+                        </ControlTemplate.Triggers>
+                      </ControlTemplate>
+                    </Setter.Value>
+                  </Setter>
+                </Style>
+              </ListBox.ItemContainerStyle>
+              <ListBox.ItemTemplate>
+                <DataTemplate>
+                  <Grid>
+                    <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                    <TextBlock Grid.Column="0" Text="{Binding Glyph}" FontFamily="{StaticResource IconFontFamily}" FontSize="{DynamicResource IconInline}"
+                               Foreground="{DynamicResource NavGlyphBrush}" VerticalAlignment="Center" Margin="4,0,12,0" />
+                    <TextBlock Grid.Column="1" Text="{Binding Title}" FontSize="{DynamicResource TypeBody}" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                    <TextBlock Grid.Column="2" Text="{Binding Detail}" FontSize="{DynamicResource TypeBody}" Foreground="{DynamicResource MutedTextBrush}"
+                               VerticalAlignment="Center" Margin="12,0,4,0" TextTrimming="CharacterEllipsis" MaxWidth="200"
+                               Visibility="{Binding Detail, Converter={StaticResource NullToCollapsedConverter}}" />
+                  </Grid>
+                </DataTemplate>
+              </ListBox.ItemTemplate>
+            </ListBox>
+            <TextBlock Text="{Binding QuickInput.Title}" FontSize="{DynamicResource TypeBody}" Foreground="{DynamicResource MutedTextBrush}"
+                       Margin="12,4,12,8" />
+          </StackPanel>
+        </Border>
+      </Popup>
     </Border>
   </Grid>
 </Window>

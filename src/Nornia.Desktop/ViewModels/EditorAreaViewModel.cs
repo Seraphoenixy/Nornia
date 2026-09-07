@@ -95,6 +95,8 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
     private readonly Dictionary<string, ISettingsSession> _languageSessions = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<EditorGroupViewModel> _wiredGroups = [];
     private readonly RevisionGate _settingsRevisionGate = new();
+    private readonly SemaphoreSlim _settingsApplyGate = new(1, 1);
+    private readonly SemaphoreSlim _settingsNotificationGate = new(1, 1);
     private readonly SemaphoreSlim _previewOptionsGate = new(1, 1);
     private readonly object _pendingPreviewOptionsGate = new();
     private readonly Dictionary<FilePreviewTab, int> _pendingPreviewOptionWrites = new(ReferenceEqualityComparer.Instance);
@@ -1132,7 +1134,7 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
         }
         else
         {
-            session.Changed += (_, _) => ApplyLanguageSettingsSafely(session);
+            session.Changed += (_, _) => _ = ApplyLanguageSettingsSafelyAsync(session);
         }
 
         _languageSessions[key] = session;
@@ -1143,40 +1145,36 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
     /// 必须显式刷新快照,否则语言会话会把变更前的旧快照当作 Current(旧值覆盖新值)。</summary>
     private async Task OnAllLanguagesSettingsChangedAsync(ISettingsSession allSession)
     {
-        if (allSession.Current is not { } snapshot) return;
-        ApplySettingsSnapshot(snapshot);
-        _cachedReadingOptions = null;
-        _cachedDiffOptions = null;
-        foreach (var session in _languageSessions.Values)
+        await _settingsNotificationGate.WaitAsync().ConfigureAwait(false);
+        try
         {
-            if (session.Context.LanguageId is null) continue;
-            try
+            if (allSession.Current is not { } snapshot) return;
+            await ApplySettingsSnapshotAsync(snapshot);
+            _cachedReadingOptions = null;
+            _cachedDiffOptions = null;
+            foreach (var session in _languageSessions.Values)
             {
-                ApplySettingsSnapshot(await session.RefreshAsync());
+                if (session.Context.LanguageId is null) continue;
+                try
+                {
+                    await ApplySettingsSnapshotAsync(await session.RefreshAsync());
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
+                {
+                    // 某一语言的设置文件暂不可读时保留其余语言的应用结果。
+                }
             }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
-            {
-                // 某一语言的设置文件暂不可读时保留其余语言的应用结果。
-            }
+        }
+        finally
+        {
+            _settingsNotificationGate.Release();
         }
     }
 
-    private void ApplySettingsSnapshot(SettingsSnapshot snapshot)
+    private async Task ApplySettingsSnapshotAsync(SettingsSnapshot snapshot)
     {
-        if (_workspaceService is not null)
-        {
-            var snapshotWorkspace = snapshot.Context.NormalizedWorkspacePath;
-            var currentWorkspace = _workspaceService.Current?.ProjectPath;
-            if (snapshotWorkspace is null
-                ? currentWorkspace is not null
-                : !PathsEqual(snapshotWorkspace, currentWorkspace))
-            {
-                return;
-            }
-        }
-
-        if (!_settingsRevisionGate.TryAccept(snapshot)) return;
-        void Apply()
+        await _settingsApplyGate.WaitAsync().ConfigureAwait(false);
+        try
         {
             if (_workspaceService is not null)
             {
@@ -1190,77 +1188,111 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
                 }
             }
 
-            _applyingSettings = true;
-            try
+            if (!_settingsRevisionGate.TryAccept(snapshot)) return;
+            void Apply()
             {
-                _editorLimitEnabled = snapshot.Effective(BuiltInSettingsCatalog.EditorLimitEnabled);
-                _maxOpenTabs = snapshot.Effective(BuiltInSettingsCatalog.EditorLimitValue);
-                _enablePreviewTabs = snapshot.Effective(BuiltInSettingsCatalog.EnablePreview);
-                var code = SettingsOptionsMapper.CodeReading(snapshot);
-                foreach (var tab in Groups.AllTabs.OfType<FilePreviewTab>().Where(tab =>
-                             snapshot.Context.LanguageId is null ||
-                             string.Equals(tab.FileType.LanguageId, snapshot.Context.LanguageId, StringComparison.OrdinalIgnoreCase)))
+                if (_workspaceService is not null)
                 {
-                    // An earlier write can publish its settings snapshot while newer local option
-                    // changes are still queued. Keep the live tab as the local source of truth
-                    // until its final captured snapshot has been persisted.
-                    if (HasPendingPreviewOptions(tab)) continue;
-                    tab.WordWrap = code.WordWrap;
-                    tab.ShowMinimap = code.ShowMinimap;
-                    tab.FontSize = code.FontSize;
-                    tab.FontFamily = code.FontFamily;
-                    tab.ShowLineNumbers = code.ShowLineNumbers;
-                    tab.ShowIndentGuides = code.ShowIndentGuides;
-                    tab.ShowFoldingControls = code.ShowFoldingControls;
-                    tab.ShowStickyScroll = code.StickyScroll;
-                    tab.MinimapRenderCharacters = code.MinimapRenderCharacters;
-                    tab.MinimapWidth = code.MinimapWidth;
-                    tab.LineNumbersRelative = code.LineNumbersRelative;
-                    tab.RulerColumns = code.RulerColumns;
-                }
-                if (snapshot.Context.LanguageId is null)
-                {
-                    var diff = SettingsOptionsMapper.Diff(snapshot);
-                    foreach (var tab in Groups.AllTabs.OfType<DiffTab>())
+                    var snapshotWorkspace = snapshot.Context.NormalizedWorkspacePath;
+                    var currentWorkspace = _workspaceService.Current?.ProjectPath;
+                    if (snapshotWorkspace is null
+                        ? currentWorkspace is not null
+                        : !PathsEqual(snapshotWorkspace, currentWorkspace))
                     {
-                        tab.EditorFontSize = code.FontSize;
-                        tab.FontFamily = code.FontFamily;
-                        tab.DiffMode = diff.DefaultLayout == DiffLayoutMode.SideBySide ? GitDiffMode.SideBySide : GitDiffMode.Inline;
-                        tab.IsContextCollapsed = diff.CollapseUnchangedContext;
-                        tab.ShowIntralineChanges = diff.ShowIntralineChanges;
-                        tab.ShowOverviewRuler = diff.ShowOverviewRuler;
-                        tab.SynchronizeScrolling = diff.SynchronizeScrolling;
-                        tab.UseInlineWhenNarrow = diff.UseInlineWhenNarrow;
-                        tab.IgnoreTrimWhitespace = diff.IgnoreWhitespaceEndOfLine;
+                        return;
                     }
                 }
-                // 降低标签上限:只回收预览标签,常驻/固定标签不因设置变化被强制关闭。
-                if (_editorLimitEnabled)
-                {
-                    foreach (var group in Groups.Groups)
-                    {
-                        while (group.Tabs.Count > _maxOpenTabs)
-                        {
-                            if (group.EvictLeastRecentlyUsedPreview() is not { } preview)
-                            {
-                                break;
-                            }
 
-                            MarkTabClosed(preview);
-                            group.Tabs.Remove(preview);
+                _applyingSettings = true;
+                try
+                {
+                    _editorLimitEnabled = snapshot.Effective(BuiltInSettingsCatalog.EditorLimitEnabled);
+                    _maxOpenTabs = snapshot.Effective(BuiltInSettingsCatalog.EditorLimitValue);
+                    _enablePreviewTabs = snapshot.Effective(BuiltInSettingsCatalog.EnablePreview);
+                    var code = SettingsOptionsMapper.CodeReading(snapshot);
+                    foreach (var tab in Groups.AllTabs.OfType<FilePreviewTab>().Where(tab =>
+                                 snapshot.Context.LanguageId is null ||
+                                 string.Equals(tab.FileType.LanguageId, snapshot.Context.LanguageId, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        // An earlier write can publish its settings snapshot while newer local option
+                        // changes are still queued. Keep the live tab as the local source of truth
+                        // until its final captured snapshot has been persisted.
+                        if (HasPendingPreviewOptions(tab)) continue;
+                        tab.WordWrap = code.WordWrap;
+                        tab.ShowMinimap = code.ShowMinimap;
+                        tab.FontSize = code.FontSize;
+                        tab.FontFamily = code.FontFamily;
+                        tab.ShowLineNumbers = code.ShowLineNumbers;
+                        tab.ShowIndentGuides = code.ShowIndentGuides;
+                        tab.ShowFoldingControls = code.ShowFoldingControls;
+                        tab.ShowStickyScroll = code.StickyScroll;
+                        tab.MinimapRenderCharacters = code.MinimapRenderCharacters;
+                        tab.MinimapWidth = code.MinimapWidth;
+                        tab.LineNumbersRelative = code.LineNumbersRelative;
+                        tab.RulerColumns = code.RulerColumns;
+                    }
+                    if (snapshot.Context.LanguageId is null)
+                    {
+                        var diff = SettingsOptionsMapper.Diff(snapshot);
+                        foreach (var tab in Groups.AllTabs.OfType<DiffTab>())
+                        {
+                            tab.EditorFontSize = code.FontSize;
+                            tab.FontFamily = code.FontFamily;
+                            tab.DiffMode = diff.DefaultLayout == DiffLayoutMode.SideBySide ? GitDiffMode.SideBySide : GitDiffMode.Inline;
+                            tab.IsContextCollapsed = diff.CollapseUnchangedContext;
+                            tab.ShowIntralineChanges = diff.ShowIntralineChanges;
+                            tab.ShowOverviewRuler = diff.ShowOverviewRuler;
+                            tab.SynchronizeScrolling = diff.SynchronizeScrolling;
+                            tab.UseInlineWhenNarrow = diff.UseInlineWhenNarrow;
+                            tab.IgnoreTrimWhitespace = diff.IgnoreWhitespaceEndOfLine;
+                        }
+                    }
+                    // 降低标签上限:只回收预览标签,常驻/固定标签不因设置变化被强制关闭。
+                    if (_editorLimitEnabled)
+                    {
+                        foreach (var group in Groups.Groups)
+                        {
+                            while (group.Tabs.Count > _maxOpenTabs)
+                            {
+                                if (group.EvictLeastRecentlyUsedPreview() is not { } preview)
+                                {
+                                    break;
+                                }
+
+                                MarkTabClosed(preview);
+                                group.Tabs.Remove(preview);
+                            }
                         }
                     }
                 }
+                finally { _applyingSettings = false; }
             }
-            finally { _applyingSettings = false; }
+
+            if (_uiContext is null || ReferenceEquals(SynchronizationContext.Current, _uiContext))
+            {
+                Apply();
+            }
+            else
+            {
+                var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                _uiContext.Post(_ =>
+                {
+                    try
+                    {
+                        Apply();
+                        completion.TrySetResult();
+                    }
+                    catch (Exception ex)
+                    {
+                        completion.TrySetException(ex);
+                    }
+                }, null);
+                await completion.Task.ConfigureAwait(false);
+            }
         }
-        if (_uiContext is null || ReferenceEquals(SynchronizationContext.Current, _uiContext))
+        finally
         {
-            Apply();
-        }
-        else
-        {
-            _uiContext.Post(_ => Apply(), null);
+            _settingsApplyGate.Release();
         }
     }
 
@@ -1311,12 +1343,12 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
         {
             var session = await GetSettingsSessionAsync(language);
             if (!IsWorkspaceContextCurrent(context) || switchCancellation.IsCancellationRequested) return;
-            ApplySettingsSnapshot(session.Current!);
+            await ApplySettingsSnapshotAsync(session.Current!);
         }
 
         var allSession = await GetSettingsSessionAsync(null);
         if (!IsWorkspaceContextCurrent(context) || switchCancellation.IsCancellationRequested) return;
-        ApplySettingsSnapshot(allSession.Current!);
+        await ApplySettingsSnapshotAsync(allSession.Current!);
         // 启动自动恢复工作区时不回放编辑器文件标签(源码文件不随启动自动打开);
         // 用户主动激活工作区时仍按保存的布局恢复。
         if (_workspaceService?.IsStartupAutoRestore is not true)
@@ -1344,18 +1376,23 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
         }
     }
 
-    private void ApplyLanguageSettingsSafely(ISettingsSession session)
+    private async Task ApplyLanguageSettingsSafelyAsync(ISettingsSession session)
     {
+        await _settingsNotificationGate.WaitAsync().ConfigureAwait(false);
         try
         {
             if (session.Current is { } snapshot)
             {
-                ApplySettingsSnapshot(snapshot);
+                await ApplySettingsSnapshotAsync(snapshot);
             }
         }
         catch (Exception ex)
         {
             _logService.Write("WARNING", $"应用语言编辑器设置失败：{ex.Message}");
+        }
+        finally
+        {
+            _settingsNotificationGate.Release();
         }
     }
 

@@ -7,6 +7,30 @@ namespace Nornia.Tests;
 public sealed class WingetProviderTests
 {
     [Fact]
+    public async Task IsAvailableAsync_ExecutesVersionInsteadOfUsingWhereAliasLookup()
+    {
+        var runner = new FakeProcessRunner((_, arguments) =>
+            arguments.SequenceEqual(["--version"])
+                ? new ProcessResult(0, "Windows Package Manager v1.10.340", "")
+                : new ProcessResult(1, "", "unexpected command"));
+        var provider = new WingetProvider(runner);
+
+        Assert.True(await provider.IsAvailableAsync());
+        var call = Assert.Single(runner.Calls);
+        Assert.Equal("winget.exe", call.FileName);
+        Assert.Equal(["--version"], call.Arguments);
+    }
+
+    [Fact]
+    public async Task IsAvailableAsync_ReturnsFalseWhenAliasCannotStart()
+    {
+        var runner = new FakeProcessRunner((_, _) => new ProcessResult(-1, "", "cannot start"));
+        var provider = new WingetProvider(runner);
+
+        Assert.False(await provider.IsAvailableAsync());
+    }
+
+    [Fact]
     public async Task SearchAsync_ParsesWingetTable()
     {
         const string output = "Name              Id                    Version  Source\n--------------------------------------------------------\nPython 3.13       Python.Python.3.13    3.13.2   winget\n";

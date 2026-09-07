@@ -165,7 +165,10 @@ public partial class PackagesViewModel(
             return;
         }
 
-            foreach (var package in selected) await packageProvider.UninstallAsync(package.Id, package.Name, OperationProgress, cancellationToken);
+        foreach (var package in selected)
+        {
+            await packageProvider.UninstallAsync(package.Id, package.Name, OperationProgress, cancellationToken);
+        }
         await LoadInstalledPackagesAsync(cancellationToken);
     }, "如卸载失败，请确认软件未在运行并查看 Problems。", canCancel: true);
 

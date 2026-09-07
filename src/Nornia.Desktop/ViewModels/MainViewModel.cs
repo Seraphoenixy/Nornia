@@ -79,17 +79,17 @@ public partial class MainViewModel : ObservableObject
         _settings = settings;
         var navigationItems = new ObservableCollection<NavigationItem>(
         [
-            new NavigationItem("Nav_Environment", Codicons.Dashboard, environment,
-                NavigationTargets.Dashboard, NavigationTargets.Runtime, NavigationTargets.Tools,
-                NavigationTargets.Packages, NavigationTargets.Cache),
             new NavigationItem("Nav_Explorer", Codicons.Files, explorer, NavigationTargets.Explorer),
             new NavigationItem("Nav_Git", Codicons.SourceControl, git, NavigationTargets.Git),
             new NavigationItem("Nav_Projects", Codicons.FolderLibrary, projects, NavigationTargets.Projects),
+            new NavigationItem("Nav_Environment", Codicons.Dashboard, environment,
+                NavigationTargets.Dashboard, NavigationTargets.Runtime, NavigationTargets.Tools,
+                NavigationTargets.Packages, NavigationTargets.Cache),
             new NavigationItem("Nav_Settings", Codicons.Settings, settings, NavigationTargets.Settings)
         ]);
         if (search is not null)
         {
-            navigationItems.Insert(2, new NavigationItem("Nav_Search", Codicons.Search, search, NavigationTargets.Search));
+            navigationItems.Insert(1, new NavigationItem("Nav_Search", Codicons.Search, search, NavigationTargets.Search));
         }
         Initialize(navigationItems);
         Terminal = terminal;
@@ -122,10 +122,7 @@ public partial class MainViewModel : ObservableObject
         _explorer.Explorer.PropertyChanged += OnWorkspaceSourceChanged;
         _explorer.Explorer.WorkspaceFilesChanged += OnWorkspaceFilesChanged;
 
-        // 启动首帧不打开页面标签(壳先行,主内容区先呈现空状态引导);默认导航项(环境管理)
-        // 的页面标签由 PreloadPagesAsync 在首帧后的空闲时机补开——否则着陆页内容区一直停留在
-        // 空状态,且点击已选中的活动栏项不会触发导航,用户必须点走再点回来才能看到页面。
-        // 其余内容页(项目管理/设置)仍按首次导航打开对应页面标签。
+        // 启动默认定位资源管理器，不打开内容页标签；环境管理等内容页仅在导航时打开。
 
         // 预加载:先让窗口壳和默认页完成首屏，再在空闲时分散激活其它页面，避免启动阶段
         // 与首屏渲染争抢 CPU、磁盘和外部进程。用户开始导航后会暂停低优先级预热。
@@ -146,17 +143,7 @@ public partial class MainViewModel : ObservableObject
             var pages = NavigationItems.Select(item => item.Page).Distinct().ToArray();
             if (pages.Length == 0) return;
 
-            // 默认导航项(环境管理)的内容必须经工作台标签渲染,而启动按"不自动打开页面标签"
-            // 约定只显示空状态引导;又因点击已选中的活动栏项不会触发 OnSelectedNavigationItemChanged,
-            // 用户必须点走再点回来才能看到着陆页——读作"环境管理页打不开"。因此在首帧后的
-            // 空闲时机补开当前导航项的标签:首帧开销不变,空状态只作极短过渡。用户此时已
-            // 开始导航或已恢复文档标签时不插手。
-            var initialPage = SelectedNavigationItem?.Page;
-            if (initialPage is not null && ReferenceEquals(CurrentPage, initialPage) && Workbench?.SelectedTab is null)
-            {
-                Workbench?.OpenOrActivatePage(initialPage);
-            }
-
+            // 预热只初始化数据，不打开或选中页面标签。
             await pages[0].ActivateAsync();
             foreach (var page in pages.Skip(1))
             {
@@ -856,7 +843,7 @@ public partial class MainViewModel : ObservableObject
             items.Add(new QuickPickItem(nav.Title, "打开页面", glyph, () => SelectNavigationItem(destination)));
         }
 
-        if (NavigationItems.FirstOrDefault()?.Page is EnvironmentManagementViewModel environment)
+        if (_environment is { } environment)
         {
             foreach (var section in environment.Items)
             {
@@ -887,7 +874,7 @@ public partial class MainViewModel : ObservableObject
     private void OpenEnvironmentSection(string title)
     {
         // 命令面板行:选中环境页(打开/激活其标签)并在页内切换小节——不产生分区标签。
-        SelectedNavigationItem = NavigationItems[0];
+        SelectNavigationItem(NavigationTargets.Dashboard);
         _environment?.SelectSection(title);
     }
 
