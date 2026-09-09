@@ -725,10 +725,14 @@
               <TextBlock Text="{Binding OperationPage.StatusMessage}" FontSize="{DynamicResource TypeBody}"
                          Foreground="{Binding OperationPage.StatusKind, Converter={StaticResource StatusKindToBrushConverter}}"
                          VerticalAlignment="Center" MaxWidth="220" TextTrimming="CharacterEllipsis" />
-              <TextBlock Text="{Binding OperationPage.CurrentOperation.ProgressDisplay}" FontSize="{DynamicResource TypeBadge}"
-                         Foreground="{Binding OperationPage.StatusKind, Converter={StaticResource StatusKindToBrushConverter}}"
-                         VerticalAlignment="Center" Margin="6,0,0,0"
-                         Visibility="{Binding OperationPage.CurrentOperation.HasProgress, Converter={StaticResource BooleanToVisibilityConverter}}" />
+              <StackPanel Orientation="Horizontal" Margin="6,0,0,0"
+                          Visibility="{Binding ShowStatusBarProgressPercentage, Converter={StaticResource BooleanToVisibilityConverter}}">
+                <TextBlock Text="{Binding OperationPage.CurrentOperation.ProgressDisplay, StringFormat=进度：{0}}" FontSize="{DynamicResource TypeBadge}"
+                           Foreground="{Binding OperationPage.StatusKind, Converter={StaticResource StatusKindToBrushConverter}}"
+                           VerticalAlignment="Center"
+                           AutomationProperties.Name="操作百分比进度"
+                           Visibility="{Binding OperationPage.CurrentOperation.HasProgress, Converter={StaticResource BooleanToVisibilityConverter}}" />
+              </StackPanel>
             </StackPanel>
           </Button>
           <Button Style="{StaticResource StatusBarItem}" Command="{Binding Commands[workbench.action.togglePanel]}" ToolTip="{loc:StringLoc Key=TogglePanel}">

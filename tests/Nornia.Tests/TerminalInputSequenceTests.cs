@@ -13,4 +13,25 @@ public sealed class TerminalInputSequenceTests
         Assert.Equal("\x1b[A", TerminalSurfaceControl.ArrowUpSequence);
         Assert.Equal("\x1b[B", TerminalSurfaceControl.ArrowDownSequence);
     }
+
+    [Theory]
+    [InlineData(9, 10, 10, 10, 0)]
+    [InlineData(0, 30, 30, 10, 20)]
+    [InlineData(15, 30, 30, 10, 14)]
+    [InlineData(0, 30, 40, 10, 29)]
+    public void ScrollOffsetForCursor_PlacesCursorInTheViewport(
+        int cursorRow, int screenRows, int totalLines, int visibleRows, int expected)
+    {
+        Assert.Equal(expected, TerminalSurfaceControl.ScrollOffsetForCursor(
+            cursorRow, screenRows, totalLines, visibleRows));
+    }
+
+    [Fact]
+    public void TerminalScreen_ClampsDisplayRowsToConPtyLimit()
+    {
+        var screen = new Nornia.Desktop.Terminal.TerminalScreen(columns: 40, rows: 999);
+        screen.Resize(40, 999);
+
+        Assert.Equal(Nornia.Desktop.Terminal.TerminalScreen.MaximumRows, screen.Rows);
+    }
 }

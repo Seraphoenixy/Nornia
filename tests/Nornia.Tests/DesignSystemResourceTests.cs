@@ -379,7 +379,8 @@ public sealed class DesignSystemResourceTests
         Assert.Contains("OnDiffContextMenuOpening", code);
         Assert.Contains("HunkIndexAtDisplayLine", code);
         Assert.Contains("FindHunkAnchorLine", code);
-        Assert.Contains("ApplyHunkAsync", code);
+        Assert.Contains("ApplyHunkBlockAsync", code);
+        Assert.Contains("TryResolveHunkBlock", code);
     }
 
     // ===== Phase 4: interaction / tooltip / font-token guards =====

@@ -14,7 +14,10 @@ namespace Nornia.Package.Providers;
 /// timeouts without retry (unlike mutations), and truncated display names are backfilled with
 /// bounded concurrency and per-Id deduplication.
 /// </summary>
-public sealed partial class WingetProvider(IProcessRunner processRunner, WingetProbe? probe = null) : IPackageProvider, IPackageProviderAvailability
+public sealed partial class WingetProvider(
+    IProcessRunner processRunner,
+    WingetProbe? probe = null,
+    IInteractiveProcessRunner? interactiveProcessRunner = null) : IPackageProvider, IPackageProviderAvailability
 {
     private const int BackfillMaxConcurrency = 4;
     private const int BackfillCacheMaxEntries = 512;
@@ -258,7 +261,13 @@ public sealed partial class WingetProvider(IProcessRunner processRunner, WingetP
             timeout.CancelAfter(MutationTimeout);
             try
             {
-                var result = await processRunner.RunAsync("winget.exe", arguments, progress, timeout.Token);
+                // WinGet suppresses its progress stream when stdout/stderr are redirected. The
+                // desktop host supplies a ConPTY-backed runner so WinGet believes it is attached
+                // to a terminal and emits the OSC 9;4 frames consumed by the UI. CLI/test hosts
+                // may not provide that capability and safely fall back to the regular runner.
+                var result = interactiveProcessRunner is null
+                    ? await processRunner.RunAsync("winget.exe", arguments, progress, timeout.Token)
+                    : await interactiveProcessRunner.RunInteractiveAsync("winget.exe", arguments, progress, timeout.Token);
                 // A declined UAC request ultimately appears as installer exit 1602. Retrying it
                 // automatically just opens another elevation prompt and makes the operation look
                 // stuck; return immediately so ThrowIfFailed can give an actionable explanation.

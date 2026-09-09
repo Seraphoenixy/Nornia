@@ -42,6 +42,28 @@ public sealed class PackagesViewModelTests
         Assert.Equal(0, inventory.ForcedRefreshCalls);
     }
 
+    [Fact]
+    public async Task UpgradeCommand_RescansAfterEachSelectedPackage()
+    {
+        var first = UpdatablePackage("Git.Git", "Git");
+        var second = UpdatablePackage("OpenJS.NodeJS", "Node.js");
+        var provider = new FakePackageProvider();
+        var inventory = new FakePackageInventory([first, second]);
+        var viewModel = new PackagesViewModel(provider, inventory, new FakeConfirmationService(), new FakeUiLogService());
+
+        viewModel.SelectedPackage = first;
+        viewModel.SelectedPackages.Add(first);
+        viewModel.SelectedPackages.Add(second);
+
+        await viewModel.UpgradeCommand.ExecuteAsync(null);
+
+        Assert.Equal(["Git.Git", "OpenJS.NodeJS"], provider.UpgradedPackages);
+        Assert.Equal(2, inventory.ForcedRefreshCalls);
+    }
+
     private static PackageInfo InstalledPackage(string id, string name) =>
         new(id, name, "1.0.0", null, "winget", true);
+
+    private static PackageInfo UpdatablePackage(string id, string name) =>
+        new(id, name, "1.0.0", "2.0.0", "winget", true);
 }

@@ -228,10 +228,25 @@ public partial class TerminalViewModel : PageViewModel
         await _defaultProfileSaveGate.WaitAsync();
         try
         {
-            var result = await session.CommitAsync(SettingScope.User,
-                [new(BuiltInSettingsCatalog.TerminalDefaultProfile.Id, System.Text.Json.Nodes.JsonValue.Create(profileId))]);
-            if (!result.IsSuccess)
-                LogService.Write("Warning", $"Failed to persist default shell: {result.Status} - {result.ErrorMessage}");
+            // 默认 Shell 是用户显式操作的结果,必须落盘。单次提交在磁盘压力下会瞬时失败:
+            // 原子替换重试耗尽(杀毒实时扫描/高并发 IO)→ FileError;会话基线过期 → Conflict。
+            // 此前单次失败即放弃,表现为"默认 Shell 静默丢失"(并行回归下的偶发超时同源)。
+            // FileError/Conflict 带退避重试(Conflict 先刷新会话基线再提交);ValidationFailed
+            // 属永久错误,不重试。
+            for (var attempt = 1; ; attempt++)
+            {
+                var result = await session.CommitAsync(SettingScope.User,
+                    [new(BuiltInSettingsCatalog.TerminalDefaultProfile.Id, System.Text.Json.Nodes.JsonValue.Create(profileId))]);
+                if (result.IsSuccess) return;
+                if (result.Status == SettingsCommitStatus.ValidationFailed || attempt >= 4)
+                {
+                    LogService.Write("Warning", $"Failed to persist default shell: {result.Status} - {result.ErrorMessage}");
+                    return;
+                }
+
+                if (result.Status == SettingsCommitStatus.Conflict) await session.RefreshAsync();
+                await Task.Delay(150 * attempt);
+            }
         }
         finally
         {

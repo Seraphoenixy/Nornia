@@ -23,6 +23,7 @@ public sealed class PackageInventoryService(
     private IReadOnlyList<PackageInfo>? _lastScan;
     private long _lastScanAt;
     private Task<IReadOnlyList<PackageInfo>>? _scanInFlight;
+    private bool _scanInFlightIsForced;
 
     public Task<IReadOnlyList<PackageInfo>> RefreshAsync(
         IProgress<ProcessOutput>? progress = null,
@@ -46,35 +47,76 @@ public sealed class PackageInventoryService(
         Task<IReadOnlyList<PackageInfo>> scanTask;
         lock (_gate)
         {
-            if (!forceRescan && _lastScan is not null && now - _lastScanAt < NorniaSettings.InventoryScanCacheSeconds)
+            if (_scanInFlight is not null)
+            {
+                if (forceRescan && !_scanInFlightIsForced)
+                {
+                    // A post-mutation forced refresh must not reuse a non-forced scan that started
+                    // before the mutation. Chain one fresh scan behind it instead.
+                    scanTask = TrackScan(
+                        ScanForcedAfterAsync(_scanInFlight, progress, cancellationToken),
+                        isForced: true);
+                }
+                else
+                {
+                    scanTask = _scanInFlight;
+                }
+            }
+            else if (!forceRescan && _lastScan is not null && now - _lastScanAt < NorniaSettings.InventoryScanCacheSeconds)
             {
                 return _lastScan;
             }
-
-            // Share one load/scan task so concurrent page activations cannot start several winget runs.
-            if (_scanInFlight is null)
-            {
-                scanTask = _scanInFlight = forceRescan
-                    ? ScanAndPersistAsync(progress, cancellationToken)
-                    : LoadOrScanAsync(cancellationToken);
-                _ = scanTask.ContinueWith(completed =>
-                {
-                    lock (_gate)
-                    {
-                        if (ReferenceEquals(_scanInFlight, completed))
-                        {
-                            _scanInFlight = null;
-                        }
-                    }
-                }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-            }
             else
             {
-                scanTask = _scanInFlight;
+                // Share one load/scan task so concurrent page activations cannot start several
+                // winget runs.
+                scanTask = TrackScan(
+                    forceRescan
+                        ? ScanAndPersistAsync(progress, cancellationToken)
+                        : LoadOrScanAsync(cancellationToken),
+                    forceRescan);
             }
         }
 
         return await scanTask.WaitAsync(cancellationToken);
+    }
+
+    private Task<IReadOnlyList<PackageInfo>> TrackScan(
+        Task<IReadOnlyList<PackageInfo>> scanTask,
+        bool isForced)
+    {
+        _scanInFlight = scanTask;
+        _scanInFlightIsForced = isForced;
+        _ = scanTask.ContinueWith(completed =>
+        {
+            lock (_gate)
+            {
+                if (ReferenceEquals(_scanInFlight, completed))
+                {
+                    _scanInFlight = null;
+                    _scanInFlightIsForced = false;
+                }
+            }
+        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        return scanTask;
+    }
+
+    private async Task<IReadOnlyList<PackageInfo>> ScanForcedAfterAsync(
+        Task<IReadOnlyList<PackageInfo>> previousScan,
+        IProgress<ProcessOutput>? progress,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await previousScan.ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // The forced scan is the authoritative post-mutation attempt. If the earlier shared
+            // scan failed, let this fresh attempt decide whether the refresh succeeds.
+        }
+
+        return await ScanAndPersistAsync(progress, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<IReadOnlyList<PackageInfo>> LoadOrScanAsync(CancellationToken cancellationToken)

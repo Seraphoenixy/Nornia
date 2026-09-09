@@ -132,8 +132,9 @@
                         ToolTip="取消当前软件包操作" />
                 <TextBlock Text="{Binding CurrentOperation.Detail}" Foreground="{DynamicResource MutedTextBrush}"
                            FontSize="{DynamicResource TypeBody}" TextTrimming="CharacterEllipsis" />
-                <TextBlock Text="{Binding CurrentOperation.ProgressDisplay}" Foreground="{DynamicResource InfoAccentBrush}"
+                <TextBlock Text="{Binding CurrentOperation.ProgressDisplay, StringFormat=下载进度：{0}}" Foreground="{DynamicResource InfoAccentBrush}"
                            FontSize="{DynamicResource TypeBadge}" Margin="{StaticResource GapLeftSm}"
+                           AutomationProperties.Name="下载百分比进度"
                            Visibility="{Binding CurrentOperation.HasProgress, Converter={StaticResource BooleanToVisibilityConverter}}" />
               </DockPanel>
               <ProgressBar Grid.Row="1" Height="4" Margin="0,4,0,0" Maximum="100"

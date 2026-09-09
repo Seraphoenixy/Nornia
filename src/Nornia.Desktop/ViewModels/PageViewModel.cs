@@ -12,6 +12,8 @@ public abstract partial class PageViewModel(string title, IUiLogService logServi
     private bool _activated;
     private readonly SemaphoreSlim _activationGate = new(1, 1);
     private CancellationTokenSource? _operationCancellation;
+    private readonly IUiDispatcher _uiDispatcher = new WpfUiDispatcher();
+    private OperationProgressSink? _operationProgress;
     private int _statusToken;
 
     public string Title { get; } = title;
@@ -43,33 +45,22 @@ public abstract partial class PageViewModel(string title, IUiLogService logServi
         get
         {
             var operation = CurrentOperation;
-            var logProgress = LogService.CreateProcessProgress(operation?.CorrelationId);
-            return new Progress<ProcessOutput>(output =>
+            if (operation is null)
             {
-                logProgress.Report(output);
-                if (operation is null
-                    || !ReferenceEquals(CurrentOperation, operation)
-                    || operation.Phase != OperationPhase.Running)
-                {
-                    return;
-                }
+                var logProgress = LogService.CreateProcessProgress(null);
+                return new Progress<ProcessOutput>(logProgress.Report);
+            }
 
-                if (!OperationProgressParser.TryGetPercentage(output.Text, out var percentage))
-                {
-                    return;
-                }
+            if (_operationProgress is null || !ReferenceEquals(_operationProgress.Operation, operation))
+            {
+                _operationProgress = new OperationProgressSink(
+                    operation,
+                    _uiDispatcher,
+                    LogService.CreateProcessProgress(operation.CorrelationId),
+                    ApplyOperationProgress);
+            }
 
-                // A process can merge stdout/stderr progress lines out of order. Do not let an
-                // older line make a visible download bar move backwards.
-                if (operation.Progress is { } previous && percentage < previous)
-                {
-                    return;
-                }
-
-                operation.Progress = percentage;
-                operation.Detail = $"{operation.Title} {operation.ProgressDisplay}";
-                StatusMessage = operation.Detail;
-            });
+            return _operationProgress;
         }
     }
 
@@ -120,6 +111,7 @@ public abstract partial class PageViewModel(string title, IUiLogService logServi
             Detail = $"{operation}正在进行…",
             RecommendedNextStep = recommendedNextStep
         };
+        _operationProgress = null;
         OnPropertyChanged(nameof(HasOperation));
         _statusToken++;
         StatusKind = StatusKind.Info;
@@ -129,6 +121,7 @@ public abstract partial class PageViewModel(string title, IUiLogService logServi
         try
         {
             await action(_operationCancellation.Token);
+            await FlushOperationProgressAsync();
             StatusMessage = successMessageFactory?.Invoke() ?? $"{operation}完成";
             CurrentOperation.Phase = OperationPhase.Succeeded;
             CurrentOperation.Detail = StatusMessage;
@@ -140,6 +133,7 @@ public abstract partial class PageViewModel(string title, IUiLogService logServi
         }
         catch (OperationCanceledException) when (_operationCancellation.IsCancellationRequested)
         {
+            await FlushOperationProgressAsync();
             StatusMessage = $"{operation}已取消";
             CurrentOperation.Phase = OperationPhase.Cancelled;
             CurrentOperation.Detail = StatusMessage;
@@ -151,6 +145,7 @@ public abstract partial class PageViewModel(string title, IUiLogService logServi
         }
         catch (Exception ex)
         {
+            await FlushOperationProgressAsync();
             var shortMessage = ex.Message.Split(["\r\n", "\n"], StringSplitOptions.RemoveEmptyEntries).FirstOrDefault()
                 ?? "未知错误";
             StatusMessage = $"{operation}失败：{shortMessage}";
@@ -169,6 +164,46 @@ public abstract partial class PageViewModel(string title, IUiLogService logServi
             _operationCancellation.Dispose();
             _operationCancellation = null;
             IsBusy = false;
+        }
+    }
+
+    private void ApplyOperationProgress(OperationState operation, double percentage)
+    {
+        if (!ReferenceEquals(CurrentOperation, operation) || operation.Phase != OperationPhase.Running)
+        {
+            return;
+        }
+
+        // stdout and stderr are drained concurrently. A late frame from the other stream must
+        // not make the visible bar move backwards.
+        if (operation.Progress is { } previous && percentage < previous)
+        {
+            return;
+        }
+
+        operation.Progress = percentage;
+        operation.Detail = $"{operation.Title} {operation.ProgressDisplay}";
+        StatusMessage = operation.Detail;
+    }
+
+    private async Task FlushOperationProgressAsync()
+    {
+        if (_operationProgress is null)
+        {
+            return;
+        }
+
+        try
+        {
+            // Progress reports from ProcessRunner arrive on background stream readers. The final
+            // operation state can otherwise be published before the queued UI callback runs,
+            // making the last download percentage disappear. Flush the latest value while the
+            // operation is still Running, immediately before publishing its terminal state.
+            await _operationProgress.FlushAsync();
+        }
+        catch (Exception exception)
+        {
+            LogService.Write("WARNING", $"刷新软件包下载进度失败：{exception.Message}");
         }
     }
 
@@ -243,6 +278,68 @@ public enum StatusKind
     Error
 }
 
+/// <summary>Receives process output without losing the last progress frame when the process exits
+/// before a queued <see cref="Progress{T}"/> callback reaches the UI thread.</summary>
+internal sealed class OperationProgressSink(OperationState operation, IUiDispatcher dispatcher,
+    IProgress<ProcessOutput> logProgress, Action<OperationState, double> apply) : IProgress<ProcessOutput>
+{
+    private readonly object _gate = new();
+    private double? _latestPercentage;
+
+    public OperationState Operation { get; } = operation;
+
+    public void Report(ProcessOutput value)
+    {
+        // Keep the existing output/log path for diagnostics. Percentage extraction is repeated
+        // synchronously below so a fast process cannot finish before its final UI update is known.
+        logProgress.Report(value);
+        if (!OperationProgressParser.TryGetPercentage(value.Text, out var percentage))
+        {
+            return;
+        }
+
+        lock (_gate)
+        {
+            if (_latestPercentage is null || percentage > _latestPercentage.Value)
+            {
+                _latestPercentage = percentage;
+            }
+        }
+
+        if (dispatcher.CheckAccess())
+        {
+            ApplyLatest();
+            return;
+        }
+
+        try
+        {
+            dispatcher.BeginInvoke(ApplyLatest);
+        }
+        catch
+        {
+            // The dispatcher may be shutting down. FlushAsync will make one final best effort,
+            // while the process operation itself still owns the original failure/cancellation.
+        }
+    }
+
+    public Task FlushAsync() => dispatcher.InvokeAsync(ApplyLatest);
+
+    private void ApplyLatest()
+    {
+        double? percentage;
+        lock (_gate)
+        {
+            percentage = _latestPercentage;
+        }
+
+        if (percentage is { } value)
+        {
+            apply(Operation, value);
+        }
+    }
+}
+
 public partial class OperationState : ObservableObject
 {
     public OperationState(string title, Guid correlationId, bool canCancel)
@@ -276,13 +373,17 @@ public partial class OperationState : ObservableObject
     }
 }
 
-/// <summary>Extracts percentages from winget/scoop/chocolatey output. Package managers use both
+/// <summary>Extracts percentages from package-manager output. In addition to human-readable
+/// percentages, winget emits OSC 9;4 virtual-terminal progress frames. Package managers use both
 /// integer and decimal percentages, and winget may emit several carriage-return updates in one
 /// line, so the last valid match is the current progress value.</summary>
 internal static class OperationProgressParser
 {
     private static readonly Regex PercentagePattern = new(
         @"(?<!\d)(?<value>\d{1,3}(?:[.,]\d+)?)\s*%",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant);
+    private static readonly Regex WingetVirtualTerminalProgressPattern = new(
+        @"\x1B\]9;4;(?<state>[124]);(?<value>\d{1,3})(?:\x07|\x1B\\)",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     public static bool TryGetPercentage(string? text, out double percentage)
@@ -293,10 +394,24 @@ internal static class OperationProgressParser
             return false;
         }
 
-        var matches = PercentagePattern.Matches(text);
-        for (var index = matches.Count - 1; index >= 0; index--)
+        // Some localized installers use the full-width percent sign. Normalize it before
+        // applying the invariant numeric parser so the UI behaves the same in Chinese locales.
+        var normalized = text.Replace('％', '%');
+        var candidates = new List<(int Index, string Token)>();
+        foreach (Match match in WingetVirtualTerminalProgressPattern.Matches(normalized))
         {
-            var token = matches[index].Groups["value"].Value.Replace(',', '.');
+            candidates.Add((match.Index, match.Groups["value"].Value));
+        }
+
+        foreach (Match match in PercentagePattern.Matches(normalized))
+        {
+            candidates.Add((match.Index, match.Groups["value"].Value));
+        }
+
+        candidates.Sort((left, right) => right.Index.CompareTo(left.Index));
+        foreach (var candidate in candidates)
+        {
+            var token = candidate.Token.Replace(',', '.');
             if (!double.TryParse(token, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, out var value)
                 || value is < 0 or > 100)
             {

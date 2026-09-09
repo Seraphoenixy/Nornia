@@ -1,4 +1,5 @@
 using System.Text;
+using Nornia.Core.Models;
 using Nornia.Core.Services;
 
 namespace Nornia.Tests;
@@ -122,6 +123,61 @@ public sealed class ProcessRunnerTests
     }
 
     [Fact]
+    public async Task RunAsync_ReportsPercentagesBeforeAnUnterminatedProgressFrameCompletes()
+    {
+        var progressReached = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var progress = new CallbackProgress(output =>
+        {
+            if (output.Text.Contains("42%", StringComparison.Ordinal))
+            {
+                progressReached.TrySetResult(true);
+            }
+        });
+        var runner = new ProcessRunner();
+        var running = runner.RunAsync(
+            "powershell.exe",
+            [
+                "-NoProfile",
+                "-Command",
+                "$o=[Console]::OpenStandardOutput(); $b=[Text.Encoding]::UTF8.GetBytes('42%'); $o.Write($b,0,$b.Length); $o.Flush(); Start-Sleep -Milliseconds 1500"
+            ],
+            progress);
+
+        var signalled = await Task.WhenAny(progressReached.Task, Task.Delay(TimeSpan.FromSeconds(5)));
+        Assert.Same(progressReached.Task, signalled);
+        Assert.False(running.IsCompleted);
+        await running;
+    }
+
+    [Fact]
+    public async Task RunAsync_ReportsWingetVirtualTerminalProgressBeforeProcessExits()
+    {
+        var progressReached = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var progress = new CallbackProgress(output =>
+        {
+            if (output.Text.Contains("]9;4;1;42", StringComparison.Ordinal))
+            {
+                progressReached.TrySetResult(true);
+            }
+        });
+        var sequence = Encoding.UTF8.GetBytes("\u001b]9;4;1;42\u0007");
+        var runner = new ProcessRunner();
+        var running = runner.RunAsync(
+            "powershell.exe",
+            [
+                "-NoProfile",
+                "-Command",
+                RawBytesCommand(sequence) + "; Start-Sleep -Milliseconds 1500"
+            ],
+            progress);
+
+        var signalled = await Task.WhenAny(progressReached.Task, Task.Delay(TimeSpan.FromSeconds(5)));
+        Assert.Same(progressReached.Task, signalled);
+        Assert.False(running.IsCompleted);
+        await running;
+    }
+
+    [Fact]
     public async Task RunAsync_CancellationTerminatesTheStartedProcess()
     {
         using var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(150));
@@ -193,5 +249,10 @@ public sealed class ProcessRunnerTests
         var completed = await Task.WhenAny(running, Task.Delay(TimeSpan.FromSeconds(3)));
         Assert.Same(running, completed);
         await running;
+    }
+
+    private sealed class CallbackProgress(Action<ProcessOutput> callback) : IProgress<ProcessOutput>
+    {
+        public void Report(ProcessOutput value) => callback(value);
     }
 }

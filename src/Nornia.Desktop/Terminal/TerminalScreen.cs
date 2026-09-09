@@ -24,6 +24,10 @@ public struct TerminalCell
 /// </summary>
 public sealed class TerminalScreen
 {
+    /// <summary>终端屏幕行数的有效范围,与 ConPTY 支持的尺寸范围保持一致。</summary>
+    public const int MinimumRows = 10;
+    public const int MaximumRows = 200;
+
     private readonly object _gate = new();
     // T1: 滚动缓冲为环形数组(head + count):超限进新行不再 List.RemoveAt(0) 整表移位,
     // 而是覆盖最旧槽位并前进 head —— O(1)。被覆盖的最旧行数组就地复用为新底行(零分配)。
@@ -71,7 +75,7 @@ public sealed class TerminalScreen
     public TerminalScreen(int columns = 120, int rows = 30, int scrollbackLimit = 2000, Func<int, int>? palette = null)
     {
         _columns = Math.Max(20, columns);
-        var initialRows = Math.Max(10, rows);
+        var initialRows = Math.Clamp(rows, MinimumRows, MaximumRows);
         _primary = NewRows(initialRows);
         _alternate = null!; // T7: 备用屏惰性分配,进入备屏时才创建
         _primaryVersions = NewVersions(initialRows);
@@ -246,7 +250,7 @@ public sealed class TerminalScreen
         lock (_gate)
         {
             var newColumns = Math.Max(20, columns);
-            var newRows = Math.Max(10, rows);
+            var newRows = Math.Clamp(rows, MinimumRows, MaximumRows);
             if (newColumns == _columns && newRows == _rows.Count)
             {
                 return;

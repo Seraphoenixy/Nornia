@@ -306,7 +306,7 @@ public partial class MainViewModel : ObservableObject
         OnPropertyChanged(nameof(IsSidebarColumnVisible));
         OnPropertyChanged(nameof(IsSettingsActive));
         OnPropertyChanged(nameof(ShowViewPageWelcome));
-        OnPropertyChanged(nameof(OperationPage));
+        NotifyOperationPageChanged();
         // 标签→活动栏同步中不重开页面标签(它已打开,重复打开会循环)。
         if (CurrentPage is { } page && !_syncingActivitySelection)
         {
@@ -349,6 +349,16 @@ public partial class MainViewModel : ObservableObject
         _ => CurrentPage,
     };
 
+    /// <summary>The package page renders its own labelled percentage beside the determinate bar;
+    /// suppress the duplicate percentage in the global status bar while that page is active.</summary>
+    public bool ShowStatusBarProgressPercentage => OperationPage is not PackagesViewModel;
+
+    private void NotifyOperationPageChanged()
+    {
+        OnPropertyChanged(nameof(OperationPage));
+        OnPropertyChanged(nameof(ShowStatusBarProgressPercentage));
+    }
+
     /// <summary>标签→活动栏联动:选中页面标签时高亮其所属活动项(受 _syncingActivitySelection
     /// 保护,避免回环);文档/空选中时活动栏不动。</summary>
     private void OnWorkbenchPropertyChanged(object? sender, PropertyChangedEventArgs e)
@@ -359,7 +369,7 @@ public partial class MainViewModel : ObservableObject
         }
 
         OnPropertyChanged(nameof(ShowViewPageWelcome));
-        OnPropertyChanged(nameof(OperationPage));
+        NotifyOperationPageChanged();
 
         if (Workbench.SelectedTab is PageWorkbenchTab { Content: PageViewModel page })
         {
@@ -386,7 +396,7 @@ public partial class MainViewModel : ObservableObject
         // 环境页内部切换小节 → 状态栏反馈源跟随当前小节页。
         if (e.PropertyName == nameof(EnvironmentManagementViewModel.CurrentPage))
         {
-            OnPropertyChanged(nameof(OperationPage));
+            NotifyOperationPageChanged();
             RecordNavigation();
         }
     }

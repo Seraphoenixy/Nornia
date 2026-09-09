@@ -4633,11 +4633,99 @@ public sealed partial class DiffTab : EditorTabItem
         };
     }
 
+    /// <summary>Number of contiguous changed blocks (maximal +/- runs, Notice 行视作分隔) inside
+    /// the hunk. git 会把间距不超过 2×上下文行的多处修改合并成一个 hunk,块数 &gt; 1 时块级操作
+    /// 才与整 hunk 操作不同。</summary>
+    internal static int CountChangedBlocks(GitDiffHunk hunk)
+    {
+        var blocks = 0;
+        var inBlock = false;
+        foreach (var line in HunkBodyLines(hunk))
+        {
+            if (line.Kind is GitDiffLineKind.Added or GitDiffLineKind.Removed)
+            {
+                if (!inBlock)
+                {
+                    blocks++;
+                    inBlock = true;
+                }
+            }
+            else
+            {
+                inBlock = false;
+            }
+        }
+
+        return blocks;
+    }
+
+    /// <summary>Resolves which contiguous changed block of the hunk contains the hovered anchor
+    /// line: a removed line matches by old file line number, an added line by new file line
+    /// number. 两个锚点都为空 → 整 hunk(null);给定了锚点却匹配不到任何块 → -1,由调用方拒绝
+    /// 应用(宁可不操作,也不能错落到相邻块)。</summary>
+    internal static int? ResolveHunkBlockOrdinal(GitDiffHunk hunk, int? anchorOldLine, int? anchorNewLine)
+    {
+        if (anchorOldLine is null && anchorNewLine is null)
+        {
+            return null;
+        }
+
+        var matched = -1;
+        var ordinal = -1;
+        var inBlock = false;
+        foreach (var line in HunkBodyLines(hunk))
+        {
+            if (line.Kind is not (GitDiffLineKind.Added or GitDiffLineKind.Removed))
+            {
+                inBlock = false;
+                continue;
+            }
+
+            if (!inBlock)
+            {
+                ordinal++;
+                inBlock = true;
+            }
+
+            var matches = (line.Kind == GitDiffLineKind.Removed && line.OldLineNumber is { } old && old == anchorOldLine)
+                || (line.Kind == GitDiffLineKind.Added && line.NewLineNumber is { } New && New == anchorNewLine);
+            if (matches)
+            {
+                matched = ordinal;
+            }
+        }
+
+        return matched;
+    }
+
+    private static IEnumerable<GitDiffLine> HunkBodyLines(GitDiffHunk hunk) =>
+        hunk.Lines.SkipWhile(line => line.Kind == GitDiffLineKind.HunkHeader);
+
     [ObservableProperty]
     private bool isHunkOperationBusy;
 
     /// <summary>Applies one hunk through Git, reloads this Diff tab and notifies the SCM page.</summary>
-    public async Task<bool> ApplyHunkAsync(int hunkIndex, GitHunkOperation operation, CancellationToken cancellationToken = default)
+    public async Task<bool> ApplyHunkAsync(int hunkIndex, GitHunkOperation operation, CancellationToken cancellationToken = default) =>
+        await ApplyHunkBlockCoreAsync(hunkIndex, null, null, operation, cancellationToken).ConfigureAwait(true);
+
+    /// <summary>Applies one contiguous changed block (悬停的变更块) inside a hunk. git 会把相近的
+    /// 两处修改合并成同一个 hunk——按块操作才能只暂存其中一处。<paramref name="blockAnchorOldLine"/>
+    /// /<paramref name="blockAnchorNewLine"/> 是悬停块首行的旧/新文件行号(取得到的那侧),由此在
+    /// hunk 原始行里解析出块序号;两个都为空时回退为整 hunk 操作。</summary>
+    public async Task<bool> ApplyHunkBlockAsync(
+        int hunkIndex,
+        int? blockAnchorOldLine,
+        int? blockAnchorNewLine,
+        GitHunkOperation operation,
+        CancellationToken cancellationToken = default) =>
+        await ApplyHunkBlockCoreAsync(hunkIndex, blockAnchorOldLine, blockAnchorNewLine, operation, cancellationToken).ConfigureAwait(true);
+
+    private async Task<bool> ApplyHunkBlockCoreAsync(
+        int hunkIndex,
+        int? blockAnchorOldLine,
+        int? blockAnchorNewLine,
+        GitHunkOperation operation,
+        CancellationToken cancellationToken)
     {
         if (!CanApplyHunk(hunkIndex, operation))
         {
@@ -4661,11 +4749,22 @@ public sealed partial class DiffTab : EditorTabItem
 
             IsHunkOperationBusy = true;
             var hunk = Hunks[hunkIndex];
+            var blockOrdinal = ResolveHunkBlockOrdinal(hunk, blockAnchorOldLine, blockAnchorNewLine);
+            if (blockOrdinal is { } resolved && (resolved < 0 || resolved >= CountChangedBlocks(hunk)))
+            {
+                // 悬停快照与当前 hunk 行不一致:拒绝应用,绝不能把块序号错落到相邻块上。
+                _logService.Write("WARNING", $"无法定位悬停的变更块：{Path} #{hunkIndex + 1}。");
+                return false;
+            }
+
             if (operation == GitHunkOperation.Restore && !_restoreConfirmedForSession)
             {
+                var target = blockOrdinal is { } ordinal && CountChangedBlocks(hunk) > 1
+                    ? $"第 {hunkIndex + 1} 个 Diff 块内的一个变更块"
+                    : $"第 {hunkIndex + 1} 个 Diff 块";
                 var confirmed = _confirmationService?.Confirm(
                     "确认还原 Diff 块",
-                    $"将还原“{Path}”的第 {hunkIndex + 1} 个 Diff 块，且无法撤销。选择“否”可安全取消。") == true;
+                    $"将还原“{Path}”的{target}，且无法撤销。选择“否”可安全取消。") == true;
                 if (!confirmed)
                 {
                     _logService.Write("INFO", $"用户取消了还原 Diff 块：{Path} #{hunkIndex + 1}。");
@@ -4675,7 +4774,7 @@ public sealed partial class DiffTab : EditorTabItem
                 _restoreConfirmedForSession = true;
             }
 
-            await _gitService.ApplyHunkAsync(_request.RepositoryPath, Path, DisplayIsStaged, hunk, operation, operationToken).ConfigureAwait(true);
+            await _gitService.ApplyHunkAsync(_request.RepositoryPath, Path, DisplayIsStaged, hunk, operation, blockOrdinal, operationToken).ConfigureAwait(true);
             await ReloadDiffAsync(operationToken).ConfigureAwait(true);
             HunkMutationCompleted?.Invoke(this, EventArgs.Empty);
             return true;

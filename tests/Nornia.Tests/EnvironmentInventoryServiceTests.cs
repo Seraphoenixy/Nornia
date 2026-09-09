@@ -61,7 +61,7 @@ public sealed class EnvironmentInventoryServiceTests
 
         var first = service.RefreshAsync();
         await discovery.Started.Task;
-        var second = service.RefreshForcedAsync();
+        var second = service.RefreshAsync();
         discovery.Release.TrySetResult(true);
 
         var results = await Task.WhenAll(first, second);
@@ -69,6 +69,25 @@ public sealed class EnvironmentInventoryServiceTests
         Assert.Equal(1, discovery.ScanCalls);
         Assert.Same(results[0], results[1]);
         Assert.Equal(1, repository.UpsertCalls);
+    }
+
+    [Fact]
+    public async Task RefreshForcedAsync_DoesNotReuseNonForcedScanInFlight()
+    {
+        var discovery = new BlockingDiscovery();
+        var repository = new FakeRuntimeRepository();
+        var service = new EnvironmentInventoryService(discovery, repository);
+
+        var initial = service.RefreshAsync();
+        await discovery.Started.Task;
+        var forced = service.RefreshForcedAsync();
+        discovery.Release.TrySetResult(true);
+
+        var results = await Task.WhenAll(initial, forced);
+
+        Assert.Equal(2, discovery.ScanCalls);
+        Assert.NotSame(results[0], results[1]);
+        Assert.Equal(2, repository.UpsertCalls);
     }
 
     [Fact]

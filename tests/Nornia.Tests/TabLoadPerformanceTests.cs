@@ -427,7 +427,7 @@ internal sealed class GatedFakeGitService : IGitService
     public Task<string> GetRawDiffAsync(string repositoryPath, bool staged, IReadOnlyList<string>? paths = null, CancellationToken cancellationToken = default) =>
         Task.FromResult(string.Empty);
 
-    public Task ApplyHunkAsync(string repositoryPath, string path, bool staged, GitDiffHunk hunk, GitHunkOperation operation, CancellationToken cancellationToken = default) =>
+    public Task ApplyHunkAsync(string repositoryPath, string path, bool staged, GitDiffHunk hunk, GitHunkOperation operation, int? blockOrdinal = null, CancellationToken cancellationToken = default) =>
         Task.CompletedTask;
 
     public Task StageAsync(string repositoryPath, IReadOnlyCollection<string> paths, CancellationToken cancellationToken = default) =>

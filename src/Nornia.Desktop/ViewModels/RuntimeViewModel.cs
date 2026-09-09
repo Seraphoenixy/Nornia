@@ -170,6 +170,7 @@ public partial class RuntimeViewModel(
             return;
         }
 
+        var refreshedAfterMutation = false;
         foreach (var runtime in selectedRuntimes)
         {
             foreach (var package in packageResolver.ResolveMany(runtime.Name, runtime.Version))
@@ -190,9 +191,19 @@ public partial class RuntimeViewModel(
                     throw new InvalidOperationException(
                         $"卸载 Runtime 包 {package.PackageId} 失败。", exception);
                 }
+
+                // Re-scan immediately after each completed winget mutation. This keeps the
+                // runtime row and its detail form current during a multi-package removal.
+                await ReloadRuntimesAsync(forceRescan: true, cancellationToken);
+                refreshedAfterMutation = true;
             }
         }
-        await ReloadRuntimesAsync(forceRescan: true, cancellationToken);
+        if (!refreshedAfterMutation)
+        {
+            // A resolver may legitimately return no package (for example, an unsupported
+            // mapping). Still refresh the form once so it cannot retain a stale snapshot.
+            await ReloadRuntimesAsync(forceRescan: true, cancellationToken);
+        }
     }, "确认 Runtime 未被占用，再查看 Problems。", canCancel: true);
 
     [RelayCommand(CanExecute = nameof(CanUpgradeSelected))]
@@ -212,6 +223,7 @@ public partial class RuntimeViewModel(
             return;
         }
 
+        var refreshedAfterMutation = false;
         foreach (var runtime in selectedRuntimes)
         {
             var packages = SelectUpgradePackages(
@@ -232,9 +244,17 @@ public partial class RuntimeViewModel(
                     LogService.Write("WARNING",
                         $"跳过 {package.PackageId}：WinGet 没有适用的更新（{WingetExitCodes.Format(exception.ExitCode)}）。");
                 }
+
+                // Whether winget upgraded the package or reported that the advertised update is
+                // no longer applicable, refresh the affected form before the next item.
+                await ReloadRuntimesAsync(forceRescan: true, cancellationToken);
+                refreshedAfterMutation = true;
             }
         }
-        await ReloadRuntimesAsync(forceRescan: true, cancellationToken);
+        if (!refreshedAfterMutation)
+        {
+            await ReloadRuntimesAsync(forceRescan: true, cancellationToken);
+        }
     }, "查看 Output 中的安装器诊断后重试。", canCancel: true);
 
     /// <summary>重载运行库列表。forceRescan=true 用于显式扫描与移除/升级等变更后的重载
@@ -260,9 +280,65 @@ public partial class RuntimeViewModel(
             .Select(runtime => new ManagedComponentItem(runtime, FindAvailableVersion(runtime, packages)))
             .ToArray();
         using var performance = performanceMetrics?.Begin("runtime.list.publish", snapshot.Length, "ui-batch");
+        var selectedItems = SelectedRuntimes.ToArray();
+        var selectedItem = SelectedRuntime;
         Runtimes.ReplaceRange(snapshot);
+        ReselectPublishedItems(snapshot, selectedItems, selectedItem);
         FilteredRuntimes.Refresh();
         NotifyCopyCommands();
+    }
+
+    private void ReselectPublishedItems(
+        IReadOnlyList<ManagedComponentItem> snapshot,
+        IReadOnlyList<ManagedComponentItem> selectedItems,
+        ManagedComponentItem? selectedItem)
+    {
+        var selected = selectedItems
+            .Select(item => FindReplacement(snapshot, item))
+            .Where(item => item is not null)
+            .Cast<ManagedComponentItem>()
+            .Distinct()
+            .ToArray();
+        SelectedRuntimes.Clear();
+        foreach (var item in selected)
+        {
+            SelectedRuntimes.Add(item);
+        }
+
+        // Keep the detail form attached to the freshly scanned row when its stable location is
+        // unchanged. If the row disappeared, clear it instead of displaying stale data.
+        SelectedRuntime = selectedItem is null
+            ? null
+            : FindReplacement(snapshot, selectedItem);
+    }
+
+    private static string GetSelectionKey(ManagedComponentItem item) =>
+        $"{item.Name}\u001F{item.Architecture}\u001F{item.InstallPath}";
+
+    private static ManagedComponentItem? FindReplacement(
+        IReadOnlyList<ManagedComponentItem> snapshot,
+        ManagedComponentItem previous)
+    {
+        var exact = snapshot.FirstOrDefault(item => string.Equals(GetSelectionKey(item), GetSelectionKey(previous), StringComparison.OrdinalIgnoreCase));
+        if (exact is not null) return exact;
+
+        // Some detectors include the version in InstallPath (notably .NET). Prefer the row that
+        // matches the advertised target version before falling back to a unique same-component
+        // row; never keep the old object when the scan cannot identify a replacement.
+        if (!string.IsNullOrWhiteSpace(previous.AvailableVersion))
+        {
+            var target = snapshot.FirstOrDefault(item =>
+                string.Equals(item.Name, previous.Name, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(item.Architecture, previous.Architecture, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(item.Version, previous.AvailableVersion, StringComparison.OrdinalIgnoreCase));
+            if (target is not null) return target;
+        }
+
+        var candidates = snapshot.Where(item =>
+                string.Equals(item.Name, previous.Name, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(item.Architecture, previous.Architecture, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        return candidates.Length == 1 ? candidates[0] : null;
     }
     partial void OnFilterTextChanged(string value) => FilteredRuntimes.Refresh();
     partial void OnSelectedRuntimeChanged(ManagedComponentItem? value)

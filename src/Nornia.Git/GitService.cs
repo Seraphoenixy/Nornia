@@ -319,6 +319,7 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
         bool staged,
         GitDiffHunk hunk,
         GitHunkOperation operation,
+        int? blockOrdinal = null,
         CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
@@ -346,7 +347,7 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
         // byte-identical, so re-encoding them through a text codec here would corrupt the
         // context and the hunk could no longer be located.
         var raw = await GetRawDiffBytesAsync(repositoryPath, staged, [path], cancellationToken).ConfigureAwait(false);
-        var patch = SelectHunkPatchBytes(raw, hunk);
+        var patch = SelectHunkPatchBytes(raw, hunk, operation, blockOrdinal);
         if (patch is null)
         {
             throw new GitOperationException("当前文件的 Diff 已发生变化，无法安全定位该块；请刷新后重试。");
@@ -387,7 +388,7 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
     /// diff header, index line) are made on the ASCII markers; the hunk header's text comparison
     /// decodes that single line with the same strict-UTF-8→GB18030 strategy the diff view uses,
     /// so a legacy-encoded header still matches the tab's properly decoded header.</summary>
-    private static byte[]? SelectHunkPatchBytes(byte[] raw, GitDiffHunk target)
+    private static byte[]? SelectHunkPatchBytes(byte[] raw, GitDiffHunk target, GitHunkOperation operation, int? blockOrdinal = null)
     {
         if (raw.Length == 0)
         {
@@ -404,13 +405,6 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
             {
                 lineStarts.Add(i + 1);
             }
-        }
-
-        static ReadOnlySpan<byte> Line(byte[] data, List<int> starts, int index)
-        {
-            var start = starts[index];
-            var end = index + 1 < starts.Count ? starts[index + 1] - 1 : data.Length;
-            return data[start..end];
         }
 
         var hunkStart = -1;
@@ -476,6 +470,22 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
             end--;
         }
 
+        // Narrow the hunk to one contiguous changed block (git merges nearby edits into a single
+        // hunk; block-level apply is what lets the user stage one of them without the other).
+        // The sibling blocks' +/- lines CANNOT simply be dropped: the pre/post image around the
+        // dropped region must still match the apply target. For a forward apply the sibling's
+        // '-' lines exist in the target, so they become context (' ') lines and the '+' lines
+        // are dropped; for a reverse apply it is mirrored ('+' → context, '-' → dropped).
+        var narrowed = blockOrdinal is { } ordinal
+            ? SelectBlockNarrowing(raw, lineStarts, hunkStart + 1, end, ordinal,
+                reverse: operation is GitHunkOperation.Unstage or GitHunkOperation.Restore)
+            : null;
+        if (narrowed is null && blockOrdinal is not null)
+        {
+            // 块序号超出当前 diff 的变更块数:hunk 内容与悬停快照已不一致,按不可定位处理。
+            return null;
+        }
+
         // The index line contains blob ids for the complete file. It is not valid metadata for
         // a patch that intentionally contains only one hunk: when another hunk is left unstaged,
         // Git can reject the otherwise matching partial patch at its target line. Keep the full
@@ -484,12 +494,27 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
         for (var index = patchStart; index < end; index++)
         {
             var line = Line(raw, lineStarts, index);
+            if (index > patchStart && narrowed?.Dropped.Contains(index) == true)
+            {
+                continue;
+            }
+
             if (index > patchStart && line.StartsWith(IndexPrefix))
             {
                 continue;
             }
 
-            patch.Write(line);
+            if (narrowed?.Converted.Contains(index) == true)
+            {
+                // 兄弟块行转上下文:保留原内容字节,标记改为 ' '。
+                patch.WriteByte((byte)' ');
+                patch.Write(line[1..]);
+            }
+            else
+            {
+                patch.Write(line);
+            }
+
             if (index + 1 < lineStarts.Count)
             {
                 patch.WriteByte((byte)'\n'); // the original separator
@@ -502,6 +527,81 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
         }
 
         return patch.ToArray();
+    }
+
+    /// <summary>The raw byte span of diff line <paramref name="index"/> without its trailing
+    /// '\n' (the separator itself is never part of the span). Shared by hunk selection and
+    /// block filtering so both walk the diff with identical line semantics.</summary>
+    private static ReadOnlySpan<byte> Line(byte[] data, List<int> starts, int index)
+    {
+        var start = starts[index];
+        var end = index + 1 < starts.Count ? starts[index + 1] - 1 : data.Length;
+        return data[start..end];
+    }
+
+    /// <summary>Computes the hunk-body line edits that narrow a patch to one contiguous changed
+    /// block: the <paramref name="blockOrdinal"/>-th maximal +/- run stays as-is, and sibling
+    /// runs are neutralized so the patch's pre/post image still matches the apply target. For a
+    /// forward apply the sibling's '-' lines exist in the target (the index), so they become
+    /// context lines while the '+' lines are dropped; for a reverse apply it is mirrored.
+    /// A '\' notice is dropped exactly when the +/- line it annotates was dropped. Returns null
+    /// when the ordinal exceeds the hunk's block count (the review snapshot no longer matches
+    /// the fresh diff).</summary>
+    private static (HashSet<int> Dropped, HashSet<int> Converted)? SelectBlockNarrowing(
+        byte[] data, List<int> starts, int bodyStart, int bodyEnd, int blockOrdinal, bool reverse)
+    {
+        var runOfLine = new int[bodyEnd - bodyStart];
+        var runCount = -1;
+        var previousWasChange = false;
+        for (var index = bodyStart; index < bodyEnd; index++)
+        {
+            var line = Line(data, starts, index);
+            var isChange = line.Length > 0 && (line[0] == (byte)'+' || line[0] == (byte)'-');
+            if (isChange && !previousWasChange)
+            {
+                runCount++;
+            }
+
+            runOfLine[index - bodyStart] = isChange ? runCount : -1;
+            previousWasChange = isChange;
+        }
+
+        if (blockOrdinal < 0 || blockOrdinal > runCount)
+        {
+            return null;
+        }
+
+        var dropped = new HashSet<int>();
+        var converted = new HashSet<int>();
+        for (var index = bodyStart; index < bodyEnd; index++)
+        {
+            var line = Line(data, starts, index);
+            var run = runOfLine[index - bodyStart];
+            if (run >= 0)
+            {
+                if (run == blockOrdinal)
+                {
+                    continue;
+                }
+
+                var isMinus = line[0] == (byte)'-';
+                // 正向:目标内容是 pre-image('-' 行存在)→ '-' 转上下文;反向镜像。
+                if (reverse ? !isMinus : isMinus)
+                {
+                    converted.Add(index);
+                }
+                else
+                {
+                    dropped.Add(index);
+                }
+            }
+            else if (line.Length > 0 && line[0] == (byte)'\\' && dropped.Contains(index - 1))
+            {
+                dropped.Add(index);
+            }
+        }
+
+        return (dropped, converted);
     }
 
     /// <summary>Decodes one diff line for text comparison, stripping a trailing CR. Uses the same

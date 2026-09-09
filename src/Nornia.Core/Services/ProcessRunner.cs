@@ -528,28 +528,91 @@ public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
             return truncated;
         }
 
-        // With a progress sink we keep streaming line by line so callers observe output in real time.
-        while (await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
+        // A package manager may redraw a progress bar with `\r`, or write the percentage without
+        // any line terminator until the download is over. ReadLineAsync would therefore hold the
+        // only useful progress frame in its buffer until process exit. Read chunks instead and
+        // report at control-character boundaries and as soon as a percentage marker arrives.
+        void AppendCaptured(ReadOnlySpan<char> chars)
         {
-            if (buffer.Length < limit)
+            if (chars.Length == 0)
             {
-                var room = (int)Math.Min(limit - buffer.Length, int.MaxValue);
-                if (line.Length + 1 <= room)
-                {
-                    buffer.AppendLine(line);
-                }
-                else
-                {
-                    buffer.Append(line.AsSpan(0, Math.Max(0, room - 1)));
-                    truncated = true;
-                }
+                return;
             }
-            else
+
+            if (buffer.Length >= limit)
+            {
+                truncated = true;
+                return;
+            }
+
+            var room = Math.Min(limit - buffer.Length, int.MaxValue);
+            var take = (int)Math.Min(chars.Length, room);
+            buffer.Append(chars[..take]);
+            if (take < chars.Length)
             {
                 truncated = true;
             }
+        }
 
-            progress.Report(new ProcessOutput(line, isError));
+        var progressBlock = new char[4096];
+        var pending = new StringBuilder();
+        var previousWasCarriageReturn = false;
+        while (true)
+        {
+            var read = await reader.ReadAsync(progressBlock.AsMemory(), cancellationToken).ConfigureAwait(false);
+            if (read == 0)
+            {
+                break;
+            }
+
+            AppendCaptured(progressBlock.AsSpan(0, read));
+            for (var index = 0; index < read; index++)
+            {
+                var character = progressBlock[index];
+                if (character is '\r' or '\n')
+                {
+                    // CRLF is one logical frame. The preceding CR already flushed it.
+                    if (character == '\n' && previousWasCarriageReturn)
+                    {
+                        previousWasCarriageReturn = false;
+                        continue;
+                    }
+
+                    progress.Report(new ProcessOutput(pending.ToString(), isError));
+                    pending.Clear();
+                    previousWasCarriageReturn = character == '\r';
+                    continue;
+                }
+
+                pending.Append(character);
+                previousWasCarriageReturn = false;
+
+                // Winget emits its download progress as an OSC 9;4 virtual-terminal sequence.
+                // Such a frame is terminated by BEL (or by ST: ESC followed by `\\`), not by a
+                // newline. Flush it immediately so the UI does not wait for winget to exit.
+                var isVirtualTerminalTerminator = character == '\a'
+                    || (character == '\\'
+                        && pending.Length >= 2
+                        && pending[pending.Length - 2] == '\x1b');
+                if (isVirtualTerminalTerminator)
+                {
+                    progress.Report(new ProcessOutput(pending.ToString(), isError));
+                    pending.Clear();
+                    continue;
+                }
+
+                // `%` and its full-width form are the stable part of the output contract. This
+                // makes a frame visible even when the producer keeps the cursor on one line.
+                if (character is '%' or '％')
+                {
+                    progress.Report(new ProcessOutput(pending.ToString(), isError));
+                }
+            }
+        }
+
+        if (pending.Length > 0)
+        {
+            progress.Report(new ProcessOutput(pending.ToString(), isError));
         }
         return truncated;
     }

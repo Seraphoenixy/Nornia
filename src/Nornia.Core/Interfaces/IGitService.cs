@@ -134,13 +134,18 @@ public interface IGitService
         CancellationToken cancellationToken = default);
 
     /// <summary>Applies exactly one currently visible hunk. The implementation must re-read and
-    /// validate the raw patch before applying it so a stale Diff tab cannot mutate another hunk.</summary>
+    /// validate the raw patch before applying it so a stale Diff tab cannot mutate another hunk.
+    /// <paramref name="blockOrdinal"/> narrows the operation to one contiguous changed block
+    /// (a maximal run of +/- lines) inside that hunk — git merges nearby edits into a single
+    /// hunk, and block-level apply is what lets the user stage one of them without the other
+    /// (0-based, <c>null</c> = the whole hunk).</summary>
     Task ApplyHunkAsync(
         string repositoryPath,
         string path,
         bool staged,
         GitDiffHunk hunk,
         GitHunkOperation operation,
+        int? blockOrdinal = null,
         CancellationToken cancellationToken = default);
 
     /// <summary>Stages the given paths (relative to the repository root); an empty collection stages

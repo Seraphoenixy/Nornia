@@ -100,9 +100,19 @@ public partial class DiffDocumentView : UserControl
     private bool _positionedFirstChange;
     private readonly List<int> _diffFindMatches = [];
     private DiffFindRenderer? _diffFindRenderer;
-    private int _hoverHunkIndex = -1;
+    private DiffHunkBlock? _hoverBlock;
     private TextView? _hoverTextView;
     private DiffScrollState? _pendingScrollRestore;
+
+    /// <summary>One contiguous changed block (连续 +/- 行) inside a hunk. git 把间距不超过
+    /// 2×上下文行的多处修改合并成一个 hunk——工具条按块锚定、按块应用,用户才能只暂存其中
+    /// 一处。Anchor 行号取块首行非空的一侧,由 <see cref="DiffTab"/> 解析成块序号。</summary>
+    private readonly record struct DiffHunkBlock(
+        int HunkIndex,
+        int? AnchorOldLine,
+        int? AnchorNewLine,
+        int BlockStart,
+        int BlockEnd);
 
     public DiffDocumentView()
     {
@@ -329,7 +339,7 @@ public partial class DiffDocumentView : UserControl
 
     private void UpdateHunkActionBar(TextView textView)
     {
-        if (!TryGetHunkAtPointer(textView, out var hunkIndex, out var y))
+        if (!TryGetHunkBlockAtPointer(textView, out var block, out var y))
         {
             // Keep the current bar alive while moving through its hit area. The pane-level
             // handler receives these moves, but the button itself is not a document line.
@@ -346,28 +356,29 @@ public partial class DiffDocumentView : UserControl
             || ReferenceEquals(textView, NewEditor.TextArea.TextView);
         var bar = sideBySide ? SideHunkActionBar : InlineHunkActionBar;
         var canvas = sideBySide ? SideHunkActionCanvas : InlineHunkActionCanvas;
-        ConfigureHunkActionBar(bar, hunkIndex);
+        ConfigureHunkActionBar(bar, block.HunkIndex);
         bar.Visibility = Visibility.Visible;
         canvas.UpdateLayout();
         bar.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
-        // VS Code renders hunk review actions in a dedicated gutter: compact icons beside the
-        // change block, outside the code and overview-ruler hit areas. The toolbar does not
-        // take a document row or change the editor's text layout.
-        // VS Code renders the hunk toolbar in a dedicated gutter. Inline uses the left gutter;
-        // side-by-side uses the modified (new) editor's gutter and keeps one shared toolbar.
+        // VS Code 渲染 hunk 工具条在专用 gutter:紧凑图标紧邻变更块,不占文档行、不改行高。
+        // 内联用左侧 gutter;并排用修改侧(new)编辑器的 gutter 且全程共享同一条工具条。
+        // 并排起点必须取编辑器实时 transform:sash 是 GridSplitter,new 编辑器不一定从面板
+        // 中点开始——此前硬编码 "(canvas.Width + 5) / 2" 会让拖动分隔条后工具条漂到代码文本上。
         var gutterLeft = sideBySide
-            ? Math.Max(0, (canvas.ActualWidth + 5) / 2 + 2.5)
+            ? Math.Max(0, NewEditor.TransformToAncestor(SideBySidePane).Transform(new Point(0, 0)).X + 2.5)
             : 2;
         Canvas.SetLeft(bar, gutterLeft);
         var boundsLines = ReferenceEquals(textView, OldEditor.TextArea.TextView)
             ? _oldLines
             : ReferenceEquals(textView, NewEditor.TextArea.TextView) ? _newLines : _inlineLines;
-        var hunkBounds = FindVisibleHunkBounds(textView, boundsLines, hunkIndex);
+        // 工具条纵向锚定悬停的变更块(而非整个 hunk):一个 hunk 内有多个相近块时,
+        // 按块定位才能让用户看清当前操作作用于哪一处修改。
+        var hunkBounds = FindVisibleDisplayBounds(textView, boundsLines, block.BlockStart, block.BlockEnd);
         var actionTop = hunkBounds is { } bounds
             ? (bounds.Top + bounds.Bottom - bar.DesiredSize.Height) / 2
             : y + 1;
         Canvas.SetTop(bar, Math.Max(2, actionTop));
-        _hoverHunkIndex = hunkIndex;
+        _hoverBlock = block;
         _hoverTextView = textView;
     }
 
@@ -400,9 +411,9 @@ public partial class DiffDocumentView : UserControl
         }
     }
 
-    private bool TryGetHunkAtPointer(TextView textView, out int hunkIndex, out double y)
+    private bool TryGetHunkBlockAtPointer(TextView textView, out DiffHunkBlock block, out double y)
     {
-        hunkIndex = -1;
+        block = default;
         y = 0;
 
         var lines = ReferenceEquals(textView, InlineEditor.TextArea.TextView)
@@ -414,11 +425,11 @@ public partial class DiffDocumentView : UserControl
             return false;
         }
 
-        hunkIndex = lines[displayIndex].HunkIndex;
-        // Anchor the toolbar to the first changed line of the hunk (rather than the line under
-        // the pointer), matching VS Code's diff review widget. For a pure insertion/deletion the
-        // corresponding side can be an empty row, so fall back to the first row carrying the hunk.
-        var anchorIndex = FindHunkAnchorLine(lines, hunkIndex, displayIndex);
+        if (!TryResolveHunkBlock(textView, lines[displayIndex].HunkIndex, displayIndex, out block, out var blockStart))
+        {
+            return false;
+        }
+
         var visualLines = GetValidVisualLines(textView);
         if (visualLines is null)
         {
@@ -426,14 +437,63 @@ public partial class DiffDocumentView : UserControl
         }
 
         var visualLine = visualLines.FirstOrDefault(line =>
-            line.FirstDocumentLine.LineNumber <= anchorIndex + 1 && line.LastDocumentLine.LineNumber >= anchorIndex + 1);
+            line.FirstDocumentLine.LineNumber <= blockStart + 1 && line.LastDocumentLine.LineNumber >= blockStart + 1);
         y = visualLine is null ? 0 : visualLine.VisualTop - textView.ScrollOffset.Y;
-        return _tab?.CanApplyHunk(hunkIndex, GitHunkOperation.Stage) == true
-            || _tab?.CanApplyHunk(hunkIndex, GitHunkOperation.Unstage) == true
-            || _tab?.CanApplyHunk(hunkIndex, GitHunkOperation.Restore) == true;
+        return _tab?.CanApplyHunk(block.HunkIndex, GitHunkOperation.Stage) == true
+            || _tab?.CanApplyHunk(block.HunkIndex, GitHunkOperation.Unstage) == true
+            || _tab?.CanApplyHunk(block.HunkIndex, GitHunkOperation.Restore) == true;
     }
 
-    private static int GetDisplayLineAtPointer(TextView textView)
+    /// <summary>解析指针所在行(或并排对侧行)所属的连续变更块:块的范围与锚点行号都在
+    /// 悬停侧(或对侧)的显示行里解析,块首行的旧/新行号交给 DiffTab 解析块序号。</summary>
+    private bool TryResolveHunkBlock(TextView textView, int hunkIndex, int displayIndex, out DiffHunkBlock block, out int blockStart)
+    {
+        block = default;
+        blockStart = -1;
+
+        var inline = ReferenceEquals(textView, InlineEditor.TextArea.TextView);
+        var lines = inline
+            ? _inlineLines
+            : ReferenceEquals(textView, OldEditor.TextArea.TextView) ? _oldLines : _newLines;
+        if (displayIndex < 0 || displayIndex >= lines.Count || lines[displayIndex].HunkIndex < 0)
+        {
+            return false;
+        }
+
+        // 并排布局下悬停到占位行(另一侧是插入行)时,按同一下标取对侧行——该行带真实的
+        // 变更内容与行号。内联布局没有占位行,悬停上下文行时回退到最近的变更行。
+        var blockLines = lines;
+        if (!inline && !lines[displayIndex].IsChange)
+        {
+            var otherLines = ReferenceEquals(textView, OldEditor.TextArea.TextView) ? _newLines : _oldLines;
+            if (otherLines.Count > displayIndex && otherLines[displayIndex].IsChange)
+            {
+                // 占位行本身没有行号,块的锚点行号取自对侧(与悬停行同一下标的真实变更行)。
+                blockLines = otherLines;
+            }
+        }
+
+        // Anchor the toolbar to the hovered contiguous changed block (rather than the whole
+        // hunk), matching VS Code's per-block review widget.
+        var anchorIndex = FindHunkAnchorLine(blockLines, hunkIndex, displayIndex);
+        if (anchorIndex < 0 || blockLines[anchorIndex].HunkIndex != hunkIndex)
+        {
+            return false;
+        }
+
+        var (start, end) = ExpandChangeBlock(blockLines, anchorIndex);
+        var anchorLine = blockLines[start];
+        block = new DiffHunkBlock(hunkIndex, anchorLine.OldLineNumber, anchorLine.NewLineNumber, start, end);
+        // 并排两侧的行是 1:1 对齐的:块在对侧解析时,行带下标不变,视口几何仍取悬停侧。
+        blockStart = start;
+        return true;
+    }
+
+    /// <summary>测试接缝:非空时以注入的指针位置(TextView 视口坐标)替代真实鼠标设备读取,
+    /// 让 STA 几何回归测试摆脱物理光标与 OS 消息投递的不确定性;生产路径恒为 null。</summary>
+    internal Func<TextView, Point>? PointerPositionOverride;
+
+    private int GetDisplayLineAtPointer(TextView textView)
     {
         var visualLines = GetValidVisualLines(textView);
         if (visualLines is null || visualLines.Count == 0)
@@ -441,7 +501,9 @@ public partial class DiffDocumentView : UserControl
             return -1;
         }
 
-        var point = Mouse.GetPosition(textView);
+        var point = PointerPositionOverride is { } probe
+            ? probe(textView)
+            : Mouse.GetPosition(textView);
         if (point.Y < 0 || point.Y > textView.ActualHeight)
         {
             return -1;
@@ -453,16 +515,37 @@ public partial class DiffDocumentView : UserControl
         return visualLine is null ? -1 : visualLine.FirstDocumentLine.LineNumber - 1;
     }
 
+    /// <summary>最近变更行:先向上、再向下在同一个 hunk 内找 IsChange 行,距离相同取较早
+    /// 的一侧(悬停 hunk 上下文行时,工具条落到距指针最近的变更块)。</summary>
     private static int FindHunkAnchorLine(IReadOnlyList<DiffRenderLine> lines, int hunkIndex, int fallback)
     {
-        for (var index = 0; index < lines.Count; index++)
+        for (var up = fallback; up >= 0; up--)
         {
-            if (lines[index].HunkIndex == hunkIndex && lines[index].IsChange)
+            if (lines[up].HunkIndex != hunkIndex)
             {
-                return index;
+                break;
+            }
+
+            if (lines[up].IsChange)
+            {
+                return up;
             }
         }
 
+        for (var down = fallback + 1; down < lines.Count; down++)
+        {
+            if (lines[down].HunkIndex != hunkIndex)
+            {
+                break;
+            }
+
+            if (lines[down].IsChange)
+            {
+                return down;
+            }
+        }
+
+        // hunk 没有任何变更行(理论不出现):维持旧行为,锚定到 hunk 首行。
         for (var index = 0; index < lines.Count; index++)
         {
             if (lines[index].HunkIndex == hunkIndex)
@@ -474,38 +557,29 @@ public partial class DiffDocumentView : UserControl
         return fallback;
     }
 
-    private static (double Top, double Bottom)? FindVisibleHunkBounds(
-        TextView textView, IReadOnlyList<DiffRenderLine> lines, int hunkIndex)
+    /// <summary>把变更行扩展成它所在的连续变更块(块内所有行同属一个 hunk)。</summary>
+    private static (int Start, int End) ExpandChangeBlock(IReadOnlyList<DiffRenderLine> lines, int anchorIndex)
     {
-        var start = -1;
-        var end = -1;
-        for (var index = 0; index < lines.Count; index++)
+        var hunkIndex = lines[anchorIndex].HunkIndex;
+        var start = anchorIndex;
+        while (start > 0 && lines[start - 1].IsChange && lines[start - 1].HunkIndex == hunkIndex)
         {
-            if (lines[index].HunkIndex != hunkIndex)
-            {
-                continue;
-            }
-
-            if (lines[index].IsChange)
-            {
-                start = start < 0 ? index : Math.Min(start, index);
-                end = index;
-            }
+            start--;
         }
 
-        if (start < 0)
+        var end = anchorIndex;
+        while (end + 1 < lines.Count && lines[end + 1].IsChange && lines[end + 1].HunkIndex == hunkIndex)
         {
-            for (var index = 0; index < lines.Count; index++)
-            {
-                if (lines[index].HunkIndex == hunkIndex)
-                {
-                    start = start < 0 ? index : start;
-                    end = index;
-                }
-            }
+            end++;
         }
 
-        if (start < 0 || end < 0)
+        return (start, end);
+    }
+
+    private static (double Top, double Bottom)? FindVisibleDisplayBounds(
+        TextView textView, IReadOnlyList<DiffRenderLine> lines, int blockStart, int blockEnd)
+    {
+        if (blockStart < 0 || blockEnd < 0)
         {
             return null;
         }
@@ -517,8 +591,8 @@ public partial class DiffDocumentView : UserControl
         }
 
         var visible = visualLines.Where(line =>
-            line.LastDocumentLine.LineNumber >= start + 1
-            && line.FirstDocumentLine.LineNumber <= end + 1).ToArray();
+            line.LastDocumentLine.LineNumber >= blockStart + 1
+            && line.FirstDocumentLine.LineNumber <= blockEnd + 1).ToArray();
         return visible.Length == 0
             ? null
             : (visible.Min(line => line.VisualTop - textView.ScrollOffset.Y),
@@ -528,7 +602,7 @@ public partial class DiffDocumentView : UserControl
     {
         InlineHunkActionBar.Visibility = Visibility.Collapsed;
         SideHunkActionBar.Visibility = Visibility.Collapsed;
-        _hoverHunkIndex = -1;
+        _hoverBlock = null;
         _hoverTextView = null;
     }
 
@@ -547,8 +621,10 @@ public partial class DiffDocumentView : UserControl
         }
 
         var position = textView.GetPositionFloor(Mouse.GetPosition(textView));
-        var hunkIndex = position is { Line: >= 1 } hit ? HunkIndexAtDisplayLine(textView, hit.Line - 1) : -1;
-        if (_tab is null || hunkIndex < 0)
+        var displayIndex = position is { Line: >= 1 } hit ? hit.Line - 1 : -1;
+        var hunkIndex = HunkIndexAtDisplayLine(textView, displayIndex);
+        if (_tab is null || hunkIndex < 0
+            || !TryResolveHunkBlock(textView, hunkIndex, displayIndex, out var block, out _))
         {
             return;
         }
@@ -568,8 +644,8 @@ public partial class DiffDocumentView : UserControl
                 continue;
             }
 
-            var item = new MenuItem { Header = header, Tag = "diff-hunk-action", ToolTip = $"对第 {hunkIndex + 1} 个 Diff 块执行“{header}”" };
-            item.Click += (_, _) => _ = ExecuteHunkOperationSafelyAsync(hunkIndex, operation);
+            var item = new MenuItem { Header = header, Tag = "diff-hunk-action", ToolTip = $"对第 {hunkIndex + 1} 个 Diff 块中悬停的变更块执行“{header}”" };
+            item.Click += (_, _) => _ = ExecuteHunkOperationSafelyAsync(block, operation);
             menu.Items.Insert(insertAt++, item);
         }
 
@@ -587,22 +663,22 @@ public partial class DiffDocumentView : UserControl
         return displayIndex >= 0 && displayIndex < lines.Count ? lines[displayIndex].HunkIndex : -1;
     }
 
-    private void InlineStageHunk_Click(object sender, RoutedEventArgs e) => _ = ExecuteHunkOperationSafelyAsync(GetActionHunkIndex(sender), GitHunkOperation.Stage);
-    private void InlineRestoreHunk_Click(object sender, RoutedEventArgs e) => _ = ExecuteHunkOperationSafelyAsync(GetActionHunkIndex(sender), GitHunkOperation.Restore);
-    private void InlineUnstageHunk_Click(object sender, RoutedEventArgs e) => _ = ExecuteHunkOperationSafelyAsync(GetActionHunkIndex(sender), GitHunkOperation.Unstage);
-    private void SideStageHunk_Click(object sender, RoutedEventArgs e) => _ = ExecuteHunkOperationSafelyAsync(GetActionHunkIndex(sender), GitHunkOperation.Stage);
-    private void SideRestoreHunk_Click(object sender, RoutedEventArgs e) => _ = ExecuteHunkOperationSafelyAsync(GetActionHunkIndex(sender), GitHunkOperation.Restore);
-    private void SideUnstageHunk_Click(object sender, RoutedEventArgs e) => _ = ExecuteHunkOperationSafelyAsync(GetActionHunkIndex(sender), GitHunkOperation.Unstage);
+    private void InlineStageHunk_Click(object sender, RoutedEventArgs e) => _ = ExecuteHunkOperationSafelyAsync(GetActionBlock(sender), GitHunkOperation.Stage);
+    private void InlineRestoreHunk_Click(object sender, RoutedEventArgs e) => _ = ExecuteHunkOperationSafelyAsync(GetActionBlock(sender), GitHunkOperation.Restore);
+    private void InlineUnstageHunk_Click(object sender, RoutedEventArgs e) => _ = ExecuteHunkOperationSafelyAsync(GetActionBlock(sender), GitHunkOperation.Unstage);
+    private void SideStageHunk_Click(object sender, RoutedEventArgs e) => _ = ExecuteHunkOperationSafelyAsync(GetActionBlock(sender), GitHunkOperation.Stage);
+    private void SideRestoreHunk_Click(object sender, RoutedEventArgs e) => _ = ExecuteHunkOperationSafelyAsync(GetActionBlock(sender), GitHunkOperation.Restore);
+    private void SideUnstageHunk_Click(object sender, RoutedEventArgs e) => _ = ExecuteHunkOperationSafelyAsync(GetActionBlock(sender), GitHunkOperation.Unstage);
 
-    private int GetActionHunkIndex(object sender)
+    private DiffHunkBlock? GetActionBlock(object sender)
     {
         if (sender is DependencyObject current)
         {
             while (current is not null)
             {
-                if (current is FrameworkElement { Tag: int hunkIndex })
+                if (current is FrameworkElement { Tag: DiffHunkBlock block })
                 {
-                    return hunkIndex;
+                    return block;
                 }
 
                 current = current switch
@@ -616,13 +692,16 @@ public partial class DiffDocumentView : UserControl
             }
         }
 
-        return _hoverHunkIndex;
+        return _hoverBlock;
     }
-    private async Task ExecuteHunkOperationSafelyAsync(int hunkIndex, GitHunkOperation operation)
+    private async Task ExecuteHunkOperationSafelyAsync(DiffHunkBlock? block, GitHunkOperation operation)
     {
         try
         {
-            await ExecuteHunkOperationAsync(hunkIndex, operation);
+            if (block is { } resolved)
+            {
+                await ExecuteHunkOperationAsync(resolved, operation);
+            }
         }
         catch (OperationCanceledException)
         {
@@ -635,16 +714,16 @@ public partial class DiffDocumentView : UserControl
         }
     }
 
-    private async Task ExecuteHunkOperationAsync(int hunkIndex, GitHunkOperation operation)
+    private async Task ExecuteHunkOperationAsync(DiffHunkBlock block, GitHunkOperation operation)
     {
-        if (_tab is null || ! _tab.CanApplyHunk(hunkIndex, operation))
+        if (_tab is null || ! _tab.CanApplyHunk(block.HunkIndex, operation))
         {
             return;
         }
 
-        var state = CaptureDiffScrollState(hunkIndex);
+        var state = CaptureDiffScrollState(block.HunkIndex);
         HideHunkActionBars();
-        await _tab.ApplyHunkAsync(hunkIndex, operation);
+        await _tab.ApplyHunkBlockAsync(block.HunkIndex, block.AnchorOldLine, block.AnchorNewLine, operation);
         _pendingScrollRestore = state;
         await Dispatcher.InvokeAsync(RestorePendingScrollState, System.Windows.Threading.DispatcherPriority.ApplicationIdle);
     }

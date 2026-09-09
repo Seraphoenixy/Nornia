@@ -45,6 +45,7 @@ public sealed class TerminalSurfaceControl : FrameworkElement
     private int _pendingColumns;
     private int _pendingRows;
     private bool _hasFocus;
+    private volatile bool _followCursor;
     private (int Row, int Column)? _selectionAnchor;
     private (int Row, int Column)? _selectionEnd;
 
@@ -150,6 +151,7 @@ public sealed class TerminalSurfaceControl : FrameworkElement
     {
         var control = (TerminalSurfaceControl)source;
         control._scrollOffset = 0;
+        control._followCursor = false;
         control._selectionAnchor = null;
         control._selectionEnd = null;
         control._lastColumns = -1;
@@ -161,15 +163,19 @@ public sealed class TerminalSurfaceControl : FrameworkElement
         // Screen — guard both sides to avoid subscribing/unsubscribing on null.
         if (args.OldValue is TerminalSession oldSession && oldSession.Screen is { } oldScreen)
         {
-            oldScreen.Changed -= control.RequestRender;
+            oldScreen.Changed -= control.OnScreenChanged;
         }
 
         if (args.NewValue is TerminalSession newSession && newSession.Screen is { } screen)
         {
-            screen.Changed += control.RequestRender;
+            screen.Changed += control.OnScreenChanged;
             control.QueueResize();
-            control.RequestRender();
         }
+
+        // A null/failed session still needs to invalidate the retained DrawingVisual. Without this
+        // repaint, closing the last terminal leaves the previous session's pixels visible beneath
+        // the empty-state layer even though the binding has already changed to null.
+        control.RequestRender();
     }
 
     private void OnThemeChanged(object? sender, AppTheme theme)
@@ -209,8 +215,20 @@ public sealed class TerminalSurfaceControl : FrameworkElement
         Dispatcher.BeginInvoke(DispatcherPriority.Render, new Action(() =>
         {
             _renderPending = false;
+            if (_followCursor)
+            {
+                ScrollToCursor(Session?.Screen, requestRender: false);
+            }
+
             InvalidateVisual();
         }));
+    }
+
+    private void OnScreenChanged()
+    {
+        // Screen changes arrive from the ConPTY pump thread. RequestRender marshals the follow-up
+        // cursor calculation back to the WPF dispatcher, where the control's scroll state belongs.
+        RequestRender();
     }
 
     // ===== metrics + resize propagation =====
@@ -237,7 +255,7 @@ public sealed class TerminalSurfaceControl : FrameworkElement
         }
 
         var columns = Math.Clamp((int)(ActualWidth / _cellWidth), 20, 500);
-        var rows = Math.Clamp((int)(ActualHeight / _cellHeight), 5, 200);
+        var rows = Math.Clamp((int)(ActualHeight / _cellHeight), TerminalScreen.MinimumRows, TerminalScreen.MaximumRows);
         if (columns != _lastColumns || rows != _lastRows)
         {
             _lastColumns = columns;
@@ -276,6 +294,7 @@ public sealed class TerminalSurfaceControl : FrameworkElement
         drawingContext.DrawRectangle(EnsureBackground(), null, new Rect(0, 0, ActualWidth, ActualHeight));
 
         var visibleRows = Math.Max(0, (int)(ActualHeight / _cellHeight));
+        _scrollOffset = ClampScrollOffset(_scrollOffset, screen, visibleRows);
         var topIndex = _scrollOffset + visibleRows - 1;
 
         for (var visualRow = 0; visualRow < visibleRows; visualRow++)
@@ -341,15 +360,16 @@ public sealed class TerminalSurfaceControl : FrameworkElement
             }
         }
 
-        // Cursor block when focused + visible.
-        if (_hasFocus && screen.CursorVisible && _scrollOffset == 0)
+        // Cursor block when focused + visible. The cursor can be above the bottom screen row
+        // (for example in an alternate-buffer application), so calculate its position from the
+        // same newest-first line mapping used by the renderer instead of only drawing at offset 0.
+        if (_hasFocus && screen.CursorVisible && visibleRows > 0)
         {
             var (cursorRow, cursorColumn) = screen.Cursor;
-            // The screen can have more rows than the viewport while layout is settling.  Render
-            // the cursor in the same bottom-aligned coordinate system as the text rows.
-            var visualCursorRow = cursorRow - Math.Max(0, screen.Rows - visibleRows);
+            var cursorLineFromBottom = screen.Rows - 1 - cursorRow;
+            var visualCursorRow = topIndex - cursorLineFromBottom;
             var y = visualCursorRow * _cellHeight;
-            if (visualCursorRow >= 0 && y < ActualHeight)
+            if (visualCursorRow >= 0 && visualCursorRow < visibleRows && y < ActualHeight)
             {
                 drawingContext.DrawRectangle(EnsureCursor(), null, new Rect(cursorColumn * _cellWidth, y, _cellWidth, _cellHeight));
             }
@@ -621,7 +641,7 @@ public sealed class TerminalSurfaceControl : FrameworkElement
                     }
                     else
                     {
-                        session.WriteTextAsync("\x03");
+                        WriteInput(session, "\x03");
                     }
 
                     e.Handled = true;
@@ -631,7 +651,7 @@ public sealed class TerminalSurfaceControl : FrameworkElement
                     e.Handled = true;
                     return;
                 case >= Key.A and <= Key.Z:
-                    session.WriteTextAsync(((char)(e.Key - Key.A + 1)).ToString());
+                    WriteInput(session, ((char)(e.Key - Key.A + 1)).ToString());
                     e.Handled = true;
                     return;
             }
@@ -664,7 +684,7 @@ public sealed class TerminalSurfaceControl : FrameworkElement
             return;
         }
 
-        session.WriteTextAsync(sequence);
+        WriteInput(session, sequence);
         e.Handled = true;
     }
 
@@ -676,7 +696,7 @@ public sealed class TerminalSurfaceControl : FrameworkElement
     {
         if (Session is not null && !e.Handled && !string.IsNullOrEmpty(e.Text))
         {
-            Session.WriteTextAsync(e.Text);
+            WriteInput(Session, e.Text);
             e.Handled = true;
             return;
         }
@@ -685,6 +705,60 @@ public sealed class TerminalSurfaceControl : FrameworkElement
     }
 
     // ===== selection =====
+
+    /// <summary>输入发生时回到当前光标所在位置。鼠标滚轮允许用户查看历史,但继续输入
+    /// 必须恢复交互区,否则字符已经写入 shell 而视图仍停在旧的滚动缓冲区。</summary>
+    private void WriteInput(TerminalSession session, string text)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return;
+        }
+
+        _followCursor = true;
+        ScrollToCursor(session.Screen);
+        session.WriteTextAsync(text);
+    }
+
+    private void ScrollToCursor(TerminalScreen? screen, bool requestRender = true)
+    {
+        if (screen is null)
+        {
+            return;
+        }
+
+        var visibleRows = VisibleRowCount();
+        var (cursorRow, _) = screen.Cursor;
+        var offset = ScrollOffsetForCursor(cursorRow, screen.Rows, screen.TotalLines, visibleRows);
+        if (offset == _scrollOffset)
+        {
+            return;
+        }
+
+        _scrollOffset = offset;
+        if (requestRender)
+        {
+            RequestRender();
+        }
+    }
+
+    private int VisibleRowCount() => Math.Max(1, (int)(ActualHeight / _cellHeight));
+
+    private static int ClampScrollOffset(int offset, TerminalScreen screen, int visibleRows) =>
+        Math.Clamp(offset, 0, Math.Max(0, screen.TotalLines - Math.Max(1, visibleRows)));
+
+    /// <summary>返回能让光标落入视口的滚动偏移;偏移 0 表示当前屏幕底部。</summary>
+    internal static int ScrollOffsetForCursor(int cursorRow, int screenRows, int totalLines, int visibleRows)
+    {
+        if (screenRows <= 0 || totalLines <= 0 || visibleRows <= 0)
+        {
+            return 0;
+        }
+
+        var cursorLineFromBottom = Math.Clamp(screenRows - 1 - cursorRow, 0, screenRows - 1);
+        var maximumOffset = Math.Max(0, totalLines - visibleRows);
+        return Math.Clamp(cursorLineFromBottom, 0, maximumOffset);
+    }
 
     private void OnSurfaceMouseDown(object sender, MouseButtonEventArgs e)
     {
@@ -754,6 +828,7 @@ public sealed class TerminalSurfaceControl : FrameworkElement
         if (newOffset != _scrollOffset)
         {
             _scrollOffset = newOffset;
+            _followCursor = false;
             // T2: 行视觉内容与 y 解耦(平移变换定位)后,滚动不再需要让行缓存失效。
         }
 
@@ -883,7 +958,7 @@ public sealed class TerminalSurfaceControl : FrameworkElement
         var text = System.Windows.Clipboard.ContainsText() ? System.Windows.Clipboard.GetText() : string.Empty;
         if (!string.IsNullOrEmpty(text))
         {
-            session.WriteTextAsync(text);
+            WriteInput(session, text);
         }
     }
 

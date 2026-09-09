@@ -1,4 +1,5 @@
 using Nornia.Core.Models;
+using Nornia.Core.Interfaces;
 using Nornia.Package.Providers;
 using Nornia.Tests.Fakes;
 
@@ -87,6 +88,32 @@ public sealed class WingetProviderTests
     }
 
     [Fact]
+    public async Task InstallAsync_ForwardsWingetVirtualTerminalProgressFrame()
+    {
+        const string wingetProgress = "\u001b]9;4;1;42\u0007";
+        var runner = new FakeProcessRunner((_, _) => new ProcessResult(0, wingetProgress, ""));
+        var provider = new WingetProvider(runner);
+        var progress = new CapturingProgress();
+
+        await provider.InstallAsync("Git.Git", progress: progress);
+
+        Assert.Contains(progress.Entries, entry => entry.Text == wingetProgress && !entry.IsError);
+    }
+
+    [Fact]
+    public async Task InstallAsync_UsesInteractiveRunnerWhenDesktopProvidesOne()
+    {
+        var standardRunner = new FakeProcessRunner((_, _) => new ProcessResult(0, "redirected", ""));
+        var interactiveRunner = new CapturingInteractiveProcessRunner();
+        var provider = new WingetProvider(standardRunner, interactiveProcessRunner: interactiveRunner);
+
+        await provider.InstallAsync("Git.Git");
+
+        Assert.True(interactiveRunner.Called);
+        Assert.Empty(standardRunner.Calls);
+    }
+
+    [Fact]
     public async Task ListInstalledAsync_DeduplicatesExactRecordsButKeepsArchitectureVariants()
     {
         const string output = """
@@ -144,6 +171,21 @@ public sealed class WingetProviderTests
     {
         public List<ProcessOutput> Entries { get; } = [];
         public void Report(ProcessOutput value) => Entries.Add(value);
+    }
+
+    private sealed class CapturingInteractiveProcessRunner : IInteractiveProcessRunner
+    {
+        public bool Called { get; private set; }
+
+        public Task<ProcessResult> RunInteractiveAsync(
+            string fileName,
+            IReadOnlyList<string> arguments,
+            IProgress<ProcessOutput>? progress = null,
+            CancellationToken cancellationToken = default)
+        {
+            Called = true;
+            return Task.FromResult(new ProcessResult(0, "installed", ""));
+        }
     }
 
     private static string PadDisplay(string value, int width)

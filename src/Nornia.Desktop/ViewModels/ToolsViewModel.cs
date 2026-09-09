@@ -228,8 +228,62 @@ public partial class ToolsViewModel(
             .Select(tool => new ManagedComponentItem(tool, FindAvailableVersion(tool, packages)))
             .ToArray();
         using var performance = performanceMetrics?.Begin("tools.list.publish", snapshot.Length, "ui-batch");
+        var selectedItems = SelectedTools.ToArray();
+        var selectedItem = SelectedTool;
         Tools.ReplaceRange(snapshot);
+        ReselectPublishedItems(snapshot, selectedItems, selectedItem);
+        FilteredTools.Refresh();
         NotifyCopyCommands();
+    }
+
+    private void ReselectPublishedItems(
+        IReadOnlyList<ManagedComponentItem> snapshot,
+        IReadOnlyList<ManagedComponentItem> selectedItems,
+        ManagedComponentItem? selectedItem)
+    {
+        var selected = selectedItems
+            .Select(item => FindReplacement(snapshot, item))
+            .Where(item => item is not null)
+            .Cast<ManagedComponentItem>()
+            .Distinct()
+            .ToArray();
+        SelectedTools.Clear();
+        foreach (var item in selected)
+        {
+            SelectedTools.Add(item);
+        }
+
+        // Keep the detail form attached to the freshly scanned row when its stable location is
+        // unchanged. If the row disappeared, clear it instead of displaying stale data.
+        SelectedTool = selectedItem is null
+            ? null
+            : FindReplacement(snapshot, selectedItem);
+    }
+
+    private static string GetSelectionKey(ManagedComponentItem item) =>
+        $"{item.Name}\u001F{item.Architecture}\u001F{item.InstallPath}";
+
+    private static ManagedComponentItem? FindReplacement(
+        IReadOnlyList<ManagedComponentItem> snapshot,
+        ManagedComponentItem previous)
+    {
+        var exact = snapshot.FirstOrDefault(item => string.Equals(GetSelectionKey(item), GetSelectionKey(previous), StringComparison.OrdinalIgnoreCase));
+        if (exact is not null) return exact;
+
+        if (!string.IsNullOrWhiteSpace(previous.AvailableVersion))
+        {
+            var target = snapshot.FirstOrDefault(item =>
+                string.Equals(item.Name, previous.Name, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(item.Architecture, previous.Architecture, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(item.Version, previous.AvailableVersion, StringComparison.OrdinalIgnoreCase));
+            if (target is not null) return target;
+        }
+
+        var candidates = snapshot.Where(item =>
+                string.Equals(item.Name, previous.Name, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(item.Architecture, previous.Architecture, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        return candidates.Length == 1 ? candidates[0] : null;
     }
     partial void OnFilterTextChanged(string value) => FilteredTools.Refresh();
     partial void OnSelectedToolChanged(ManagedComponentItem? value)

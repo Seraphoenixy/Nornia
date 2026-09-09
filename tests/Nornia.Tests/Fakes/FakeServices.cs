@@ -405,6 +405,79 @@ internal sealed class FakeSettingsService : ISettingsService
         CancellationToken cancellationToken = default) => _inner.OpenSessionAsync(context, keys, cancellationToken);
 }
 
+/// <summary>模拟瞬时提交失败(磁盘压力/杀软实时扫描下的 FileError、会话基线过期 → Conflict):
+/// 打开的会话前 <see cref="InitialFailures"/> 次提交返回指定状态,之后透传内部真实服务,用于
+/// 验证默认 Shell 持久化的重试路径。拦截在会话层:SettingsSession 绑定创建它的服务实例,
+/// 只包装 ISettingsService 的 CommitAsync 拦不到会话提交。</summary>
+internal sealed class FlakySettingsService : ISettingsService
+{
+    private readonly FakeSettingsService _inner = new();
+    private int _commits;
+
+    public FlakySettingsService(SettingsCommitStatus failureStatus = SettingsCommitStatus.FileError, int initialFailures = 2)
+    {
+        FailureStatus = failureStatus;
+        InitialFailures = initialFailures;
+    }
+
+    public SettingsCommitStatus FailureStatus { get; }
+    public int InitialFailures { get; }
+
+    /// <summary>收到的会话提交总数(含注入的失败),供断言"发生了重试"。</summary>
+    public int CommitCount => _commits;
+
+    public string SettingsPath => _inner.SettingsPath;
+
+    public Task<SettingsSnapshot> GetSnapshotAsync(SettingsContext context, CancellationToken cancellationToken = default) =>
+        _inner.GetSnapshotAsync(context, cancellationToken);
+
+    public Task<SettingsCommitResult> CommitAsync(SettingsTransaction transaction, CancellationToken cancellationToken = default) =>
+        _inner.CommitAsync(transaction, cancellationToken);
+
+    public Task<SettingsCommitResult> ResetAsync(string key, SettingScope scope, SettingsContext context,
+        string? languageId = null, CancellationToken cancellationToken = default) =>
+        _inner.ResetAsync(key, scope, context, languageId, cancellationToken);
+
+    public IAsyncEnumerable<SettingsChangeSet> WatchAsync(SettingsContext context, CancellationToken cancellationToken = default) =>
+        _inner.WatchAsync(context, cancellationToken);
+
+    public async Task<ISettingsSession> OpenSessionAsync(SettingsContext context, IReadOnlyCollection<string>? keys = null,
+        CancellationToken cancellationToken = default)
+    {
+        var inner = await _inner.OpenSessionAsync(context, keys, cancellationToken);
+        return new FlakySession(inner, this);
+    }
+
+    private sealed class FlakySession(ISettingsSession inner, FlakySettingsService owner) : ISettingsSession
+    {
+        public SettingsContext Context => inner.Context;
+        public SettingsSnapshot? Current => inner.Current;
+        public IReadOnlyCollection<string>? SubscribedKeys => inner.SubscribedKeys;
+
+        public event EventHandler<SettingsChangeSet>? Changed
+        {
+            add => inner.Changed += value;
+            remove => inner.Changed -= value;
+        }
+
+        public Task<SettingsSnapshot> RefreshAsync(CancellationToken cancellationToken = default) =>
+            inner.RefreshAsync(cancellationToken);
+
+        public async Task<SettingsCommitResult> CommitAsync(SettingScope scope, IReadOnlyList<SettingOperation> operations,
+            CancellationToken cancellationToken = default)
+        {
+            if (Interlocked.Increment(ref owner._commits) <= owner.InitialFailures)
+            {
+                return new SettingsCommitResult(owner.FailureStatus, ErrorMessage: "simulated transient failure");
+            }
+
+            return await inner.CommitAsync(scope, operations, cancellationToken);
+        }
+
+        public ValueTask DisposeAsync() => inner.DisposeAsync();
+    }
+}
+
 /// <summary>Workspace service fake. By default reports no active workspace; tests can set
 /// <see cref="Current"/> directly when a context is required.</summary>
 internal sealed class FakeProjectWorkspaceService : IProjectWorkspaceService
@@ -503,7 +576,7 @@ internal sealed class FakeGitService : IGitService
     public int StashListCalls { get; private set; }
     public int CommitFileListCalls { get; private set; }
     public List<string> CommitFileListRequests { get; } = [];
-    public List<(string RepositoryPath, string Path, bool Staged, GitDiffHunk Hunk, GitHunkOperation Operation)> HunkOperations { get; } = [];
+    public List<(string RepositoryPath, string Path, bool Staged, GitDiffHunk Hunk, GitHunkOperation Operation, int? BlockOrdinal)> HunkOperations { get; } = [];
 
     public async Task<GitRepositoryStatus> GetStatusAsync(string repositoryPath, CancellationToken cancellationToken = default, bool includeAllUntracked = true)
     {
@@ -547,9 +620,9 @@ internal sealed class FakeGitService : IGitService
     public Task<string> GetRawDiffAsync(string repositoryPath, bool staged, IReadOnlyList<string>? paths = null, CancellationToken cancellationToken = default) =>
         Task.FromResult(RawDiff);
 
-    public Task ApplyHunkAsync(string repositoryPath, string path, bool staged, GitDiffHunk hunk, GitHunkOperation operation, CancellationToken cancellationToken = default)
+    public Task ApplyHunkAsync(string repositoryPath, string path, bool staged, GitDiffHunk hunk, GitHunkOperation operation, int? blockOrdinal = null, CancellationToken cancellationToken = default)
     {
-        HunkOperations.Add((repositoryPath, path, staged, hunk, operation));
+        HunkOperations.Add((repositoryPath, path, staged, hunk, operation, blockOrdinal));
         return Task.CompletedTask;
     }
 

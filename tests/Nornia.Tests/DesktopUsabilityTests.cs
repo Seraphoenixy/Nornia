@@ -1,5 +1,7 @@
 using Nornia.Desktop.ViewModels;
 using Nornia.Desktop.Services;
+using Nornia.Core.Models;
+using Nornia.Tests.Fakes;
 
 namespace Nornia.Tests;
 
@@ -36,8 +38,11 @@ public sealed class DesktopUsabilityTests
 
     [Theory]
     [InlineData("正在下载 42%", 42)]
+    [InlineData("正在下载 42％", 42)]
     [InlineData("Downloading 12.5 %", 12.5)]
     [InlineData("0%\r27%", 27)]
+    [InlineData("\u001b]9;4;1;42\u0007", 42)]
+    [InlineData("\u001b]9;4;4;87\u001b\\", 87)]
     public void OperationProgressParser_ReadsLatestPercentage(string text, double expected)
     {
         Assert.True(OperationProgressParser.TryGetPercentage(text, out var percentage));
@@ -52,6 +57,29 @@ public sealed class DesktopUsabilityTests
     }
 
     [Fact]
+    public async Task PageOperation_PublishesLastProgressBeforeTerminalState()
+    {
+        var page = new ProgressPage(new FakeUiLogService());
+
+        await page.RunWithProgressAsync("Downloading 42%");
+
+        Assert.Equal(OperationPhase.Succeeded, page.CurrentOperation?.Phase);
+        Assert.Equal(42, page.CurrentOperation?.Progress);
+        Assert.Equal("安装软件包完成", page.CurrentOperation?.Detail);
+    }
+
+    [Fact]
+    public async Task PageOperation_PublishesWingetVirtualTerminalProgress()
+    {
+        var page = new ProgressPage(new FakeUiLogService());
+
+        await page.RunWithProgressAsync("\u001b]9;4;1;42\u0007");
+
+        Assert.Equal(OperationPhase.Succeeded, page.CurrentOperation?.Phase);
+        Assert.Equal(42, page.CurrentOperation?.Progress);
+    }
+
+    [Fact]
     public void NavigationService_PreservesDestinationContext()
     {
         var service = new DesktopNavigationService();
@@ -59,6 +87,15 @@ public sealed class DesktopUsabilityTests
         service.NavigationRequested += (_, request) => received = request;
         service.Navigate("Packages", new NavigationContext.Updates());
         Assert.Equal(new NavigationRequest("Packages", new NavigationContext.Updates()), received);
+    }
+
+    private sealed class ProgressPage(IUiLogService logService) : PageViewModel("测试", logService)
+    {
+        public Task RunWithProgressAsync(string output) => RunAsync("安装软件包", _ =>
+        {
+            OperationProgress.Report(new ProcessOutput(output, false));
+            return Task.CompletedTask;
+        });
     }
 
 }

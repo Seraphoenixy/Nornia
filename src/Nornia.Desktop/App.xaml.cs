@@ -86,6 +86,10 @@ public partial class App : Application
         // its WPF-specific services here.
         _services = new ServiceCollection()
             .AddNorniaServices()
+            // WinGet suppresses progress when launched with redirected standard streams. The
+            // desktop registers a ConPTY-backed capability so package mutations emit their
+            // native OSC 9;4 progress frames for the operation banner.
+            .AddSingleton<IInteractiveProcessRunner, WingetInteractiveProcessRunner>()
             .AddSingleton<BuiltInSettingsCatalog>()
             .AddSingleton<ISettingsDocumentStore, SettingsDocumentStore>()
             .AddSingleton<ISettingsResolver, SettingsResolver>()

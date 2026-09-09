@@ -204,14 +204,21 @@ public sealed class WorkbenchMainViewModelTests
         // 环境页标签选中 → 反馈源是其当前小节页(默认概览)。
         Assert.Same(environment.CurrentPage, fixture.Main.OperationPage);
         Assert.IsType<DashboardViewModel>(fixture.Main.OperationPage);
+        Assert.True(fixture.Main.ShowStatusBarProgressPercentage);
 
         // 页内切小节 → 反馈源跟随。
         environment.SelectSection(EnvironmentSection.Runtime);
         Assert.IsType<RuntimeViewModel>(fixture.Main.OperationPage);
+        Assert.True(fixture.Main.ShowStatusBarProgressPercentage);
+
+        environment.SelectSection(EnvironmentSection.Packages);
+        Assert.IsType<PackagesViewModel>(fixture.Main.OperationPage);
+        Assert.False(fixture.Main.ShowStatusBarProgressPercentage);
 
         // 其它内容页标签选中 → 反馈源是该页本身。
         fixture.Main.NavigateByIndexCommand.Execute(2); // 项目管理
         Assert.Same(fixture.Main.NavigationItems[2].Page, fixture.Main.OperationPage);
+        Assert.True(fixture.Main.ShowStatusBarProgressPercentage);
 
         // 视图页 → 反馈源回落到当前活动栏页。
         fixture.Main.NavigateByIndexCommand.Execute(0); // 资源管理器
@@ -478,9 +485,55 @@ public sealed class WorkbenchMainViewModelTests
             var final = await settingsService.GetSnapshotAsync(new SettingsContext());
             persisted = string.Equals("cmd", final.Effective(BuiltInSettingsCatalog.TerminalDefaultProfile), StringComparison.Ordinal);
         }
-        Assert.True(persisted, "Default shell was not persisted within the expected time.");
+        if (!persisted)
+        {
+            // 诊断:失败时dump日志(含持久化失败原因)与落盘文件内容,避免只有超时表象。
+            var file = File.Exists(settingsService.SettingsPath)
+                ? File.ReadAllText(settingsService.SettingsPath)
+                : "<missing>";
+            var logs = string.Join("\n", logService.Entries.Select(entry => $"[{entry.Level}] {entry.Message}"));
+            Assert.Fail($"""
+                Default shell was not persisted within the expected time.
+                Settings file ({settingsService.SettingsPath}): {file}
+                Log entries:
+                {logs}
+                """);
+        }
         Assert.Same(session, Assert.Single(terminal.Sessions));
         Assert.Equal("test-Terminal-A", session.Session.Profile.Id);
+    }
+
+    /// <summary>磁盘压力下(原子替换重试耗尽 → FileError)单次提交失败不应让默认 Shell
+    /// 静默丢失:持久化必须带退避重试直至落盘。回归自 ProfileSwitch 全量并行下的偶发超时。</summary>
+    [Theory]
+    [InlineData(SettingsCommitStatus.FileError)]
+    [InlineData(SettingsCommitStatus.Conflict)]
+    public async Task ProfileSwitch_RetriesTransientPersistFailure(SettingsCommitStatus failureStatus)
+    {
+        var settingsService = new FlakySettingsService(failureStatus, initialFailures: 2);
+        var terminalService = Substitute.For<ITerminalService>();
+        terminalService.DiscoverProfiles().Returns([
+            new ShellProfile("pwsh", "PowerShell 7", "pwsh.exe"),
+            new ShellProfile("cmd", "命令提示符", "cmd.exe")]);
+        var terminal = new TerminalViewModel(terminalService, settingsService, new FakeProjectWorkspaceService(),
+            new FakeUiLogService(), new FakeClipboardService());
+        await terminal.ActivateAsync();
+        await AddSessionToAsync(terminal, terminalService, "Terminal-A");
+
+        var cmdProfile = terminal.Profiles.ToArray().Single(profile => profile.Id == "cmd");
+        terminal.SelectedProfile = cmdProfile;
+
+        // 前两次提交被注入失败,重试路径(Conflict 先刷新会话基线)最终必须落盘。
+        var persisted = false;
+        for (var i = 0; i < 100 && !persisted; i++)
+        {
+            var snapshot = await settingsService.GetSnapshotAsync(new SettingsContext());
+            persisted = string.Equals("cmd", snapshot.Effective(BuiltInSettingsCatalog.TerminalDefaultProfile), StringComparison.Ordinal);
+            if (!persisted) await Task.Delay(50);
+        }
+
+        Assert.True(persisted, $"默认 Shell 未在重试后落盘(failureStatus={failureStatus})");
+        Assert.True(settingsService.CommitCount >= 3, "应观察到重试(至少 3 次提交)");
     }
 
     // ===== Helpers =====

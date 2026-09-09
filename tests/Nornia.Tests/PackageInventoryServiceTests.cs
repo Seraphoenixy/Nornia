@@ -40,6 +40,25 @@ public sealed class PackageInventoryServiceTests
     }
 
     [Fact]
+    public async Task RefreshForcedAsync_DoesNotReuseNonForcedScanInFlight()
+    {
+        var provider = new BlockingPackageProvider();
+        var repository = new FakePackageRepository();
+        var service = new PackageInventoryService(provider, repository);
+
+        var initial = service.RefreshAsync();
+        await provider.Started.Task;
+        var forced = service.RefreshForcedAsync();
+        provider.Release.TrySetResult(true);
+
+        var results = await Task.WhenAll(initial, forced);
+
+        Assert.Equal(2, provider.ListInstalledCalls);
+        Assert.NotSame(results[0], results[1]);
+        Assert.Equal(2, repository.ReplaceSnapshotCalls);
+    }
+
+    [Fact]
     public async Task RefreshAsync_FreshSnapshotWithinTtlServesPersistedDataWithoutRunningProvider()
     {
         var provider = new FakePackageProvider();
@@ -163,6 +182,35 @@ public sealed class PackageInventoryServiceTests
             InstallCalls++;
             return Task.CompletedTask;
         }
+
+        public Task UninstallAsync(string packageId, string? packageName = null, IProgress<ProcessOutput>? progress = null, CancellationToken cancellationToken = default) =>
+            Task.CompletedTask;
+
+        public Task UpgradeAsync(string packageId, IProgress<ProcessOutput>? progress = null, CancellationToken cancellationToken = default) =>
+            Task.CompletedTask;
+    }
+
+    private sealed class BlockingPackageProvider : IPackageProvider
+    {
+        public int ListInstalledCalls { get; private set; }
+        public TaskCompletionSource<bool> Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource<bool> Release { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public string Name => "fake";
+
+        public Task<IReadOnlyList<PackageInfo>> SearchAsync(string query, IProgress<ProcessOutput>? progress = null, CancellationToken cancellationToken = default) =>
+            Task.FromResult<IReadOnlyList<PackageInfo>>([]);
+
+        public async Task<IReadOnlyList<PackageInfo>> ListInstalledAsync(IProgress<ProcessOutput>? progress = null, CancellationToken cancellationToken = default)
+        {
+            ListInstalledCalls++;
+            Started.TrySetResult(true);
+            await Release.Task.WaitAsync(cancellationToken);
+            return [Package("Git.Git")];
+        }
+
+        public Task InstallAsync(string packageId, string? version = null, IProgress<ProcessOutput>? progress = null, CancellationToken cancellationToken = default) =>
+            Task.CompletedTask;
 
         public Task UninstallAsync(string packageId, string? packageName = null, IProgress<ProcessOutput>? progress = null, CancellationToken cancellationToken = default) =>
             Task.CompletedTask;

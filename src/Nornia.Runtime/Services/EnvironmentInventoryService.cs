@@ -20,6 +20,7 @@ public sealed class EnvironmentInventoryService(
     private IReadOnlyList<CoreRuntime>? _lastScan;
     private long _lastScanAt;
     private Task<IReadOnlyList<CoreRuntime>>? _scanInFlight;
+    private bool _scanInFlightIsForced;
 
     /// <summary>Coalesces repeated scans: callers asking for a refresh within the in-memory cooldown
     /// window receive the latest result. Beyond it, a persisted snapshot younger than the configured
@@ -43,36 +44,75 @@ public sealed class EnvironmentInventoryService(
         Task<IReadOnlyList<CoreRuntime>> scanTask;
         lock (_gate)
         {
-            if (!forceRescan && _lastScan is not null && now - _lastScanAt < NorniaSettings.InventoryScanCacheSeconds)
+            if (_scanInFlight is not null)
+            {
+                if (forceRescan && !_scanInFlightIsForced)
+                {
+                    // A post-mutation forced refresh must not reuse a non-forced scan that started
+                    // before the mutation. Chain one fresh discovery pass behind it instead.
+                    scanTask = TrackScan(
+                        ScanForcedAfterAsync(_scanInFlight, cancellationToken),
+                        isForced: true);
+                }
+                else
+                {
+                    scanTask = _scanInFlight;
+                }
+            }
+            else if (!forceRescan && _lastScan is not null && now - _lastScanAt < NorniaSettings.InventoryScanCacheSeconds)
             {
                 return _lastScan;
             }
-
-            // A cache miss is common when the Runtime and Projects pages activate together. Share
-            // the load/scan task so one expiry cannot start several provider scans.
-            if (_scanInFlight is null)
-            {
-                scanTask = _scanInFlight = forceRescan
-                    ? ScanAndPersistAsync(cancellationToken)
-                    : LoadOrScanAsync(cancellationToken);
-                _ = scanTask.ContinueWith(completed =>
-                {
-                    lock (_gate)
-                    {
-                        if (ReferenceEquals(_scanInFlight, completed))
-                        {
-                            _scanInFlight = null;
-                        }
-                    }
-                }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-            }
             else
             {
-                scanTask = _scanInFlight;
+                // A cache miss is common when the Runtime and Projects pages activate together.
+                // Share one load/scan task so one expiry cannot start several provider scans.
+                scanTask = TrackScan(
+                    forceRescan
+                        ? ScanAndPersistAsync(cancellationToken)
+                        : LoadOrScanAsync(cancellationToken),
+                    forceRescan);
             }
         }
 
         return await scanTask.WaitAsync(cancellationToken);
+    }
+
+    private Task<IReadOnlyList<CoreRuntime>> TrackScan(
+        Task<IReadOnlyList<CoreRuntime>> scanTask,
+        bool isForced)
+    {
+        _scanInFlight = scanTask;
+        _scanInFlightIsForced = isForced;
+        _ = scanTask.ContinueWith(completed =>
+        {
+            lock (_gate)
+            {
+                if (ReferenceEquals(_scanInFlight, completed))
+                {
+                    _scanInFlight = null;
+                    _scanInFlightIsForced = false;
+                }
+            }
+        }, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        return scanTask;
+    }
+
+    private async Task<IReadOnlyList<CoreRuntime>> ScanForcedAfterAsync(
+        Task<IReadOnlyList<CoreRuntime>> previousScan,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            await previousScan.ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // The forced scan is the authoritative post-mutation attempt. If the earlier shared
+            // scan failed, let this fresh attempt decide whether the refresh succeeds.
+        }
+
+        return await ScanAndPersistAsync(cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Single-flight body for non-forced refreshes: first try the persisted snapshot gate,

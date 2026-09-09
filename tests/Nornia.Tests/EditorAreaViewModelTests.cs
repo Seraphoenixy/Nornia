@@ -284,6 +284,57 @@ public sealed class EditorAreaViewModelTests : IDisposable
         Assert.All(confirmation.Requests, request => Assert.Contains("无法撤销", request.Message));
     }
 
+    /// <summary>git 会把相近的两处修改合并成一个 hunk——按块操作时,tab 必须用悬停块的锚点
+    /// 行号解析出 hunk 内的连续变更块序号;匹配不到时拒绝应用(绝不能错落到相邻块)。</summary>
+    [Fact]
+    public async Task DiffTab_ApplyHunkBlock_ResolvesOrdinalFromAnchorLine()
+    {
+        var git = new FakeGitService { DiffResult = BuildTwoBlockOneHunkDiff() };
+        var tab = new DiffTab(git, new GitDiffRequest(@"C:\repo", "src/A.cs", false, false),
+            new FakeUiLogService(), new FakeClipboardService());
+        await tab.LoadAsync();
+
+        // 悬停第一块:removed 行旧号 4(added 行新号同页,两种锚点都应命中块 0)。
+        Assert.True(await tab.ApplyHunkBlockAsync(0, 4, null, GitHunkOperation.Stage));
+        Assert.Equal(0, git.HunkOperations[0].BlockOrdinal);
+        Assert.True(await tab.ApplyHunkBlockAsync(0, null, 4, GitHunkOperation.Stage));
+        Assert.Equal(0, git.HunkOperations[1].BlockOrdinal);
+
+        // 悬停第二块:added 行新号 8 → 块序号 1。
+        Assert.True(await tab.ApplyHunkBlockAsync(0, null, 8, GitHunkOperation.Stage));
+        Assert.Equal(1, git.HunkOperations[2].BlockOrdinal);
+
+        // 匹配不到的锚点:拒绝应用,不产生 git 调用。
+        Assert.False(await tab.ApplyHunkBlockAsync(0, 999, null, GitHunkOperation.Stage));
+        Assert.Equal(3, git.HunkOperations.Count);
+
+        // 两个锚点都为空 → 整 hunk 兼容路径(BlockOrdinal 为 null)。
+        Assert.True(await tab.ApplyHunkAsync(0, GitHunkOperation.Stage));
+        Assert.Null(git.HunkOperations[3].BlockOrdinal);
+    }
+
+    private static GitFileDiff BuildTwoBlockOneHunkDiff() => new(
+        "a.cs", null, false, false, false,
+    [
+        new GitDiffHunk(1, 11, 1, 11, "@@ -1,11 +1,11 @@",
+        [
+            new GitDiffLine(GitDiffLineKind.HunkHeader, null, null, "@@ -1,11 +1,11 @@"),
+            new GitDiffLine(GitDiffLineKind.Context, 1, 1, "c1"),
+            new GitDiffLine(GitDiffLineKind.Context, 2, 2, "c2"),
+            new GitDiffLine(GitDiffLineKind.Context, 3, 3, "c3"),
+            new GitDiffLine(GitDiffLineKind.Removed, 4, null, "old1"),
+            new GitDiffLine(GitDiffLineKind.Added, null, 4, "new1"),
+            new GitDiffLine(GitDiffLineKind.Context, 5, 5, "c4"),
+            new GitDiffLine(GitDiffLineKind.Context, 6, 6, "c5"),
+            new GitDiffLine(GitDiffLineKind.Context, 7, 7, "c6"),
+            new GitDiffLine(GitDiffLineKind.Removed, 8, null, "old2"),
+            new GitDiffLine(GitDiffLineKind.Added, null, 8, "new2"),
+            new GitDiffLine(GitDiffLineKind.Context, 9, 9, "c7"),
+            new GitDiffLine(GitDiffLineKind.Context, 10, 10, "c8"),
+            new GitDiffLine(GitDiffLineKind.Context, 11, 11, "c9"),
+        ]),
+    ]);
+
     [Fact]
     public async Task EditorArea_ForwardsSuccessfulDiffHunkMutation()
     {

@@ -80,6 +80,17 @@ public interface IProcessRunner
     }
 }
 
+/// <summary>Runs a process with a real virtual terminal attached. This is required for tools such
+/// as winget that suppress progress output when stdout/stderr are redirected.</summary>
+public interface IInteractiveProcessRunner
+{
+    Task<ProcessResult> RunInteractiveAsync(
+        string fileName,
+        IReadOnlyList<string> arguments,
+        IProgress<ProcessOutput>? progress = null,
+        CancellationToken cancellationToken = default);
+}
+
 /// <summary>Allows a host to stop processes it started during application shutdown.</summary>
 public interface IProcessRunnerShutdown
 {

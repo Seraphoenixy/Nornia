@@ -168,8 +168,10 @@ public partial class PackagesViewModel(
         foreach (var package in selected)
         {
             await packageProvider.UninstallAsync(package.Id, package.Name, OperationProgress, cancellationToken);
+            // Refresh after each completed mutation so a batch operation does not leave the
+            // package grid/form showing the pre-uninstall snapshot until the very end.
+            await LoadInstalledPackagesAsync(cancellationToken);
         }
-        await LoadInstalledPackagesAsync(cancellationToken);
     }, "如卸载失败，请确认软件未在运行并查看 Problems。", canCancel: true);
 
     [RelayCommand(CanExecute = nameof(CanUpgrade))]
@@ -178,8 +180,13 @@ public partial class PackagesViewModel(
         var selected = SelectedPackages.Where(package => package.IsInstalled && !string.IsNullOrWhiteSpace(package.AvailableVersion)).ToArray();
         if (selected.Length == 0 && SelectedPackage is { IsInstalled: true, AvailableVersion: not null } current) selected = [current];
         if (selected.Length == 0) throw new InvalidOperationException("请选择一个或多个存在更新的软件包。");
-        foreach (var package in selected) await packageProvider.UpgradeAsync(package.Id, OperationProgress, cancellationToken);
-        await LoadInstalledPackagesAsync(cancellationToken);
+        foreach (var package in selected)
+        {
+            await packageProvider.UpgradeAsync(package.Id, OperationProgress, cancellationToken);
+            // The installed version and available-version columns are authoritative only after
+            // winget has completed and the live inventory has been scanned again.
+            await LoadInstalledPackagesAsync(cancellationToken);
+        }
     }, "查看 Output 中的包管理器诊断后重试。", canCancel: true);
 
     /// <summary>Bulk-upgrade every installed package that has an available update (the Updates view's
@@ -193,9 +200,8 @@ public partial class PackagesViewModel(
         foreach (var package in updatable)
         {
             await packageProvider.UpgradeAsync(package.Id, OperationProgress, cancellationToken);
+            await LoadInstalledPackagesAsync(cancellationToken);
         }
-
-        await LoadInstalledPackagesAsync(cancellationToken);
     }, "查看 Output 中的包管理器诊断后重试。", canCancel: true);
 
     [RelayCommand]
@@ -261,12 +267,42 @@ public partial class PackagesViewModel(
     {
         var snapshot = packages as IReadOnlyList<PackageInfo> ?? packages.ToArray();
         using var performance = performanceMetrics?.Begin("packages.installed.publish", snapshot.Count, "ui-batch");
+        var preserveSelection = ListMode == PackageListMode.Installed;
+        var selectedIds = SelectedPackages.Select(package => package.Id)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var selectedId = SelectedPackage?.Id;
         Packages.ReplaceRange(snapshot);
 
         ListMode = PackageListMode.Installed;
+        if (preserveSelection)
+        {
+            ReselectPublishedPackages(snapshot, selectedIds, selectedId);
+        }
         IsProviderColumnVisible = Packages.Select(package => package.Provider).Distinct(StringComparer.OrdinalIgnoreCase).Skip(1).Any();
         NotifyCopyCommands();
         UpdateInstalledListState();
+    }
+
+    private void ReselectPublishedPackages(
+        IReadOnlyList<PackageInfo> snapshot,
+        IReadOnlySet<string> selectedIds,
+        string? selectedId)
+    {
+        var selected = snapshot
+            .Where(package => selectedIds.Contains(package.Id))
+            .ToArray();
+        SelectedPackages.Clear();
+        foreach (var package in selected)
+        {
+            SelectedPackages.Add(package);
+        }
+
+        // Keep the form bound to the newly scanned package record. A removed package has no
+        // replacement, so clearing it is preferable to showing its old version as if it still
+        // existed.
+        SelectedPackage = selectedId is null
+            ? null
+            : snapshot.FirstOrDefault(package => string.Equals(package.Id, selectedId, StringComparison.OrdinalIgnoreCase));
     }
 
     private void ShowSearchResults(IEnumerable<PackageInfo> packages, string summary)

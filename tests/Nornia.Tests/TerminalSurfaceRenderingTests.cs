@@ -45,4 +45,38 @@ public sealed class TerminalSurfaceRenderingTests
             Assert.True(changedPixels > 20, $"终端文本没有产生可见像素，非背景像素数：{changedPixels}");
         });
     }
+
+    [Fact]
+    public void ClearingSession_RemovesRetainedTerminalPixels()
+    {
+        WpfStaContext.Run(() =>
+        {
+            const int width = 320;
+            const int height = 200;
+            var session = new TerminalSession(new ShellProfile("test", "Test", "test.exe"), "", null);
+            session.AttachFallbackScreen(columns: 40, rows: 10);
+            session.Screen!.FeedText("stale terminal output");
+
+            var surface = new TerminalSurfaceControl { Session = session };
+            surface.Measure(new Size(width, height));
+            surface.Arrange(new Rect(0, 0, width, height));
+            surface.UpdateLayout();
+            WpfStaContext.PumpQueue();
+
+            surface.Session = null;
+            WpfStaContext.PumpQueue();
+
+            var bitmap = new RenderTargetBitmap(width, height, 96, 96, PixelFormats.Pbgra32);
+            bitmap.Render(surface);
+            var stride = width * 4;
+            var pixels = new byte[stride * height];
+            bitmap.CopyPixels(pixels, stride, 0);
+            var background = pixels.AsSpan(0, 4).ToArray();
+            for (var offset = 0; offset < pixels.Length; offset += 4)
+            {
+                Assert.True(pixels.AsSpan(offset, 4).SequenceEqual(background),
+                    $"终端会话关闭后仍有残留像素，偏移：{offset}");
+            }
+        });
+    }
 }
