@@ -16,7 +16,6 @@ public abstract record NavigationContext
     public record NewProject(string ProjectPath) : NavigationContext;
     public record History : NavigationContext;
     public record CacheHighConfidence : NavigationContext;
-    public record CacheByPackage(string PackageId, string PackageName, string Provider) : NavigationContext;
 
     public static NavigationContext? Parse(string? context)
     {

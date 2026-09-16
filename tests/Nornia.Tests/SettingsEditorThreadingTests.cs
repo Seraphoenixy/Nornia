@@ -12,6 +12,7 @@ namespace Nornia.Tests;
 /// "该类型的 CollectionView 不支持从调度程序线程以外的线程对其 SourceCollection 进行的更改"
 /// (生产日志中表现为未观察的 Task 异常)。VM 必须像 OnSessionChanged/OnBindingsChanged
 /// 事件回调一样把应用回 marshal 到调度程序线程。</summary>
+[Collection("WpfStaSequential")]
 public sealed class SettingsEditorThreadingTests
 {
     [Fact]
@@ -52,7 +53,15 @@ public sealed class SettingsEditorThreadingTests
         var exception = await Record.ExceptionAsync(() => init);
         Assert.Null(exception);
         // 快捷键条目已在调度程序线程上填充(0 → 1);修复前该步跨线程变更直接抛
-        // NotSupportedException,init 任务 fault。
+        // NotSupportedException,init 任务 fault。泵与初始化续体是并发的:满负载下
+        // BeginInvoke 的落地会晚于单次泵,轮询泵到填充完成为止。
+        var deadline = DateTime.UtcNow.AddSeconds(30);
+        while (editor.ShortcutItems.Count == 0 && DateTime.UtcNow < deadline)
+        {
+            WpfStaContext.Run(WpfStaContext.PumpQueue);
+            await Task.Delay(10);
+        }
+
         Assert.Single(editor.ShortcutItems);
     }
 }

@@ -10,6 +10,22 @@ namespace Nornia.Tests;
 public sealed class LanguagePresentationTests
 {
     [Fact]
+    public async Task XamlComments_KeepCommentHighlightingForTextAndAcrossLines()
+    {
+        const string xaml = "<Grid><!-- same line --></Grid>\n<!-- first line\nsecond line -->\n<TextBlock />";
+        var type = CodeFileTypeRegistry.Instance.FromPath("View.xaml");
+        var snapshot = await CodePresentationService.Instance.AnalyzeAsync(xaml, type, 1);
+
+        static CodeTokenSpan TokenAt(CodePresentationSnapshot result, int line, int column) =>
+            result.Tokens.Where(token => token.Line == line && token.Start <= column && token.Start + token.Length > column).Last();
+
+        Assert.Equal(CodeTokenKind.Comment, TokenAt(snapshot, 1, 12).Kind); // same-line body
+        Assert.Equal(CodeTokenKind.Comment, TokenAt(snapshot, 2, 8).Kind);  // opening-line body
+        Assert.Equal(CodeTokenKind.Comment, TokenAt(snapshot, 3, 2).Kind);  // continuation body
+        Assert.Equal(CodeTokenRole.Comment, TokenTheme.Resolve(TokenAt(snapshot, 3, 2).Scopes)!.Role);
+    }
+
+    [Fact]
     public async Task AnalyzeAsync_UsesTextMateTokensAndKeepsVersion()
     {
         var type = CodeFileTypeRegistry.Instance.FromPath("Demo.cs");
@@ -407,6 +423,109 @@ public sealed class DiffPresentationTests
         Assert.Equal(4, lines[0].OldLineNumber);
         Assert.Equal(8, lines[1].NewLineNumber);
         Assert.Equal((5, 9), (lines[2].OldLineNumber, lines[2].NewLineNumber));
+    }
+}
+
+// The diff-view text highligting must be identical to 正文 (the real file tokenisation), because
+// the tokenizer is stateful across lines and the raw inline doc interleaves @@ headers/removed(old)
+// lines ahead of added(new) ones. These tests drive DiffHighlightProjection: the clean new-side
+// text must equal the current file, and each added line's tokens must equal 正文's for the same line.
+[Collection("TextMate")]
+public sealed class DiffHighlightProjectionTests
+{
+    private static async Task<CodePresentationSnapshot> AnalyzeAsync(string path, string text) =>
+        await CodePresentationService.Instance.AnalyzeAsync(text, CodeFileTypeRegistry.Instance.FromPath(path), 1);
+
+    private static IReadOnlyDictionary<int, IReadOnlyList<CodeTokenSpan>> ByLine(CodePresentationSnapshot snapshot) =>
+        snapshot.Tokens.GroupBy(token => token.Line).ToDictionary(group => group.Key, group => (IReadOnlyList<CodeTokenSpan>)group.ToArray());
+
+    /// <summary>CodeTokenSpan 记录对 Scopes 数组用引用相等,故按决定颜色的语义字段比较
+    /// (跨行号则忽略,只看行内区间、类别与 scope 栈内容)。</summary>
+    private static object[] Semantic(IReadOnlyList<CodeTokenSpan> tokens) =>
+        tokens.Select(token => new object[]
+        {
+            token.Start,
+            token.Length,
+            token.Kind,
+            token.Scopes is { } scopes ? (object)string.Join(' ', scopes) : (object)string.Empty,
+        }).ToArray();
+
+    [Fact]
+    public async Task AddedLineTokens_Match正文TokenizationForSameLine()
+    {
+        // 修改文件:第 3 行改为新增。NewText(干净新侧)必须等于当前正文;added 行 token 必须等于正文第 3 行。
+        List<DiffRenderLine> renderLines =
+        [
+            new("@@ -1,4 +1,4 @@", GitDiffLineKind.HunkHeader, null, null),
+            new("public class Demo", GitDiffLineKind.Context, 1, 1),
+            new("{", GitDiffLineKind.Context, 2, 2),
+            new("string old = \"hello\";", GitDiffLineKind.Removed, 3, null),
+            new("string name = \"hello\";", GitDiffLineKind.Added, null, 3),
+            new("}", GitDiffLineKind.Context, 4, 4),
+        ];
+
+        var source = DiffHighlightProjection.BuildSource(renderLines);
+        const string newFileText = "public class Demo\n{\nstring name = \"hello\";\n}";
+        Assert.Equal(newFileText, source.NewText);
+
+        var bodyByLine = ByLine(await AnalyzeAsync("Demo.cs", newFileText));
+        var newByLine = ByLine(await AnalyzeAsync("Demo.cs", source.NewText));
+        var oldByLine = ByLine(await AnalyzeAsync("Demo.cs", source.OldText));
+        var pane = DiffHighlightProjection.BuildPaneTokens(renderLines, newByLine, oldByLine, source);
+
+        // Add 行是 renderLines 中 Kind==Added 的那一行(前面有 hunk 头,故文档行号>3)。
+        var addedDocLine = renderLines.FindIndex(line => line.Kind == GitDiffLineKind.Added) + 1;
+        Assert.True(pane.TryGetValue(addedDocLine, out var addedTokens), "added 行应有 token");
+        Assert.Equal(Semantic(bodyByLine[3]), Semantic(addedTokens));
+        Assert.Contains(addedTokens, token => token.Kind == CodeTokenKind.String);
+        Assert.Contains(addedTokens, token => token.Kind == CodeTokenKind.Keyword);
+    }
+
+    [Fact]
+    public async Task PureNewFile_EveryAddedLineMatches正文()
+    {
+        // 纯新增文件:全部为 added,新侧干净文本 = 整个新文件,所有行映射到正文对应行。
+        const string fileText = "int x = 1;\nstring s = \"hi\";\nreturn x;";
+        var renderLines = fileText.Split('\n')
+            .Select((line, index) => new DiffRenderLine(line, GitDiffLineKind.Added, null, index + 1))
+            .Cast<DiffRenderLine>()
+            .ToList();
+        var source = DiffHighlightProjection.BuildSource(renderLines);
+        Assert.Equal(fileText, source.NewText);
+
+        var bodyByLine = ByLine(await AnalyzeAsync("Demo.cs", fileText));
+        var newByLine = ByLine(await AnalyzeAsync("Demo.cs", source.NewText));
+        var pane = DiffHighlightProjection.BuildPaneTokens(renderLines, newByLine, new Dictionary<int, IReadOnlyList<CodeTokenSpan>>(), source);
+
+        Assert.Equal(renderLines.Count, pane.Count);
+        foreach (var line in Enumerable.Range(1, renderLines.Count))
+        {
+            Assert.True(pane.TryGetValue(line, out var tokens), $"第 {line} 行应有 token");
+            Assert.Equal(Semantic(bodyByLine[line]), Semantic(tokens));
+        }
+    }
+
+    [Fact]
+    public void BuildSource_SkipsMetaAndSplitsSidesCorrectly()
+    {
+        List<DiffRenderLine> renderLines =
+        [
+            new("@@ -1 +1 @@", GitDiffLineKind.HunkHeader, null, null),
+            new("a", GitDiffLineKind.Context, 1, 1),
+            new("old", GitDiffLineKind.Removed, 2, null),
+            new("new", GitDiffLineKind.Added, null, 2),
+            new("z", GitDiffLineKind.Context, 3, 3),
+            new("\\ No newline at end of file", GitDiffLineKind.Notice, null, null),
+        ];
+
+        var source = DiffHighlightProjection.BuildSource(renderLines);
+        // hunk 头与 notice 不进入干净文本;新侧 = context+added,旧侧 = context+removed。
+        Assert.Equal("a\nnew\nz", source.NewText);
+        Assert.Equal("a\nold\nz", source.OldText);
+        Assert.Equal(2, source.NewLineToRank[2]);   // added 新行 2 → 新侧 rank 2
+        Assert.Equal(2, source.OldLineToRank[2]);   // removed 旧行 2 → 旧侧 rank 2
+        Assert.Equal(3, source.NewLineToRank[3]);   // 末尾 context 新行 3
+        Assert.Equal(3, source.OldLineToRank[3]);
     }
 }
 

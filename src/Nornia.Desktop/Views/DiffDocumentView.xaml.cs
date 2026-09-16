@@ -7,8 +7,10 @@ using Nornia.Core.Models;
 using Nornia.Desktop.Code;
 using Nornia.Desktop.Services;
 using Nornia.Desktop.ViewModels;
+using Serilog;
 using System.Collections.Specialized;
 using System.ComponentModel;
+using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -72,8 +74,7 @@ public partial class DiffDocumentView : UserControl
     private double _expectedNewVertical;
     private Brush _overviewAddedBrush = Brushes.Green;
     private Brush _overviewRemovedBrush = Brushes.Red;
-    private string _highlightingName = string.Empty;
-    private IHighlightingDefinition? _highlightingDefinition;
+    private DiffHighlightProjection.DiffHighlightSource? _highlightSource;
     private readonly CodeTokenColorizer _inlineSemanticTokens;
     private readonly CodeTokenColorizer _oldSemanticTokens;
     private readonly CodeTokenColorizer _newSemanticTokens;
@@ -90,8 +91,7 @@ public partial class DiffDocumentView : UserControl
     private DiffDisplayMap? _inlineMap;
     private DiffDisplayMap? _sideMap;
     // 原始 hunk 头文本(按 hunk 序):折叠投影会把 @@ 元数据从内联文档隐藏(hideHunkHeader),
-    // sticky 行仍显示真实头文本;第 k 个显示 hunk 头与第 k 个原始 hunk 头一一对应
-    // (折叠只压缩上下文,不增删 hunk 头)。
+    // sticky 行仍显示真实头文本;第 k 个显示 hunk 头与第 k 个原始 hunk 头一一对应。
     private IReadOnlyList<string> _rawHunkHeaderTexts = [];
     // 并排两侧的行对齐变更掩码(RebuildDocuments 随 _oldLines/_newLines 一次性重建):
     // 变更导航/概览 current 标记按并排行号空间定位。每次重建只分配一次,
@@ -100,9 +100,19 @@ public partial class DiffDocumentView : UserControl
     private bool _positionedFirstChange;
     private readonly List<int> _diffFindMatches = [];
     private DiffFindRenderer? _diffFindRenderer;
-    private int _hoverHunkIndex = -1;
+    private DiffHunkBlock? _hoverBlock;
     private TextView? _hoverTextView;
     private DiffScrollState? _pendingScrollRestore;
+
+    /// <summary>One contiguous changed block (连续 +/- 行) inside a hunk. git 把间距不超过
+    /// 2×上下文行的多处修改合并成一个 hunk——工具条按块锚定、按块应用,用户才能只暂存其中
+    /// 一处。Anchor 行号取块首行非空的一侧,由 <see cref="DiffTab"/> 解析成块序号。</summary>
+    private readonly record struct DiffHunkBlock(
+        int HunkIndex,
+        int? AnchorOldLine,
+        int? AnchorNewLine,
+        int BlockStart,
+        int BlockEnd);
 
     public DiffDocumentView()
     {
@@ -121,9 +131,11 @@ public partial class DiffDocumentView : UserControl
         NewOverviewCanvas.SizeChanged += (_, _) => RedrawSideOverviews();
         NewOverviewCanvas.MouseLeftButtonDown += OnSideOverviewMouseDown;
         // Click-to-expand collapsed context placeholders (VS Code "… N unchanged lines …" bar).
-        InlineEditor.TextArea.TextView.PreviewMouseLeftButtonDown += OnEditorPreviewMouseDown;
-        OldEditor.TextArea.TextView.PreviewMouseLeftButtonDown += OnEditorPreviewMouseDown;
-        NewEditor.TextArea.TextView.PreviewMouseLeftButtonDown += OnEditorPreviewMouseDown;
+        // Listen on the panes instead of only TextView: the floating hunk-action canvas is layered
+        // over the editors and can otherwise become the routed-event source, making a prompt click
+        // look inert even though the prompt is visible.
+        InlinePane.PreviewMouseLeftButtonDown += OnDiffPanePreviewMouseDown;
+        SideBySidePane.PreviewMouseLeftButtonDown += OnDiffPanePreviewMouseDown;
         InlineEditor.TextArea.TextView.MouseMove += OnDiffTextViewMouseMove;
         OldEditor.TextArea.TextView.MouseMove += OnDiffTextViewMouseMove;
         NewEditor.TextArea.TextView.MouseMove += OnDiffTextViewMouseMove;
@@ -182,12 +194,24 @@ public partial class DiffDocumentView : UserControl
 
     private TextEditor _positionedEditor = null!;
 
-    /// <summary>窄窗自动内联(VS Code useInlineViewWhenSpaceIsLimited):窗口过窄时即使请求并排
-    /// 也以内联显示(仅显示层,不改 DiffMode)。</summary>
-    private const double NarrowInlineWidth = 540;
+    /// <summary>窄窗自动内联(VS Code useInlineViewWhenSpaceIsLimited):未手动选择布局时,
+    /// 宽度不足时切回单栏；一旦用户手工选择则保持该布局，且仅作用于当前本次打开的 Diff 标签。
+    /// 这不依赖全局状态，因此对同一文件的下一次打开会重新回到自动决策。</summary>
+    private const double NarrowInlineWidth = 700;
 
-    private bool EffectiveInline() =>
-        _tab is null || _tab.IsInlineDiff || (_tab.UseInlineWhenNarrow && ActualWidth < NarrowInlineWidth);
+    private bool EffectiveInline()
+    {
+        if (_tab is null)
+        {
+            return true;
+        }
+
+        // The selected diff mode remains the baseline. The narrow-window option is only an
+        // automatic fallback for a requested side-by-side layout; without this OR an inline
+        // default would unexpectedly turn into side-by-side as soon as the view became wide.
+        return _tab.IsInlineDiff
+            || (!_tab.IsLayoutManuallySelected && _tab.ShouldAutoUseInlineForWidth(ActualWidth));
+    }
 
     private void UpdateLayoutMode()
     {
@@ -219,7 +243,17 @@ public partial class DiffDocumentView : UserControl
         }
     }
 
-    private void OnThemeChanged(object? sender, AppTheme theme) => ApplyEditorTheme();
+    private void OnThemeChanged(object? sender, AppTheme theme)
+    {
+        // 与 CodeDocumentView.OnThemeChanged 相同:非宿主线程的广播归组回宿主 Dispatcher。
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.InvokeAsync(ApplyEditorTheme);
+            return;
+        }
+
+        ApplyEditorTheme();
+    }
 
     private void OnDataContextChanged(object sender, DependencyPropertyChangedEventArgs e)
     {
@@ -305,7 +339,7 @@ public partial class DiffDocumentView : UserControl
 
     private void UpdateHunkActionBar(TextView textView)
     {
-        if (!TryGetHunkAtPointer(textView, out var hunkIndex, out var y))
+        if (!TryGetHunkBlockAtPointer(textView, out var block, out var y))
         {
             // Keep the current bar alive while moving through its hit area. The pane-level
             // handler receives these moves, but the button itself is not a document line.
@@ -322,28 +356,29 @@ public partial class DiffDocumentView : UserControl
             || ReferenceEquals(textView, NewEditor.TextArea.TextView);
         var bar = sideBySide ? SideHunkActionBar : InlineHunkActionBar;
         var canvas = sideBySide ? SideHunkActionCanvas : InlineHunkActionCanvas;
-        ConfigureHunkActionBar(bar, hunkIndex);
+        ConfigureHunkActionBar(bar, block.HunkIndex);
         bar.Visibility = Visibility.Visible;
         canvas.UpdateLayout();
         bar.Measure(new Size(double.PositiveInfinity, double.PositiveInfinity));
-        // VS Code renders hunk review actions in a dedicated gutter: compact icons beside the
-        // change block, outside the code and overview-ruler hit areas. The toolbar does not
-        // take a document row or change the editor's text layout.
-        // VS Code renders the hunk toolbar in a dedicated gutter. Inline uses the left gutter;
-        // side-by-side uses the modified (new) editor's gutter and keeps one shared toolbar.
+        // VS Code 渲染 hunk 工具条在专用 gutter:紧凑图标紧邻变更块,不占文档行、不改行高。
+        // 内联用左侧 gutter;并排用修改侧(new)编辑器的 gutter 且全程共享同一条工具条。
+        // 并排起点必须取编辑器实时 transform:sash 是 GridSplitter,new 编辑器不一定从面板
+        // 中点开始——此前硬编码 "(canvas.Width + 5) / 2" 会让拖动分隔条后工具条漂到代码文本上。
         var gutterLeft = sideBySide
-            ? Math.Max(0, (canvas.ActualWidth + 5) / 2 + 2.5)
+            ? Math.Max(0, NewEditor.TransformToAncestor(SideBySidePane).Transform(new Point(0, 0)).X + 2.5)
             : 2;
         Canvas.SetLeft(bar, gutterLeft);
         var boundsLines = ReferenceEquals(textView, OldEditor.TextArea.TextView)
             ? _oldLines
             : ReferenceEquals(textView, NewEditor.TextArea.TextView) ? _newLines : _inlineLines;
-        var hunkBounds = FindVisibleHunkBounds(textView, boundsLines, hunkIndex);
+        // 工具条纵向锚定悬停的变更块(而非整个 hunk):一个 hunk 内有多个相近块时,
+        // 按块定位才能让用户看清当前操作作用于哪一处修改。
+        var hunkBounds = FindVisibleDisplayBounds(textView, boundsLines, block.BlockStart, block.BlockEnd);
         var actionTop = hunkBounds is { } bounds
             ? (bounds.Top + bounds.Bottom - bar.DesiredSize.Height) / 2
             : y + 1;
         Canvas.SetTop(bar, Math.Max(2, actionTop));
-        _hoverHunkIndex = hunkIndex;
+        _hoverBlock = block;
         _hoverTextView = textView;
     }
 
@@ -376,9 +411,9 @@ public partial class DiffDocumentView : UserControl
         }
     }
 
-    private bool TryGetHunkAtPointer(TextView textView, out int hunkIndex, out double y)
+    private bool TryGetHunkBlockAtPointer(TextView textView, out DiffHunkBlock block, out double y)
     {
-        hunkIndex = -1;
+        block = default;
         y = 0;
 
         var lines = ReferenceEquals(textView, InlineEditor.TextArea.TextView)
@@ -390,11 +425,11 @@ public partial class DiffDocumentView : UserControl
             return false;
         }
 
-        hunkIndex = lines[displayIndex].HunkIndex;
-        // Anchor the toolbar to the first changed line of the hunk (rather than the line under
-        // the pointer), matching VS Code's diff review widget. For a pure insertion/deletion the
-        // corresponding side can be an empty row, so fall back to the first row carrying the hunk.
-        var anchorIndex = FindHunkAnchorLine(lines, hunkIndex, displayIndex);
+        if (!TryResolveHunkBlock(textView, lines[displayIndex].HunkIndex, displayIndex, out block, out var blockStart))
+        {
+            return false;
+        }
+
         var visualLines = GetValidVisualLines(textView);
         if (visualLines is null)
         {
@@ -402,14 +437,63 @@ public partial class DiffDocumentView : UserControl
         }
 
         var visualLine = visualLines.FirstOrDefault(line =>
-            line.FirstDocumentLine.LineNumber <= anchorIndex + 1 && line.LastDocumentLine.LineNumber >= anchorIndex + 1);
+            line.FirstDocumentLine.LineNumber <= blockStart + 1 && line.LastDocumentLine.LineNumber >= blockStart + 1);
         y = visualLine is null ? 0 : visualLine.VisualTop - textView.ScrollOffset.Y;
-        return _tab?.CanApplyHunk(hunkIndex, GitHunkOperation.Stage) == true
-            || _tab?.CanApplyHunk(hunkIndex, GitHunkOperation.Unstage) == true
-            || _tab?.CanApplyHunk(hunkIndex, GitHunkOperation.Restore) == true;
+        return _tab?.CanApplyHunk(block.HunkIndex, GitHunkOperation.Stage) == true
+            || _tab?.CanApplyHunk(block.HunkIndex, GitHunkOperation.Unstage) == true
+            || _tab?.CanApplyHunk(block.HunkIndex, GitHunkOperation.Restore) == true;
     }
 
-    private static int GetDisplayLineAtPointer(TextView textView)
+    /// <summary>解析指针所在行(或并排对侧行)所属的连续变更块:块的范围与锚点行号都在
+    /// 悬停侧(或对侧)的显示行里解析,块首行的旧/新行号交给 DiffTab 解析块序号。</summary>
+    private bool TryResolveHunkBlock(TextView textView, int hunkIndex, int displayIndex, out DiffHunkBlock block, out int blockStart)
+    {
+        block = default;
+        blockStart = -1;
+
+        var inline = ReferenceEquals(textView, InlineEditor.TextArea.TextView);
+        var lines = inline
+            ? _inlineLines
+            : ReferenceEquals(textView, OldEditor.TextArea.TextView) ? _oldLines : _newLines;
+        if (displayIndex < 0 || displayIndex >= lines.Count || lines[displayIndex].HunkIndex < 0)
+        {
+            return false;
+        }
+
+        // 并排布局下悬停到占位行(另一侧是插入行)时,按同一下标取对侧行——该行带真实的
+        // 变更内容与行号。内联布局没有占位行,悬停上下文行时回退到最近的变更行。
+        var blockLines = lines;
+        if (!inline && !lines[displayIndex].IsChange)
+        {
+            var otherLines = ReferenceEquals(textView, OldEditor.TextArea.TextView) ? _newLines : _oldLines;
+            if (otherLines.Count > displayIndex && otherLines[displayIndex].IsChange)
+            {
+                // 占位行本身没有行号,块的锚点行号取自对侧(与悬停行同一下标的真实变更行)。
+                blockLines = otherLines;
+            }
+        }
+
+        // Anchor the toolbar to the hovered contiguous changed block (rather than the whole
+        // hunk), matching VS Code's per-block review widget.
+        var anchorIndex = FindHunkAnchorLine(blockLines, hunkIndex, displayIndex);
+        if (anchorIndex < 0 || blockLines[anchorIndex].HunkIndex != hunkIndex)
+        {
+            return false;
+        }
+
+        var (start, end) = ExpandChangeBlock(blockLines, anchorIndex);
+        var anchorLine = blockLines[start];
+        block = new DiffHunkBlock(hunkIndex, anchorLine.OldLineNumber, anchorLine.NewLineNumber, start, end);
+        // 并排两侧的行是 1:1 对齐的:块在对侧解析时,行带下标不变,视口几何仍取悬停侧。
+        blockStart = start;
+        return true;
+    }
+
+    /// <summary>测试接缝:非空时以注入的指针位置(TextView 视口坐标)替代真实鼠标设备读取,
+    /// 让 STA 几何回归测试摆脱物理光标与 OS 消息投递的不确定性;生产路径恒为 null。</summary>
+    internal Func<TextView, Point>? PointerPositionOverride;
+
+    private int GetDisplayLineAtPointer(TextView textView)
     {
         var visualLines = GetValidVisualLines(textView);
         if (visualLines is null || visualLines.Count == 0)
@@ -417,7 +501,9 @@ public partial class DiffDocumentView : UserControl
             return -1;
         }
 
-        var point = Mouse.GetPosition(textView);
+        var point = PointerPositionOverride is { } probe
+            ? probe(textView)
+            : Mouse.GetPosition(textView);
         if (point.Y < 0 || point.Y > textView.ActualHeight)
         {
             return -1;
@@ -429,16 +515,37 @@ public partial class DiffDocumentView : UserControl
         return visualLine is null ? -1 : visualLine.FirstDocumentLine.LineNumber - 1;
     }
 
+    /// <summary>最近变更行:先向上、再向下在同一个 hunk 内找 IsChange 行,距离相同取较早
+    /// 的一侧(悬停 hunk 上下文行时,工具条落到距指针最近的变更块)。</summary>
     private static int FindHunkAnchorLine(IReadOnlyList<DiffRenderLine> lines, int hunkIndex, int fallback)
     {
-        for (var index = 0; index < lines.Count; index++)
+        for (var up = fallback; up >= 0; up--)
         {
-            if (lines[index].HunkIndex == hunkIndex && lines[index].IsChange)
+            if (lines[up].HunkIndex != hunkIndex)
             {
-                return index;
+                break;
+            }
+
+            if (lines[up].IsChange)
+            {
+                return up;
             }
         }
 
+        for (var down = fallback + 1; down < lines.Count; down++)
+        {
+            if (lines[down].HunkIndex != hunkIndex)
+            {
+                break;
+            }
+
+            if (lines[down].IsChange)
+            {
+                return down;
+            }
+        }
+
+        // hunk 没有任何变更行(理论不出现):维持旧行为,锚定到 hunk 首行。
         for (var index = 0; index < lines.Count; index++)
         {
             if (lines[index].HunkIndex == hunkIndex)
@@ -450,38 +557,29 @@ public partial class DiffDocumentView : UserControl
         return fallback;
     }
 
-    private static (double Top, double Bottom)? FindVisibleHunkBounds(
-        TextView textView, IReadOnlyList<DiffRenderLine> lines, int hunkIndex)
+    /// <summary>把变更行扩展成它所在的连续变更块(块内所有行同属一个 hunk)。</summary>
+    private static (int Start, int End) ExpandChangeBlock(IReadOnlyList<DiffRenderLine> lines, int anchorIndex)
     {
-        var start = -1;
-        var end = -1;
-        for (var index = 0; index < lines.Count; index++)
+        var hunkIndex = lines[anchorIndex].HunkIndex;
+        var start = anchorIndex;
+        while (start > 0 && lines[start - 1].IsChange && lines[start - 1].HunkIndex == hunkIndex)
         {
-            if (lines[index].HunkIndex != hunkIndex)
-            {
-                continue;
-            }
-
-            if (lines[index].IsChange)
-            {
-                start = start < 0 ? index : Math.Min(start, index);
-                end = index;
-            }
+            start--;
         }
 
-        if (start < 0)
+        var end = anchorIndex;
+        while (end + 1 < lines.Count && lines[end + 1].IsChange && lines[end + 1].HunkIndex == hunkIndex)
         {
-            for (var index = 0; index < lines.Count; index++)
-            {
-                if (lines[index].HunkIndex == hunkIndex)
-                {
-                    start = start < 0 ? index : start;
-                    end = index;
-                }
-            }
+            end++;
         }
 
-        if (start < 0 || end < 0)
+        return (start, end);
+    }
+
+    private static (double Top, double Bottom)? FindVisibleDisplayBounds(
+        TextView textView, IReadOnlyList<DiffRenderLine> lines, int blockStart, int blockEnd)
+    {
+        if (blockStart < 0 || blockEnd < 0)
         {
             return null;
         }
@@ -493,8 +591,8 @@ public partial class DiffDocumentView : UserControl
         }
 
         var visible = visualLines.Where(line =>
-            line.LastDocumentLine.LineNumber >= start + 1
-            && line.FirstDocumentLine.LineNumber <= end + 1).ToArray();
+            line.LastDocumentLine.LineNumber >= blockStart + 1
+            && line.FirstDocumentLine.LineNumber <= blockEnd + 1).ToArray();
         return visible.Length == 0
             ? null
             : (visible.Min(line => line.VisualTop - textView.ScrollOffset.Y),
@@ -504,7 +602,7 @@ public partial class DiffDocumentView : UserControl
     {
         InlineHunkActionBar.Visibility = Visibility.Collapsed;
         SideHunkActionBar.Visibility = Visibility.Collapsed;
-        _hoverHunkIndex = -1;
+        _hoverBlock = null;
         _hoverTextView = null;
     }
 
@@ -523,8 +621,10 @@ public partial class DiffDocumentView : UserControl
         }
 
         var position = textView.GetPositionFloor(Mouse.GetPosition(textView));
-        var hunkIndex = position is { Line: >= 1 } hit ? HunkIndexAtDisplayLine(textView, hit.Line - 1) : -1;
-        if (_tab is null || hunkIndex < 0)
+        var displayIndex = position is { Line: >= 1 } hit ? hit.Line - 1 : -1;
+        var hunkIndex = HunkIndexAtDisplayLine(textView, displayIndex);
+        if (_tab is null || hunkIndex < 0
+            || !TryResolveHunkBlock(textView, hunkIndex, displayIndex, out var block, out _))
         {
             return;
         }
@@ -544,8 +644,8 @@ public partial class DiffDocumentView : UserControl
                 continue;
             }
 
-            var item = new MenuItem { Header = header, Tag = "diff-hunk-action", ToolTip = $"对第 {hunkIndex + 1} 个 Diff 块执行“{header}”" };
-            item.Click += async (_, _) => await ExecuteHunkOperationAsync(hunkIndex, operation);
+            var item = new MenuItem { Header = header, Tag = "diff-hunk-action", ToolTip = $"对第 {hunkIndex + 1} 个 Diff 块中悬停的变更块执行“{header}”" };
+            item.Click += (_, _) => _ = ExecuteHunkOperationSafelyAsync(block, operation);
             menu.Items.Insert(insertAt++, item);
         }
 
@@ -563,40 +663,67 @@ public partial class DiffDocumentView : UserControl
         return displayIndex >= 0 && displayIndex < lines.Count ? lines[displayIndex].HunkIndex : -1;
     }
 
-    private async void InlineStageHunk_Click(object sender, RoutedEventArgs e) => await ExecuteHunkOperationAsync(GetActionHunkIndex(sender), GitHunkOperation.Stage);
-    private async void InlineRestoreHunk_Click(object sender, RoutedEventArgs e) => await ExecuteHunkOperationAsync(GetActionHunkIndex(sender), GitHunkOperation.Restore);
-    private async void InlineUnstageHunk_Click(object sender, RoutedEventArgs e) => await ExecuteHunkOperationAsync(GetActionHunkIndex(sender), GitHunkOperation.Unstage);
-    private async void SideStageHunk_Click(object sender, RoutedEventArgs e) => await ExecuteHunkOperationAsync(GetActionHunkIndex(sender), GitHunkOperation.Stage);
-    private async void SideRestoreHunk_Click(object sender, RoutedEventArgs e) => await ExecuteHunkOperationAsync(GetActionHunkIndex(sender), GitHunkOperation.Restore);
-    private async void SideUnstageHunk_Click(object sender, RoutedEventArgs e) => await ExecuteHunkOperationAsync(GetActionHunkIndex(sender), GitHunkOperation.Unstage);
+    private void InlineStageHunk_Click(object sender, RoutedEventArgs e) => _ = ExecuteHunkOperationSafelyAsync(GetActionBlock(sender), GitHunkOperation.Stage);
+    private void InlineRestoreHunk_Click(object sender, RoutedEventArgs e) => _ = ExecuteHunkOperationSafelyAsync(GetActionBlock(sender), GitHunkOperation.Restore);
+    private void InlineUnstageHunk_Click(object sender, RoutedEventArgs e) => _ = ExecuteHunkOperationSafelyAsync(GetActionBlock(sender), GitHunkOperation.Unstage);
+    private void SideStageHunk_Click(object sender, RoutedEventArgs e) => _ = ExecuteHunkOperationSafelyAsync(GetActionBlock(sender), GitHunkOperation.Stage);
+    private void SideRestoreHunk_Click(object sender, RoutedEventArgs e) => _ = ExecuteHunkOperationSafelyAsync(GetActionBlock(sender), GitHunkOperation.Restore);
+    private void SideUnstageHunk_Click(object sender, RoutedEventArgs e) => _ = ExecuteHunkOperationSafelyAsync(GetActionBlock(sender), GitHunkOperation.Unstage);
 
-    private int GetActionHunkIndex(object sender)
+    private DiffHunkBlock? GetActionBlock(object sender)
     {
         if (sender is DependencyObject current)
         {
             while (current is not null)
             {
-                if (current is FrameworkElement { Tag: int hunkIndex })
+                if (current is FrameworkElement { Tag: DiffHunkBlock block })
                 {
-                    return hunkIndex;
+                    return block;
                 }
 
-                current = VisualTreeHelper.GetParent(current);
+                current = current switch
+                {
+                    FrameworkContentElement content => content.Parent ?? ContentOperations.GetParent(content),
+                    ContentElement content => ContentOperations.GetParent(content),
+                    Visual or System.Windows.Media.Media3D.Visual3D =>
+                        VisualTreeHelper.GetParent(current) ?? LogicalTreeHelper.GetParent(current),
+                    _ => LogicalTreeHelper.GetParent(current),
+                };
             }
         }
 
-        return _hoverHunkIndex;
+        return _hoverBlock;
     }
-    private async Task ExecuteHunkOperationAsync(int hunkIndex, GitHunkOperation operation)
+    private async Task ExecuteHunkOperationSafelyAsync(DiffHunkBlock? block, GitHunkOperation operation)
     {
-        if (_tab is null || ! _tab.CanApplyHunk(hunkIndex, operation))
+        try
+        {
+            if (block is { } resolved)
+            {
+                await ExecuteHunkOperationAsync(resolved, operation);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // The diff tab may be disposed while the Git operation or the final
+            // scroll restoration is still in flight.
+        }
+        catch (Exception exception)
+        {
+            Log.Error(exception, "Diff 块操作完成后的视图更新失败");
+        }
+    }
+
+    private async Task ExecuteHunkOperationAsync(DiffHunkBlock block, GitHunkOperation operation)
+    {
+        if (_tab is null || ! _tab.CanApplyHunk(block.HunkIndex, operation))
         {
             return;
         }
 
-        var state = CaptureDiffScrollState(hunkIndex);
+        var state = CaptureDiffScrollState(block.HunkIndex);
         HideHunkActionBars();
-        await _tab.ApplyHunkAsync(hunkIndex, operation);
+        await _tab.ApplyHunkBlockAsync(block.HunkIndex, block.AnchorOldLine, block.AnchorNewLine, operation);
         _pendingScrollRestore = state;
         await Dispatcher.InvokeAsync(RestorePendingScrollState, System.Windows.Threading.DispatcherPriority.ApplicationIdle);
     }
@@ -929,7 +1056,17 @@ public partial class DiffDocumentView : UserControl
 
     private void OnTabPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
-        if (e.PropertyName is nameof(DiffTab.IsLoaded) or nameof(DiffTab.DiffMode) or nameof(DiffTab.IsContextCollapsed))
+        if (e.PropertyName == nameof(DiffTab.IsContextCollapsed))
+        {
+            // This is a direct user action from the toolbar. Apply it immediately so the button
+            // cannot appear inert while a background-priority coalesced rebuild is waiting behind
+            // other dispatcher work; collection changes still use the coalesced path below.
+            RebuildDocuments();
+            UpdateLayoutMode();
+            return;
+        }
+
+        if (e.PropertyName is nameof(DiffTab.IsLoaded) or nameof(DiffTab.DiffMode))
         {
             if (e.PropertyName == nameof(DiffTab.IsLoaded))
             {
@@ -1091,7 +1228,8 @@ public partial class DiffDocumentView : UserControl
         }
 
         var lineNumber = matchIndex + 1;
-        InlineEditor.ScrollTo(lineNumber, 0);
+        // 查找跳转(上一处/下一处匹配按钮点击):目标行居中显示。
+        CenterLine(InlineEditor, lineNumber);
         InlineEditor.CaretOffset = InlineEditor.Document.GetLineByNumber(lineNumber).Offset + column;
         InlineEditor.SelectionStart = InlineEditor.CaretOffset;
         InlineEditor.SelectionLength = Math.Min(_tab.FindText?.Length ?? 0, Math.Max(0, text.Length - column));
@@ -1100,11 +1238,11 @@ public partial class DiffDocumentView : UserControl
         var line = _inlineLines[matchIndex];
         if (line.OldLineNumber is { } oldLine && OldEditor.Document is { } oldDoc && oldLine <= oldDoc.LineCount)
         {
-            OldEditor.ScrollTo(oldLine, 0);
+            CenterLine(OldEditor, oldLine);
         }
         if (line.NewLineNumber is { } newLine && NewEditor.Document is { } newDoc && newLine <= newDoc.LineCount)
         {
-            NewEditor.ScrollTo(newLine, 0);
+            CenterLine(NewEditor, newLine);
         }
 
         var segments = new List<(int Start, int Length)>();
@@ -1140,26 +1278,56 @@ public partial class DiffDocumentView : UserControl
             .Where(line => line.Kind == GitDiffLineKind.HunkHeader)
             .Select(line => line.Text)
             .ToArray();
-        var sideBySide = DiffDocumentBuilders.BuildSideBySide(_tab.SideBySideRows);
-        var sideCollapseSource = DiffDocumentBuilders.BuildSideBySideCollapseSource(sideBySide.Old, sideBySide.New);
+        // Highlighting maps clean new/old side texts back to pane lines by real line number, so it
+        // must be built from the un-collapsed inline model (fold toggles never change line numbers).
+        _highlightSource = DiffHighlightProjection.BuildSource(rawInline);
+        // The inline projection is also the source for the diff find bar. The much larger paired
+        // projection is only needed by the visible side-by-side layout; deferring it avoids doing
+        // a second alignment pass every time an inline diff is refreshed or its context is toggled.
+        (IReadOnlyList<DiffRenderLine> Old, IReadOnlyList<DiffRenderLine> New) sideBySide = _tab.IsSideBySideDiff
+            ? DiffDocumentBuilders.BuildSideBySide(_tab.SideBySideRows)
+            : (Array.Empty<DiffRenderLine>() as IReadOnlyList<DiffRenderLine>,
+               Array.Empty<DiffRenderLine>() as IReadOnlyList<DiffRenderLine>);
+        var sideCollapseSource = _tab.IsSideBySideDiff
+            ? DiffDocumentBuilders.BuildSideBySideCollapseSource(sideBySide.Old, sideBySide.New)
+            : [];
+
+        // Keep the projection map in sync with the toggle state. Reusing stale maps is what caused
+        // collapsing / expanding unchanged context to appear non-responsive when the user toggled the
+        // setting without a full reload.
+        if (_tab.IsLoaded)
+        {
+            _inlineMap ??= new DiffDisplayMap(rawInline, collapseContext: _tab.IsContextCollapsed);
+            _inlineMap.SetCollapseContext(_tab.IsContextCollapsed);
+            if (_tab.IsSideBySideDiff)
+            {
+                // Side-by-side hunk spacer/header cells are both empty. Do not materialize them
+                // into editor documents, otherwise every hunk contributes phantom blank rows below
+                // a fold.
+                _sideMap ??= new DiffDisplayMap(sideCollapseSource, collapseContext: _tab.IsContextCollapsed,
+                    includeHunkHeaders: false);
+                _sideMap.SetCollapseContext(_tab.IsContextCollapsed);
+            }
+            else
+            {
+                // Recreate the side projection when the user switches back to it; an empty map
+                // from an inline rebuild must never shadow the real rows.
+                _sideMap = null;
+            }
+        }
+
+        var inlineMap = _inlineMap ?? new DiffDisplayMap(rawInline, collapseContext: _tab.IsContextCollapsed);
+        var sideMap = _tab.IsSideBySideDiff
+            ? _sideMap ?? new DiffDisplayMap(sideCollapseSource, collapseContext: _tab.IsContextCollapsed,
+                includeHunkHeaders: false)
+            : new DiffDisplayMap([], collapseContext: _tab.IsContextCollapsed, includeHunkHeaders: false);
         if (_tab.IsContextCollapsed)
         {
-            // Once the tab is loaded, keep a persistent projection so click-to-expand state
-            // survives rebuilds / mode switches; during loading use throwaway maps (the lines
-            // arrive incrementally and a persistent map would churn on every batch).
-            if (_tab.IsLoaded && _inlineMap is null)
-            {
-                _inlineMap = new DiffDisplayMap(rawInline);
-                _sideMap = new DiffDisplayMap(sideCollapseSource);
-            }
-
-            var inlineMap = _inlineMap ?? new DiffDisplayMap(rawInline);
-            var sideMap = _sideMap ?? new DiffDisplayMap(sideCollapseSource);
-            // Keep hunk headers in the projection as hard folding boundaries, but do not expose
-            // the raw unified-diff "@@ ... @@" metadata in the single-column reading surface.
-            _inlineLines = inlineMap.Lines.Select(line => ToDisplayLine(line, hideHunkHeader: true)).ToArray();
-            _oldLines = sideMap.Lines.Select(line => ToDisplayLine(line, sideBySide.Old)).ToArray();
-            _newLines = sideMap.Lines.Select(line => ToDisplayLine(line, sideBySide.New)).ToArray();
+            // Inline keeps metadata rows for sticky hunk headers; side-by-side drops its empty
+            // spacer/header rows so they cannot become phantom blank editor lines.
+            _inlineLines = inlineMap.Lines.Select(line => line.ToRenderLine(hideHunkHeader: true)).ToArray();
+            _oldLines = sideMap.Lines.Select(line => line.ToRenderLine(sideBySide.Old)).ToArray();
+            _newLines = sideMap.Lines.Select(line => line.ToRenderLine(sideBySide.New)).ToArray();
         }
         else
         {
@@ -1170,9 +1338,21 @@ public partial class DiffDocumentView : UserControl
 
         _sideChangeMask = DiffDocumentBuilders.BuildSideBySideChangeMask(_oldLines, _newLines);
 
-        SetEditorDocument(InlineEditor, _inlineLines);
-        SetEditorDocument(OldEditor, _oldLines);
-        SetEditorDocument(NewEditor, _newLines);
+        // Only the visible layout owns a populated AvalonEdit document. Keeping all three
+        // projections materialized made a 100k-line diff pay for three TextDocument instances,
+        // even though two editors were Collapsed. Switching layout rebuilds the newly visible side.
+        if (_tab.IsInlineDiff)
+        {
+            SetEditorDocument(InlineEditor, _inlineLines);
+            SetEditorDocument(OldEditor, []);
+            SetEditorDocument(NewEditor, []);
+        }
+        else
+        {
+            SetEditorDocument(InlineEditor, []);
+            SetEditorDocument(OldEditor, _oldLines);
+            SetEditorDocument(NewEditor, _newLines);
+        }
         _ = ApplyPresentationAsync();
 
         InstallMargins();
@@ -1191,14 +1371,52 @@ public partial class DiffDocumentView : UserControl
     }
 
     /// <summary>Expands the collapsed-context placeholder under the pointer (VS Code click-to-expand)
-    /// and rebuilds the editors from the persistent projection.</summary>
-    private void OnEditorPreviewMouseDown(object sender, System.Windows.Input.MouseButtonEventArgs e)
+    /// and rebuilds the editors from the persistent projection. This is pane-level because the
+    /// floating hunk-action canvas sits above the editor TextViews in the visual tree.</summary>
+    private void OnDiffPanePreviewMouseDown(object sender, MouseButtonEventArgs e)
     {
-        if (sender is not TextView textView)
+        if (e.ChangedButton != MouseButton.Left || e.Handled)
         {
             return;
         }
 
+        TextEditor? editor;
+        if (ReferenceEquals(sender, InlinePane))
+        {
+            if (InlineHunkActionBar.IsMouseOver || OverviewCanvas.IsMouseOver)
+            {
+                return;
+            }
+
+            editor = InlineEditor;
+        }
+        else if (ReferenceEquals(sender, SideBySidePane))
+        {
+            if (SideHunkActionBar.IsMouseOver || OldOverviewCanvas.IsMouseOver || NewOverviewCanvas.IsMouseOver)
+            {
+                return;
+            }
+
+            var pointer = e.GetPosition(SideBySidePane);
+            var oldOrigin = OldEditor.TransformToAncestor(SideBySidePane).Transform(new Point(0, 0));
+            var newOrigin = NewEditor.TransformToAncestor(SideBySidePane).Transform(new Point(0, 0));
+            var oldBounds = new Rect(oldOrigin, new Size(OldEditor.ActualWidth, OldEditor.ActualHeight));
+            var newBounds = new Rect(newOrigin, new Size(NewEditor.ActualWidth, NewEditor.ActualHeight));
+            editor = oldBounds.Contains(pointer) ? OldEditor
+                : newBounds.Contains(pointer) ? NewEditor
+                : null;
+        }
+        else
+        {
+            return;
+        }
+
+        if (editor is null)
+        {
+            return;
+        }
+
+        var textView = editor.TextArea.TextView;
         var position = textView.GetPositionFloor(e.GetPosition(textView));
         if (position is not { Line: >= 1 } hit)
         {
@@ -1206,8 +1424,8 @@ public partial class DiffDocumentView : UserControl
         }
 
         var displayIndex = hit.Line - 1;
-        var map = ReferenceEquals(textView, InlineEditor.TextArea.TextView) ? _inlineMap : _sideMap;
-        if (map is null || displayIndex >= map.Lines.Count || !map.Lines[displayIndex].IsCollapsedContext)
+        var map = ReferenceEquals(editor, InlineEditor) ? _inlineMap : _sideMap;
+        if (map is null || displayIndex < 0 || displayIndex >= map.Lines.Count || !map.Lines[displayIndex].IsCollapsedContext)
         {
             return;
         }
@@ -1217,22 +1435,6 @@ public partial class DiffDocumentView : UserControl
             RebuildDocuments();
             e.Handled = true;
         }
-    }
-
-    private static DiffRenderLine ToDisplayLine(
-        DiffDisplayLine line,
-        IReadOnlyList<DiffRenderLine>? source = null,
-        bool hideHunkHeader = false)
-    {
-        if (line.IsCollapsedContext)
-        {
-            return new DiffRenderLine(line.Text, GitDiffLineKind.None, null, null);
-        }
-
-        var result = source is null ? line.Source! : source[line.OriginalIndex];
-        return hideHunkHeader && result.Kind == GitDiffLineKind.HunkHeader
-            ? result with { Text = string.Empty }
-            : result;
     }
 
     private static void SetEditorDocument(TextEditor editor, IReadOnlyList<DiffRenderLine> lines)
@@ -1394,22 +1596,21 @@ public partial class DiffDocumentView : UserControl
         ApplyHighlightingTheme();
     }
 
-    /// <summary>按 diff 文件的扩展名准备与资源管理器相同的 AvalonEdit 回退定义；正常渲染由
-    /// ApplyPresentationAsync 提供的 TextMate token 快照负责。纯文本/未知扩展为 null 高亮。</summary>
+    /// <summary>准备 meta 行转换器并重绘。文本高亮完全由 TextMate token colorizer 负责（见
+    /// ApplyPresentationAsync），编辑器不再挂载 AvalonEdit 内置定义，避免打开时“默认上色 →
+    /// 文本高亮”的闪变；语法不支持的扩展名自然回落到纯文本。</summary>
     private void ApplyHighlighting()
     {
-        _highlightingName = DiffDocumentBuilders.ResolveHighlightingName(_tab?.Path);
-        _highlightingDefinition = string.IsNullOrEmpty(_highlightingName)
-            ? null
-            : HighlightingManager.Instance.GetDefinition(_highlightingName);
-        foreach (var editor in new[] { InlineEditor, OldEditor, NewEditor })
-        {
-            editor.SyntaxHighlighting = _highlightingDefinition;
-        }
-
         InstallMetaTransformers();
         ApplyHighlightingTheme();
     }
+
+    // 增量发布中最新的新/旧侧 token 索引（key = clean 侧文本行号）；first-batch 部分快照与
+    // 完整快照共用同一套映射回 pane 的路径，因此可视行能提前拿到最终配色。
+    private IReadOnlyDictionary<int, IReadOnlyList<CodeTokenSpan>> _partialNewByLine =
+        new Dictionary<int, IReadOnlyList<CodeTokenSpan>>();
+    private IReadOnlyDictionary<int, IReadOnlyList<CodeTokenSpan>> _partialOldByLine =
+        new Dictionary<int, IReadOnlyList<CodeTokenSpan>>();
 
     private void CancelPresentation()
     {
@@ -1419,10 +1620,11 @@ public partial class DiffDocumentView : UserControl
         _presentationCancellation = null;
     }
 
-    /// <summary>Uses the same TextMate presentation service as the resource-manager code reader.
-    /// Each diff pane gets a snapshot for its own text because removed and added lines are not the
-    /// same document.  The version gate prevents an incremental diff rebuild from painting stale
-    /// tokens over a newer projection.</summary>
+    /// <summary>按“侧”对 diff 做与正文一致的文本高亮。直接对交错/合成文档分词会让 @@ 头与
+    /// removed(旧)行污染其后 added 行的跨行 grammar 状态，导致颜色与正文不一致；这里改对
+    /// 两份额外清洗的干净文本（新侧=context+added、旧侧=context+removed）分词，再按真实行号
+    /// 映射回三个 pane 的显示行，每个 diff 行得到与正文完全一致的规则栈。版本门控阻止陈旧
+    /// token 覆盖更新的投影。</summary>
     private async Task ApplyPresentationAsync()
     {
         CancelPresentation();
@@ -1434,31 +1636,40 @@ public partial class DiffDocumentView : UserControl
             return;
         }
 
-        _inlineSemanticTokens.SetSnapshot(null);
-        _oldSemanticTokens.SetSnapshot(null);
-        _newSemanticTokens.SetSnapshot(null);
+        ResetDiffTokens();
         SetSyntaxFallback();
+
+        var source = _highlightSource;
+        if (source is null || (source.NewText.Length == 0 && source.OldText.Length == 0))
+        {
+            return;
+        }
 
         var fileType = CodeFileTypeRegistry.Instance.FromPath(tab.Path);
         var service = CodePresentationService.Instance;
+        var syncContext = SynchronizationContext.Current;
         try
         {
-            var inlineTask = service.AnalyzeTokensAsync(InlineEditor.Document?.Text ?? string.Empty,
-                fileType, version, cancellation.Token);
-            var oldTask = service.AnalyzeTokensAsync(OldEditor.Document?.Text ?? string.Empty,
-                fileType, version, cancellation.Token);
-            var newTask = service.AnalyzeTokensAsync(NewEditor.Document?.Text ?? string.Empty,
-                fileType, version, cancellation.Token);
-            await Task.WhenAll(inlineTask, oldTask, newTask);
+            var newTask = source.NewText.Length > 0
+                ? service.AnalyzeTokensAsync(source.NewText, fileType, version, null,
+                    partial => PostPublishPartial(partial, isNew: true, syncContext, tab, version),
+                    cancellation.Token)
+                : Task.FromResult(CodePresentationSnapshot.Empty(version));
+            var oldTask = source.OldText.Length > 0
+                ? service.AnalyzeTokensAsync(source.OldText, fileType, version, null,
+                    partial => PostPublishPartial(partial, isNew: false, syncContext, tab, version),
+                    cancellation.Token)
+                : Task.FromResult(CodePresentationSnapshot.Empty(version));
+            await Task.WhenAll(newTask, oldTask);
             if (cancellation.IsCancellationRequested || version != _presentationVersion ||
                 !ReferenceEquals(tab, _tab))
             {
                 return;
             }
 
-            _inlineSemanticTokens.SetSnapshot(inlineTask.Result);
-            _oldSemanticTokens.SetSnapshot(oldTask.Result);
-            _newSemanticTokens.SetSnapshot(newTask.Result);
+            _partialNewByLine = IndexCleanSide(newTask.Result);
+            _partialOldByLine = IndexCleanSide(oldTask.Result);
+            PublishDiffTokens();
             SetSyntaxFallback();
             InlineEditor.TextArea.TextView.Redraw();
             OldEditor.TextArea.TextView.Redraw();
@@ -1470,17 +1681,86 @@ public partial class DiffDocumentView : UserControl
         }
         catch (Exception ex)
         {
-            // Keep the same safe fallback as the resource-manager preview if a grammar is not
-            // available for a particular file. The diff itself remains fully readable.
+            // 与资源管理器预览一致:语法不可用(原生库/grammar 缺失)时逐文档空集合兜底,
+            // diff 本身保持完全可读(纯文本)。
             LogPresentationFailure(ex);
         }
     }
 
+    private static IReadOnlyDictionary<int, IReadOnlyList<CodeTokenSpan>> IndexCleanSide(
+        CodePresentationSnapshot snapshot) =>
+        CodePresentationSnapshotIndexer.Build(snapshot.Tokens).ByLine
+        ?? new Dictionary<int, IReadOnlyList<CodeTokenSpan>>();
+
+    private void PostPublishPartial(
+        CodePresentationSnapshot partial, bool isNew, SynchronizationContext? syncContext, DiffTab tab, int version)
+    {
+        // onFirstBatch 回调发生在 worker 线程；生产路径归组回宿主 Dispatcher 再发布。
+        if (syncContext is null)
+        {
+            PublishPartial(partial, isNew, tab, version);
+        }
+        else
+        {
+            syncContext.Post(_ => PublishPartial(partial, isNew, tab, version), null);
+        }
+    }
+
+    private void PublishPartial(CodePresentationSnapshot partial, bool isNew, DiffTab tab, int version)
+    {
+        if (version != _presentationVersion || !ReferenceEquals(tab, _tab))
+        {
+            return;
+        }
+
+        var index = IndexCleanSide(partial);
+        if (isNew)
+        {
+            _partialNewByLine = index;
+        }
+        else
+        {
+            _partialOldByLine = index;
+        }
+
+        PublishDiffTokens();
+        InlineEditor.TextArea.TextView.Redraw();
+        OldEditor.TextArea.TextView.Redraw();
+        NewEditor.TextArea.TextView.Redraw();
+    }
+
+    private void ResetDiffTokens()
+    {
+        _partialNewByLine = new Dictionary<int, IReadOnlyList<CodeTokenSpan>>();
+        _partialOldByLine = new Dictionary<int, IReadOnlyList<CodeTokenSpan>>();
+        _inlineSemanticTokens.SetSnapshotByLine(_partialNewByLine);
+        _oldSemanticTokens.SetSnapshotByLine(_partialNewByLine);
+        _newSemanticTokens.SetSnapshotByLine(_partialNewByLine);
+    }
+
+    private void PublishDiffTokens()
+    {
+        var source = _highlightSource;
+        if (source is null)
+        {
+            return;
+        }
+
+        _inlineSemanticTokens.SetSnapshotByLine(
+            DiffHighlightProjection.BuildPaneTokens(_inlineLines, _partialNewByLine, _partialOldByLine, source));
+        _oldSemanticTokens.SetSnapshotByLine(
+            DiffHighlightProjection.BuildPaneTokens(_oldLines, _partialNewByLine, _partialOldByLine, source));
+        _newSemanticTokens.SetSnapshotByLine(
+            DiffHighlightProjection.BuildPaneTokens(_newLines, _partialNewByLine, _partialOldByLine, source));
+    }
+
+    /// <summary>编辑器不使用 AvalonEdit 内置上色；唯一上色来源是上面两个 colorizer 的 token
+    /// 快照。此方法仅保证内置定义从未被挂上（打开文件时不会先“默认上色”再变文本高亮）。</summary>
     private void SetSyntaxFallback()
     {
-        InlineEditor.SyntaxHighlighting = _inlineSemanticTokens.HasTokens ? null : _highlightingDefinition;
-        OldEditor.SyntaxHighlighting = _oldSemanticTokens.HasTokens ? null : _highlightingDefinition;
-        NewEditor.SyntaxHighlighting = _newSemanticTokens.HasTokens ? null : _highlightingDefinition;
+        InlineEditor.SyntaxHighlighting = null;
+        OldEditor.SyntaxHighlighting = null;
+        NewEditor.SyntaxHighlighting = null;
     }
 
     private static void LogPresentationFailure(Exception exception)
@@ -1488,15 +1768,10 @@ public partial class DiffDocumentView : UserControl
         System.Diagnostics.Debug.WriteLine($"Diff syntax presentation failed: {exception.Message}");
     }
 
-    /// <summary>把当前主题的回退高亮定义应用到主题并重绘。正常情况下 diff 使用上面的
-    /// TextMate token colorizer；仅在语法分析没有 token 时沿用资源管理器的 AvalonEdit 回退。</summary>
+    /// <summary>重绘三个 pane。语法主题已被 token colorizer 的主题回调接管，此处不再应用
+    /// AvalonEdit 定义主题。</summary>
     private void ApplyHighlightingTheme()
     {
-        if (_highlightingDefinition is { } definition)
-        {
-            ThemeHighlightingColorizer.ApplyDefinitionTheme(definition);
-        }
-
         InlineEditor.TextArea.TextView.Redraw();
         OldEditor.TextArea.TextView.Redraw();
         NewEditor.TextArea.TextView.Redraw();
@@ -1618,7 +1893,8 @@ public partial class DiffDocumentView : UserControl
         var muted = Brush("MutedTextBrush") ?? Brushes.Gray;
         var hover = Brush("HoverBrush") ?? Brushes.Transparent;
         var row = new Border { Cursor = Cursors.Hand, Background = Brushes.Transparent, Padding = new Thickness(8, 2, 8, 2) };
-        row.MouseLeftButtonUp += (_, _) => InlineEditor.ScrollTo(headerStart, 0);
+        // sticky 段头点击:跳转到段首行并居中显示。
+        row.MouseLeftButtonUp += (_, _) => CenterLine(InlineEditor, headerStart);
         var panel = new StackPanel { Orientation = Orientation.Horizontal };
         panel.Children.Add(new TextBlock
         {
@@ -1744,6 +2020,7 @@ public partial class DiffDocumentView : UserControl
         private Brush _activeNumberBrush = Brushes.White;
         private Brush _addedGutterBrush = Brushes.Green;
         private Brush _removedGutterBrush = Brushes.Red;
+        private Brush _collapsedContextBrush = Brushes.Gray;
         private int _activeLine = -1;
         // D10: 行号位数缓存。旧实现每次 MeasureOverride 对整份行列表做两次 LINQ 全量扫描;
         // 位数只随行列表实例变化(RebuildDocuments 每次产出新数组,UpdateLines 是唯一换文档
@@ -1808,6 +2085,9 @@ public partial class DiffDocumentView : UserControl
             _activeNumberBrush = _owner.Brush("CodeLineNumberActiveBrush") ?? _numberBrush;
             _addedGutterBrush = _owner.Brush("EditorGutterAddedBrush") ?? Brushes.Green;
             _removedGutterBrush = _owner.Brush("EditorGutterDeletedBrush") ?? Brushes.Red;
+            _collapsedContextBrush = _owner.Brush("DiffPlaceholderForegroundBrush")
+                ?? _owner.Brush("DiffExpandPlaceholderBrush")
+                ?? _numberBrush;
             InvalidateVisual();
         }
 
@@ -1866,6 +2146,11 @@ public partial class DiffDocumentView : UserControl
 
             var fontSize = _owner._tab?.EditorFontSize ?? 14;
             var typeface = new Typeface(_owner.InlineEditor.FontFamily.Source);
+            var iconFamily = _owner.TryFindResource("IconFontFamily") as FontFamily
+                ?? Application.Current?.TryFindResource("IconFontFamily") as FontFamily;
+            var iconTypeface = iconFamily is null
+                ? typeface
+                : new Typeface(iconFamily, FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);
             var visualLines = GetValidVisualLines(view);
             if (visualLines is null)
             {
@@ -1897,7 +2182,30 @@ public partial class DiffDocumentView : UserControl
                 var dip = VisualTreeHelper.GetDpi(this).PixelsPerDip;
                 var oldText = line.OldLineNumber?.ToString() ?? string.Empty;
                 var newText = line.NewLineNumber?.ToString() ?? string.Empty;
-                if (_mode == DiffNumberMode.Both)
+                if (line.IsCollapsedContext)
+                {
+                    // VS Code keeps the expand affordance in the line-number gutter. The prompt
+                    // itself is a single document row, so draw one glyph per number column and
+                    // deliberately do not synthesize old/new line numbers for hidden rows.
+                    if (_mode == DiffNumberMode.Both)
+                    {
+                        var split = HunkActionGutterWidth + (ActualWidth - HunkActionGutterWidth) / 2;
+                        DrawNumberIcon(drawingContext, Codicons.Ellipsis, split - 8, y,
+                            _collapsedContextBrush, iconTypeface, fontSize, dip);
+                        drawingContext.DrawRectangle(
+                            _owner.Brush("DiffEditorBorderBrush") ?? Brushes.Transparent,
+                            null,
+                            new Rect(split, y + 2, 1, Math.Max(1, visualLine.Height - 4)));
+                        DrawNumberIcon(drawingContext, Codicons.Ellipsis, ActualWidth - 6, y,
+                            _collapsedContextBrush, iconTypeface, fontSize, dip);
+                    }
+                    else
+                    {
+                        DrawNumberIcon(drawingContext, Codicons.Ellipsis, ActualWidth - 6, y,
+                            _collapsedContextBrush, iconTypeface, fontSize, dip);
+                    }
+                }
+                else if (_mode == DiffNumberMode.Both)
                 {
                     var split = HunkActionGutterWidth + (ActualWidth - HunkActionGutterWidth) / 2;
                     DrawNumber(drawingContext, oldText, split - 8, y, brush, typeface, fontSize, dip);
@@ -1930,6 +2238,20 @@ public partial class DiffDocumentView : UserControl
             }
         }
 
+        private static void DrawNumberIcon(DrawingContext drawingContext, string glyph, double right,
+            double y, Brush brush, Typeface typeface, double fontSize, double pixelsPerDip)
+        {
+            var formatted = new FormattedText(
+                glyph,
+                System.Globalization.CultureInfo.CurrentUICulture,
+                FlowDirection.LeftToRight,
+                typeface,
+                fontSize,
+                brush,
+                pixelsPerDip);
+            drawingContext.DrawText(formatted, new Point(Math.Max(0, right - formatted.Width), y));
+        }
+
         private static void DrawNumber(DrawingContext drawingContext, string text, double right,
             double y, Brush brush, Typeface typeface, double fontSize, double pixelsPerDip)
         {
@@ -1960,6 +2282,7 @@ public partial class DiffDocumentView : UserControl
         private Brush _modifiedBrush = Brushes.Transparent;
         private Brush _hoverBrush = Brushes.Transparent;
         private Brush _placeholderBrush = Brushes.Transparent;
+        private Brush _placeholderShadowBrush = Brushes.Transparent;
 
         public DiffLineBackgroundRenderer(IReadOnlyList<DiffRenderLine> lines, DiffDocumentView owner, TextView textView)
         {
@@ -1984,11 +2307,44 @@ public partial class DiffDocumentView : UserControl
             _modifiedBrush = OwnerBrush("DiffModifiedBrush", _modifiedBrush);
             _hoverBrush = OwnerBrush("HoverBrush", _hoverBrush);
             _placeholderBrush = OwnerBrush("DiffUnchangedRegionBrush", _placeholderBrush);
+            _placeholderShadowBrush = CreatePlaceholderShadowBrush(_placeholderBrush);
             _textView.InvalidateLayer(Layer);
         }
 
         private Brush OwnerBrush(string key, Brush fallback) =>
             _owner.TryFindResource(key) as Brush ?? Application.Current?.TryFindResource(key) as Brush ?? fallback;
+
+        private static Brush CreatePlaceholderShadowBrush(Brush fill)
+        {
+            var slash = new SolidColorBrush(Color.FromArgb(85, 118, 121, 124));
+            var slashGeometry = new RectangleGeometry(new Rect(4.5, -2, 1, 14))
+            {
+                Transform = new RotateTransform(45, 5, 5),
+            };
+            return new DrawingBrush
+            {
+                TileMode = TileMode.Tile,
+                Viewport = new Rect(0, 0, 10, 10),
+                ViewportUnits = BrushMappingMode.Absolute,
+                Stretch = Stretch.None,
+                Drawing = new DrawingGroup
+                {
+                    Children =
+                    {
+                        new GeometryDrawing
+                        {
+                            Brush = fill,
+                            Geometry = new RectangleGeometry(new Rect(0, 0, 10, 10)),
+                        },
+                        new GeometryDrawing
+                        {
+                            Brush = slash,
+                            Geometry = slashGeometry,
+                        },
+                    },
+                },
+            };
+        }
 
         public void Draw(TextView textView, DrawingContext drawingContext)
         {
@@ -2010,29 +2366,27 @@ public partial class DiffDocumentView : UserControl
                 var kind = line.Kind;
                 // VisualTop is document-space; the background layer draws in viewport space.
                 var y = visualLine.VisualTop - textView.ScrollOffset.Y;
-                if (line.IsModified)
-                {
-                    // 改行(old 删 + new 增的配对):修正着色覆盖纯增删色。
-                    var modifiedRect = new Rect(0, y, textView.ActualWidth, visualLine.Height);
-                    drawingContext.DrawRectangle(_modifiedBrush, null, modifiedRect);
-                    continue;
-                }
-
                 var background = kind switch
                 {
                     GitDiffLineKind.Added => _addedBrush,
                     GitDiffLineKind.Removed => _removedBrush,
                     GitDiffLineKind.HunkHeader => _headerBrush,
+                    // IsModified identifies a paired replacement, but each side still keeps its
+                    // semantic Added/Removed kind. Prefer that side-specific color above; this
+                    // fallback is only for a future modified row without a concrete side kind.
+                    _ when line.IsModified => _modifiedBrush,
                     _ => null,
                 };
 
                 if (background is null)
                 {
-                    // VS Code-style expandable placeholder bar ("… 展开 N 行未更改内容 …").
-                    if (kind == GitDiffLineKind.None && _lines[index].Text.Contains("…"))
+                    // Only a real unmatched side cell gets the VS Code diagonal shadow fill. A
+                    // collapsed context prompt is already the sole visible representative of the
+                    // hidden run; it must stay on the editor's normal background.
+                    if (!line.IsCollapsedContext && DiffDocumentBuilders.IsPlaceholderLine(line))
                     {
                         drawingContext.DrawRectangle(
-                            _placeholderBrush,
+                            line.IsSideBySidePlaceholder ? _placeholderShadowBrush : _placeholderBrush,
                             null,
                             new Rect(0, y, textView.ActualWidth, visualLine.Height));
                     }
@@ -2173,7 +2527,7 @@ public partial class DiffDocumentView : UserControl
             }
 
             // VS Code-style clickable collapsed-context placeholder ("… 展开 N 行未更改内容 …").
-            if (kind == GitDiffLineKind.None && lines[index].Text.Contains("…"))
+            if (lines[index].IsCollapsedContext)
             {
                 var expandBrush = _owner.Brush("DiffPlaceholderForegroundBrush")
                     ?? _owner.Brush("DiffExpandPlaceholderBrush");
@@ -2220,7 +2574,14 @@ public partial class DiffDocumentView : UserControl
             foreach (var visualLine in visualLines)
             {
                 var index = visualLine.FirstDocumentLine.LineNumber - 1;
-                if (index < 0 || index >= lines.Count || lines[index].IntralineChanges is not { Count: > 0 } ranges)
+                if (index < 0 || index >= lines.Count)
+                {
+                    continue;
+                }
+
+                var line = lines[index];
+                // 仅加/删行参与行内(词级)高亮;上下文与占位行不受此渲染器影响。
+                if (line.Kind is not (GitDiffLineKind.Added or GitDiffLineKind.Removed))
                 {
                     continue;
                 }
@@ -2231,10 +2592,20 @@ public partial class DiffDocumentView : UserControl
                     continue;
                 }
 
-                var isRemoved = lines[index].Kind == GitDiffLineKind.Removed;
+                var isRemoved = line.Kind == GitDiffLineKind.Removed;
                 var fill = _owner.Brush(isRemoved ? "DiffRemovedIntralineBrush" : "DiffAddedIntralineBrush");
                 if (fill is null)
                 {
+                    continue;
+                }
+
+                // 纯新增/纯删除行(整行都是新的,没有词级精化区间)整行应用更强的 intraline
+                // 高亮,以区别于仅浅色的基础行背景(VS Code 对整行新增同样整行强绿色)。
+                if (line.IntralineChanges is not { Count: > 0 } ranges)
+                {
+                    var y = visualLine.VisualTop - textView.ScrollOffset.Y;
+                    drawingContext.DrawRectangle(fill, null,
+                        new Rect(0, y, textView.ActualWidth, visualLine.Height));
                     continue;
                 }
 

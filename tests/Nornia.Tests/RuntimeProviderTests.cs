@@ -121,6 +121,52 @@ public sealed class RuntimeProviderTests
 
         Assert.Equal("14.51.36247.0", RuntimeViewModel.SelectAvailableVersion(runtime, packages, resolved));
     }
+
+    [Fact]
+    public void RestrictToLatestInstalls_KeepsAvailableOnlyOnNewestSideBySideInstance()
+    {
+        // Windows App Runtime 同包多实例(6000.318~6000.457 全解析到 Microsoft.WindowsAppRuntime.1.6):
+        // 只有最新构建(x86/x64 并列)保留可用更新,旧 side-by-side 构建不显示虚假可用更新。
+        var newestX64 = new CoreRuntime(
+            Guid.NewGuid(), "Windows App Runtime", "6000.457.2140.0", @"C:\Program Files\WindowsApps\A", "X64", "WindowsAppRuntimeProvider", 0, RuntimeStatus.Installed);
+        var newestX86 = new CoreRuntime(
+            Guid.NewGuid(), "Windows App Runtime", "6000.457.2140.0", @"C:\Program Files\WindowsApps\B", "X86", "WindowsAppRuntimeProvider", 0, RuntimeStatus.Installed);
+        var older = new CoreRuntime(
+            Guid.NewGuid(), "Windows App Runtime", "6000.318.2304.0", @"C:\Program Files\WindowsApps\C", "X64", "WindowsAppRuntimeProvider", 0, RuntimeStatus.Installed);
+        var annotated = new[]
+        {
+            (Runtime: newestX64, GroupKey: "Microsoft.WindowsAppRuntime.1.6", Available: (string?)"1.6.9"),
+            (Runtime: newestX86, GroupKey: "Microsoft.WindowsAppRuntime.1.6", Available: (string?)"1.6.9"),
+            (Runtime: older, GroupKey: "Microsoft.WindowsAppRuntime.1.6", Available: (string?)"1.6.9"),
+        };
+
+        var result = RuntimeViewModel.RestrictToLatestInstalls(annotated);
+
+        Assert.Equal(2, result.Count);
+        Assert.All(result, item => Assert.Equal("6000.457.2140.0", item.Runtime.Version));
+        Assert.All(result, item => Assert.Equal("1.6.9", item.Available));
+    }
+
+    [Fact]
+    public void RestrictToLatestInstalls_DifferentMajorPackagesKeepTheirOwnUpdate()
+    {
+        // .NET 等组件不同 major 解析为不同 winget 包:各自组内都是最新,互不吞掉可用更新。
+        var net8 = new CoreRuntime(
+            Guid.NewGuid(), ".NET Runtime", "8.0.11", "C:\\Program Files\\dotnet", "X64", "DotNetRuntimeProvider", 0, RuntimeStatus.Installed);
+        var net9 = new CoreRuntime(
+            Guid.NewGuid(), ".NET Runtime", "9.0.0", "C:\\Program Files\\dotnet", "X64", "DotNetRuntimeProvider", 0, RuntimeStatus.Installed);
+        var annotated = new[]
+        {
+            (Runtime: net8, GroupKey: "Microsoft.DotNet.Runtime.8", Available: (string?)"8.0.12"),
+            (Runtime: net9, GroupKey: "Microsoft.DotNet.Runtime.9", Available: (string?)"9.0.1"),
+        };
+
+        var result = RuntimeViewModel.RestrictToLatestInstalls(annotated);
+
+        Assert.Equal(2, result.Count);
+        Assert.Equal("8.0.12", result.Single(item => item.Runtime.Version == "8.0.11").Available);
+        Assert.Equal("9.0.1", result.Single(item => item.Runtime.Version == "9.0.0").Available);
+    }
 }
 
 /// <summary>Creates a unique temp directory and removes it (recursively) on dispose.</summary>

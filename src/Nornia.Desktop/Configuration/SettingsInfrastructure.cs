@@ -149,8 +149,11 @@ public sealed class SettingsDocumentStore : ISettingsDocumentStore, IDisposable
         var directory = Path.GetDirectoryName(path)!;
         Directory.CreateDirectory(directory);
         var bytes = encoding.GetBytes(text);
-        var maxRetries = 3;
-        var retryDelay = 80;
+        // 6 次指数退避(100→1600ms,总计约 3.1s):2 核 CI 全量套件并行下 %TEMP% 上的
+        // 共享Violation/替换冲突远超旧预算(3 次/560ms);提交失败会静默返回 FileError,
+        // 订阅者收不到变更,设置"实时生效"测试表现为永久超时,因此必须给足重试。
+        var maxRetries = 6;
+        var retryDelay = 100;
         for (var attempt = 0; attempt < maxRetries; attempt++)
         {
             var temporary = Path.Combine(directory, $".{Path.GetFileName(path)}.{Guid.NewGuid():N}.tmp");

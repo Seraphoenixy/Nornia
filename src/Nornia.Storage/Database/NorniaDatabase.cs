@@ -183,6 +183,9 @@ public sealed class NorniaDatabase(string databasePath) : ISqliteConnectionFacto
             CREATE UNIQUE INDEX IF NOT EXISTS ux_projects_path ON projects(path);
             CREATE UNIQUE INDEX IF NOT EXISTS ux_environment_profiles_project_id ON environment_profiles(project_id);
             CREATE INDEX IF NOT EXISTS ix_packages_id_architecture ON packages(id, architecture);
+            CREATE TABLE IF NOT EXISTS scan_state (
+                kind TEXT PRIMARY KEY, scanned_at INTEGER NOT NULL,
+                duration_ms INTEGER NOT NULL DEFAULT 0, fingerprint TEXT NOT NULL DEFAULT '');
 
             -- 日志类数据已全部移出数据库(操作日志整体移除;环境修复明细改为数据目录下的文件)。
             -- 旧版本库中残留的三张表在此清理;全新库上为无操作。

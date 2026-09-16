@@ -39,13 +39,15 @@ public sealed class TerminalSession : IAsyncDisposable
     private Timer? _outputPublishTimer;
     private ConPty.Instance? _pty;
     private TerminalScreen? _screen;
+    private readonly IUiLogService? _log;
 
-    internal TerminalSession(ShellProfile profile, string workingDirectory, Process? process)
+    internal TerminalSession(ShellProfile profile, string workingDirectory, Process? process, IUiLogService? log = null)
     {
         Id = Guid.NewGuid();
         Profile = profile;
         WorkingDirectory = workingDirectory;
         _process = process;
+        _log = log;
         State = TerminalSessionState.Running;
     }
 
@@ -68,9 +70,9 @@ public sealed class TerminalSession : IAsyncDisposable
 
     public bool CanAcceptInput => State == TerminalSessionState.Running && IsInteractive;
 
-    internal static TerminalSession CreateFailed(ShellProfile profile, string workingDirectory, string reason)
+    internal static TerminalSession CreateFailed(ShellProfile profile, string workingDirectory, string reason, IUiLogService? log = null)
     {
-        var session = new TerminalSession(profile, workingDirectory, null);
+        var session = new TerminalSession(profile, workingDirectory, null, log);
         session.State = TerminalSessionState.Failed;
         session.FailureReason = reason;
         session.StartupWarning = reason;
@@ -135,7 +137,15 @@ public sealed class TerminalSession : IAsyncDisposable
                 // 嵌入式回退模式同样把输出喂给屏幕模型, 批量提交避免每字符触发渲染导致卡顿
                 if (_screen is not null)
                 {
-                    _screen.FeedTextBatch(text);
+                    try
+                    {
+                        _screen.FeedTextBatch(text);
+                    }
+                    catch (Exception exception)
+                    {
+                        // 与 PumpPtyAsync 同策略:单块解析失败不得杀死输出泵(终端冻结)。
+                        _log?.Write("WARNING", $"终端屏幕解析单块失败(已跳过该块渲染): {exception.Message}");
+                    }
                 }
 
                 ScheduleOutputChanged();
@@ -214,7 +224,17 @@ public sealed class TerminalSession : IAsyncDisposable
                 var text = new string(chars, 0, count);
                 if (_screen is not null)
                 {
-                    _screen.FeedTextBatch(text);
+                    try
+                    {
+                        _screen.FeedTextBatch(text);
+                    }
+                    catch (Exception exception)
+                    {
+                        // 解析单块失败只丢这一块的屏显渲染,绝不能让泵任务死亡——泵一死
+                        // 终端就永久冻结(输入仍发给 shell,但一切回显/历史召回都不可见,
+                        // 表现为"方向键不能回到历史"),且再无任何错误可见。
+                        _log?.Write("WARNING", $"终端屏幕解析单块失败(已跳过该块渲染): {exception.Message}");
+                    }
                 }
                 else
                 {
@@ -389,15 +409,24 @@ public sealed class TerminalService : ITerminalService
         string ptyError = string.Empty;
         if (TryConPtyFirst && ConPty.TryStartAttached(profile.Executable, profile.Arguments, workDir, DefaultColumns, DefaultRows, out var pty, out var attachedProcess, out ptyError))
         {
-            var session = new TerminalSession(profile, workDir, attachedProcess!);
+            var session = new TerminalSession(profile, workDir, attachedProcess!, _log);
             session.AttachPseudoConsole(pty!, DefaultColumns, DefaultRows);
             _sessions.Add(session);
             var output = pty!.Output;
             var firstOutput = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             _ = Task.Run(async () =>
             {
-                using var reader = new StreamReader(output, Encoding.UTF8, true, 4096, leaveOpen: false);
-                await session.PumpPtyAsync(reader, () => firstOutput.TrySetResult());
+                try
+                {
+                    using var reader = new StreamReader(output, Encoding.UTF8, true, 4096, leaveOpen: false);
+                    await session.PumpPtyAsync(reader, () => firstOutput.TrySetResult());
+                }
+                catch (Exception exception)
+                {
+                    // 泵任务必须被观察:否则退出期的 IO 异常会以 UnobservedTaskException 形式
+                    // 落到终结器线程。正常退出路径(reader 结束/Disposed)已在泵内吞掉。
+                    _log?.Write("WARNING", $"终端输出泵结束: {exception.Message}");
+                }
             });
             try { attachedProcess!.EnableRaisingEvents = true; } catch (InvalidOperationException) { session.MarkExited(); }
             attachedProcess!.Exited += (_, _) => session.MarkExited();
@@ -471,7 +500,7 @@ public sealed class TerminalService : ITerminalService
 
     private TerminalSession CreateFailedSession(ShellProfile profile, string workingDirectory, string reason)
     {
-        var session = TerminalSession.CreateFailed(profile, workingDirectory, reason);
+        var session = TerminalSession.CreateFailed(profile, workingDirectory, reason, _log);
         _sessions.Add(session);
         return session;
     }

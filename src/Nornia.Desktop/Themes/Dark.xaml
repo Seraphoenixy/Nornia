@@ -15,6 +15,12 @@
   <SolidColorBrush x:Key="PanelBrush" Color="#191A1B" />
   <SolidColorBrush x:Key="CardBrush" Color="#242526" />
   <SolidColorBrush x:Key="InputBrush" Color="#191A1B" />
+  <!-- Fluent 分层阶梯:Dark 下编辑器为最暗层(内容层),Card 为亮一档的浮面。
+       LayerBrush/LayerAltBrush 暴露阶梯供新视图消费,既有表面值保持 VS Code 2026 对齐不动。 -->
+  <Color x:Key="LayerColor">#242526</Color>
+  <Color x:Key="LayerAltColor">#2C2D2E</Color>
+  <SolidColorBrush x:Key="LayerBrush" Color="{StaticResource LayerColor}" />
+  <SolidColorBrush x:Key="LayerAltBrush" Color="{StaticResource LayerAltColor}" />
   <!-- text-caret / cursor color on InputBrush surfaces -->
   <SolidColorBrush x:Key="CaretBrush" Color="#BBBEBF" />
   <SolidColorBrush x:Key="HoverBrush" Color="#242526" />

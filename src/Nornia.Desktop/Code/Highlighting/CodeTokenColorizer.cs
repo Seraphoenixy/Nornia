@@ -34,6 +34,8 @@ public sealed class CodeTokenColorizer : DocumentColorizingTransformer
 
     private readonly Func<string, Brush?> _brush;
     private readonly Func<FontFamily> _fontFamily;
+    // 构造线程的 Dispatcher(宿主视图线程):主题广播归组用,见 RefreshThemeForBroadcast。
+    private readonly System.Windows.Threading.Dispatcher _dispatcher = System.Windows.Threading.Dispatcher.CurrentDispatcher;
     private readonly Dictionary<string, Brush?> _brushCache = new(StringComparer.Ordinal);
     private readonly Dictionary<(string Family, bool Italic, bool Bold), Typeface> _typefaceCache = new();
     private bool _paletteCurrent;
@@ -54,6 +56,20 @@ public sealed class CodeTokenColorizer : DocumentColorizingTransformer
     /// <summary>主题变化时重解析冻结调色板(宿主视图主题路径或 ThemeEvents 广播触发)。
     /// 只解析 <see cref="CachedBrushNames"/> 中的名称;未登记的名称在首次取用时惰性补齐。</summary>
     public void RefreshTheme() => RebuildPalette();
+
+    /// <summary>ThemeEvents 广播入口(ColorizerThemeWatcher 调用):生产环境颜色化器恒建于
+    /// UI 线程,行为不变;测试进程里并行测试类可能从工作线程 Raise——非宿主线程只归组回
+    /// 宿主 Dispatcher,避免跨线程执行 TryFindResource 等线程亲和调用。</summary>
+    internal void RefreshThemeForBroadcast()
+    {
+        if (!_dispatcher.CheckAccess())
+        {
+            _dispatcher.InvokeAsync(RefreshTheme);
+            return;
+        }
+
+        RefreshTheme();
+    }
 
     private void RebuildPalette()
     {
@@ -109,6 +125,14 @@ public sealed class CodeTokenColorizer : DocumentColorizingTransformer
                 .ToDictionary(group => group.Key,
                     group => (IReadOnlyList<CodeTokenSpan>)group.ToArray())
             ?? new Dictionary<int, IReadOnlyList<CodeTokenSpan>>();
+    }
+
+    /// <summary>Directly installs a pre-built line → token-span index (key = AvalonEdit document
+    /// line number, 1-based). The diff view uses this to feed per-pane snapshots whose token lines
+    /// are mapped back from clean per-side tokenisation, so each diff line matches 正文 colours.</summary>
+    public void SetSnapshotByLine(IReadOnlyDictionary<int, IReadOnlyList<CodeTokenSpan>> byLine)
+    {
+        _byLine = byLine ?? new Dictionary<int, IReadOnlyList<CodeTokenSpan>>();
     }
 
     protected override void ColorizeLine(DocumentLine line)
@@ -226,7 +250,7 @@ internal static class ColorizerThemeWatcher
 
         foreach (var colorizer in live)
         {
-            colorizer.RefreshTheme();
+            colorizer.RefreshThemeForBroadcast();
         }
     }
 }

@@ -110,7 +110,7 @@
       <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconFolderOpened}" FontFamily="{StaticResource IconFontFamily}" Command="{Binding DataContext.ChooseProjectCommand, RelativeSource={RelativeSource AncestorType=views:ExplorerSidebarView}}" Margin="0" AutomationProperties.Name="打开项目目录" />
     </controls:SidebarShell.HeaderActions>
     <controls:SidebarShell.BodyContent>
-      <ListBox ItemsSource="{Binding WorkspaceTreeRows}" SelectedItem="{Binding SelectedTreeRow, Mode=TwoWay}" ItemContainerStyle="{StaticResource SidebarRowItemStyle}" Background="Transparent" BorderThickness="0" Padding="0,8,8,0" ScrollViewer.HorizontalScrollBarVisibility="Disabled" VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling" MouseEnter="WorkspaceRows_MouseEnter" MouseLeave="WorkspaceRows_MouseLeave">
+      <ListBox ItemsSource="{Binding WorkspaceTreeRows}" SelectedItem="{Binding SelectedTreeRow, Mode=TwoWay}" ItemContainerStyle="{StaticResource SidebarRowItemStyle}" Background="Transparent" BorderThickness="0" Padding="0,8,8,0" ScrollViewer.HorizontalScrollBarVisibility="Disabled" VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling" VirtualizingPanel.ScrollUnit="Pixel" MouseEnter="WorkspaceRows_MouseEnter" MouseLeave="WorkspaceRows_MouseLeave">
         <ListBox.Resources>
           <DataTemplate DataType="{x:Type local:WorkspaceFolderRow}"><ContentControl Content="{Binding}" ContentTemplate="{StaticResource WorkspaceFolderRowTemplate}" /></DataTemplate>
           <DataTemplate DataType="{x:Type local:WorkspaceFileRow}"><ContentControl Content="{Binding}" ContentTemplate="{StaticResource WorkspaceFileRowTemplate}" /></DataTemplate>

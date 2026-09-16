@@ -45,6 +45,7 @@ public sealed class TerminalSurfaceControl : FrameworkElement
     private int _pendingColumns;
     private int _pendingRows;
     private bool _hasFocus;
+    private volatile bool _followCursor;
     private (int Row, int Column)? _selectionAnchor;
     private (int Row, int Column)? _selectionEnd;
 
@@ -150,6 +151,7 @@ public sealed class TerminalSurfaceControl : FrameworkElement
     {
         var control = (TerminalSurfaceControl)source;
         control._scrollOffset = 0;
+        control._followCursor = false;
         control._selectionAnchor = null;
         control._selectionEnd = null;
         control._lastColumns = -1;
@@ -161,19 +163,31 @@ public sealed class TerminalSurfaceControl : FrameworkElement
         // Screen — guard both sides to avoid subscribing/unsubscribing on null.
         if (args.OldValue is TerminalSession oldSession && oldSession.Screen is { } oldScreen)
         {
-            oldScreen.Changed -= control.RequestRender;
+            oldScreen.Changed -= control.OnScreenChanged;
         }
 
         if (args.NewValue is TerminalSession newSession && newSession.Screen is { } screen)
         {
-            screen.Changed += control.RequestRender;
+            screen.Changed += control.OnScreenChanged;
             control.QueueResize();
-            control.RequestRender();
         }
+
+        // A null/failed session still needs to invalidate the retained DrawingVisual. Without this
+        // repaint, closing the last terminal leaves the previous session's pixels visible beneath
+        // the empty-state layer even though the binding has already changed to null.
+        control.RequestRender();
     }
 
     private void OnThemeChanged(object? sender, AppTheme theme)
     {
+        // 非宿主线程的广播归组回宿主 Dispatcher(见 CodeDocumentView.OnThemeChanged):
+        // 纪元与刷子缓存字段的写也必须落在宿主线程,RequestRender 依赖同线程状态。
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.InvokeAsync(() => OnThemeChanged(sender, theme));
+            return;
+        }
+
         // 主题纪元 +1:行缓存按纪元失效,主题刷延迟重新解析。
         _themeEpoch++;
         _backgroundBrush = null;
@@ -201,8 +215,20 @@ public sealed class TerminalSurfaceControl : FrameworkElement
         Dispatcher.BeginInvoke(DispatcherPriority.Render, new Action(() =>
         {
             _renderPending = false;
+            if (_followCursor)
+            {
+                ScrollToCursor(Session?.Screen, requestRender: false);
+            }
+
             InvalidateVisual();
         }));
+    }
+
+    private void OnScreenChanged()
+    {
+        // Screen changes arrive from the ConPTY pump thread. RequestRender marshals the follow-up
+        // cursor calculation back to the WPF dispatcher, where the control's scroll state belongs.
+        RequestRender();
     }
 
     // ===== metrics + resize propagation =====
@@ -210,9 +236,13 @@ public sealed class TerminalSurfaceControl : FrameworkElement
     private void UpdateCellMetrics()
     {
         var typeface = new Typeface(MonoFont(), FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);
+        var pixelsPerDip = VisualTreeHelper.GetDpi(this).PixelsPerDip;
+        // Match VS Code/xterm's font measurement: the terminal grid is based on the
+        // natural advance of a representative monospace glyph, not on a fixed width and
+        // not on a later horizontal transform of the rendered text.
         var sample = new FormattedText(
-            "M", CultureInfo.CurrentUICulture, FlowDirection.LeftToRight, typeface, TerminalFontSize,
-            Brushes.Black, VisualTreeHelper.GetDpi(this).PixelsPerDip);
+            "X", CultureInfo.CurrentUICulture, FlowDirection.LeftToRight, typeface, TerminalFontSize,
+            Brushes.Transparent, pixelsPerDip);
         _cellWidth = Math.Max(4, sample.WidthIncludingTrailingWhitespace);
         _cellHeight = Math.Max(8, sample.Height);
     }
@@ -225,7 +255,7 @@ public sealed class TerminalSurfaceControl : FrameworkElement
         }
 
         var columns = Math.Clamp((int)(ActualWidth / _cellWidth), 20, 500);
-        var rows = Math.Clamp((int)(ActualHeight / _cellHeight), 5, 200);
+        var rows = Math.Clamp((int)(ActualHeight / _cellHeight), TerminalScreen.MinimumRows, TerminalScreen.MaximumRows);
         if (columns != _lastColumns || rows != _lastRows)
         {
             _lastColumns = columns;
@@ -241,10 +271,14 @@ public sealed class TerminalSurfaceControl : FrameworkElement
     {
         if (!string.IsNullOrWhiteSpace(TerminalFontFamily))
         {
-            return new FontFamily(TerminalFontFamily);
+            // Match VS Code's terminal font resolution: always append an explicit monospace
+            // fallback. If the configured family is not installed, WPF must not silently fall
+            // back to a proportional UI font while the grid is measured from a monospace glyph.
+            return new FontFamily(FontCatalog.ComposeRenderingFamily(TerminalFontFamily));
         }
 
-        return (Application.Current?.TryFindResource("MonoFontFamily") as FontFamily) ?? new FontFamily("Consolas");
+        return (Application.Current?.TryFindResource("MonoFontFamily") as FontFamily)
+            ?? new FontFamily(FontCatalog.ComposeRenderingFamily(null));
     }
 
     // ===== rendering =====
@@ -260,6 +294,7 @@ public sealed class TerminalSurfaceControl : FrameworkElement
         drawingContext.DrawRectangle(EnsureBackground(), null, new Rect(0, 0, ActualWidth, ActualHeight));
 
         var visibleRows = Math.Max(0, (int)(ActualHeight / _cellHeight));
+        _scrollOffset = ClampScrollOffset(_scrollOffset, screen, visibleRows);
         var topIndex = _scrollOffset + visibleRows - 1;
 
         for (var visualRow = 0; visualRow < visibleRows; visualRow++)
@@ -325,15 +360,16 @@ public sealed class TerminalSurfaceControl : FrameworkElement
             }
         }
 
-        // Cursor block when focused + visible.
-        if (_hasFocus && screen.CursorVisible && _scrollOffset == 0)
+        // Cursor block when focused + visible. The cursor can be above the bottom screen row
+        // (for example in an alternate-buffer application), so calculate its position from the
+        // same newest-first line mapping used by the renderer instead of only drawing at offset 0.
+        if (_hasFocus && screen.CursorVisible && visibleRows > 0)
         {
             var (cursorRow, cursorColumn) = screen.Cursor;
-            // The screen can have more rows than the viewport while layout is settling.  Render
-            // the cursor in the same bottom-aligned coordinate system as the text rows.
-            var visualCursorRow = cursorRow - Math.Max(0, screen.Rows - visibleRows);
+            var cursorLineFromBottom = screen.Rows - 1 - cursorRow;
+            var visualCursorRow = topIndex - cursorLineFromBottom;
             var y = visualCursorRow * _cellHeight;
-            if (visualCursorRow >= 0 && y < ActualHeight)
+            if (visualCursorRow >= 0 && visualCursorRow < visibleRows && y < ActualHeight)
             {
                 drawingContext.DrawRectangle(EnsureCursor(), null, new Rect(cursorColumn * _cellWidth, y, _cellWidth, _cellHeight));
             }
@@ -343,8 +379,8 @@ public sealed class TerminalSurfaceControl : FrameworkElement
     }
 
     /// <summary>把一行渲染进独立 DrawingVisual 并缓存(内容画在 y=0,位置由调用方的
-    /// 平移变换定位 → 滚动无需失效缓存,T2)。背景 run + 单段 FormattedText;前景色按
-    /// 同色 run 合并为一次 <c>SetForegroundBrush(start,count)</c>(旧实现逐格一次)。</summary>
+    /// 平移变换定位 → 滚动无需失效缓存,T2)。背景 run 按网格 + 前景文本按颜色分段,
+    /// 文本使用与网格相同字体的自然 advance 绘制。</summary>
     private DrawingVisual? RenderLine(TerminalCell[] line, string text)
     {
         var typeface = EnsureTypeface();
@@ -378,34 +414,98 @@ public sealed class TerminalSurfaceControl : FrameworkElement
             {
                 hasText = true;
                 var dpi = VisualTreeHelper.GetDpi(this).PixelsPerDip;
-                var formatted = new FormattedText(text, CultureInfo.CurrentUICulture, FlowDirection.LeftToRight, typeface, TerminalFontSize, foreground, dpi);
-                // 前景色按 run 合并:同色连续段一次 SetForegroundBrush(start,count)。
-                var colorRunStart = 0;
-                var colorRun = 0;
-                var inColorRun = false;
-                for (var column = 0; column <= line.Length; column++)
+                // 光标、背景和选区都按"列×_cellWidth"定位;文本从同一网格列起点自然绘制,
+                // 不通过 ScaleTransform 拉伸字形。宽字符单独绘制并占两列;宽字符的 \0
+                // 占位格被跳过。
+                var segmentStartCell = -1;
+                var segmentStartText = -1;
+                var segmentColor = 0;
+                var textIndex = 0;
+                var column = 0;
+                void FlushTextSegment(int endColumn, int endTextIndex)
                 {
-                    var color = column < line.Length ? line[column].Foreground : 0;
-                    if (inColorRun && color != colorRun)
+                    if (segmentStartCell < 0)
                     {
-                        formatted.SetForegroundBrush(ColorBrush(colorRun), colorRunStart, column - colorRunStart);
-                        inColorRun = false;
+                        return;
                     }
 
-                    if (!inColorRun && color != 0)
+                    var safeEndText = Math.Clamp(endTextIndex, segmentStartText, text.Length);
+                    var segment = text[segmentStartText..safeEndText];
+                    if (segment.Length > 0)
                     {
-                        colorRun = color;
-                        colorRunStart = column;
-                        inColorRun = true;
+                        var brush = segmentColor != 0 ? ColorBrush(segmentColor) : foreground;
+                        DrawTextRun(context, segment, segmentStartCell, typeface, brush, dpi);
                     }
+
+                    segmentStartCell = -1;
+                    segmentStartText = -1;
                 }
 
-                context.DrawText(formatted, new Point(0, 0));
+                while (column < line.Length && textIndex < text.Length)
+                {
+                    var cell = line[column];
+                    if (cell.Char == '\0')
+                    {
+                        // Internal NULs are real empty cells (or the continuation cell of a wide
+                        // character). The latter is consumed together with its head below.
+                        FlushTextSegment(column, textIndex);
+                        column++;
+                        textIndex++;
+                        continue;
+                    }
+
+                    var cellWidth = cell.Width == 2 ? 2 : 1;
+                    if (cellWidth == 2)
+                    {
+                        FlushTextSegment(column, textIndex);
+                        var brush = cell.Foreground != 0 ? ColorBrush(cell.Foreground) : foreground;
+                        DrawTextRun(context, cell.Char.ToString(), column, typeface, brush, dpi);
+                        column += 2;
+                        // GetRenderedLine retains the internal NUL continuation when another
+                        // character follows the wide glyph, but trims it when this is the last
+                        // visible cell.
+                        textIndex = Math.Min(text.Length, textIndex + 2);
+                        continue;
+                    }
+
+                    if (segmentStartCell >= 0 && cell.Foreground != segmentColor)
+                    {
+                        FlushTextSegment(column, textIndex);
+                    }
+
+                    if (segmentStartCell < 0)
+                    {
+                        segmentStartCell = column;
+                        segmentStartText = textIndex;
+                        segmentColor = cell.Foreground;
+                    }
+
+                    column++;
+                    textIndex++;
+                }
+
+                FlushTextSegment(column, textIndex);
             }
         }
 
         // 空行返回 null:缓存"已知空"状态,避免每帧 GetLine + 字符串构造。
         return hasBackground || hasText ? visual : null;
+    }
+
+    /// <summary>使用与 UpdateCellMetrics 相同的 Typeface/字号/DPI 绘制文本,因此字符
+    /// advance 与终端网格一致,字形本身不做水平缩放。</summary>
+    private void DrawTextRun(DrawingContext context, string text, int startColumn,
+        Typeface typeface, Brush brush, double pixelsPerDip)
+    {
+        if (text.Length == 0)
+        {
+            return;
+        }
+
+        var formatted = new FormattedText(
+            text, CultureInfo.CurrentUICulture, FlowDirection.LeftToRight, typeface,
+            TerminalFontSize, brush, pixelsPerDip);
+        context.DrawText(formatted, new Point(startColumn * _cellWidth, 0));
     }
 
     private Typeface EnsureTypeface()
@@ -527,95 +627,76 @@ public sealed class TerminalSurfaceControl : FrameworkElement
         }
 
         var control = (Keyboard.Modifiers & ModifierKeys.Control) != 0;
-        var shift = (Keyboard.Modifiers & ModifierKeys.Shift) != 0;
 
-        switch (e.Key)
+        // Ctrl 组合是仅有的端侧特例(复制/粘贴/控制字符);Ctrl+方向键等其余组合键
+        // 故意落到下方查表按普通键透传,与既有行为一致。
+        if (control)
         {
-            case Key.Enter:
-                session.WriteTextAsync("\r");
-                e.Handled = true;
-                return;
-            case Key.Back:
-                session.WriteTextAsync("\x7f");
-                e.Handled = true;
-                return;
-            case Key.Tab:
-                session.WriteTextAsync(shift ? "\x1b[Z" : "\t");
-                e.Handled = true;
-                return;
-            case Key.Escape:
-                session.WriteTextAsync("\x1b");
-                e.Handled = true;
-                return;
-            case Key.Up:
-                session.WriteTextAsync("\x1b[A");
-                e.Handled = true;
-                return;
-            case Key.Down:
-                session.WriteTextAsync("\x1b[B");
-                e.Handled = true;
-                return;
-            case Key.Right:
-                session.WriteTextAsync("\x1b[C");
-                e.Handled = true;
-                return;
-            case Key.Left:
-                session.WriteTextAsync("\x1b[D");
-                e.Handled = true;
-                return;
-            case Key.Home:
-                session.WriteTextAsync("\x1b[H");
-                e.Handled = true;
-                return;
-            case Key.End:
-                session.WriteTextAsync("\x1b[F");
-                e.Handled = true;
-                return;
-            case Key.PageUp:
-                session.WriteTextAsync("\x1b[5~");
-                e.Handled = true;
-                return;
-            case Key.PageDown:
-                session.WriteTextAsync("\x1b[6~");
-                e.Handled = true;
-                return;
-            case Key.Delete:
-                session.WriteTextAsync("\x1b[3~");
-                e.Handled = true;
-                return;
-            case Key.C when control:
-                if (CopySelection())
-                {
-                    ClearSelection();
-                }
-                else
-                {
-                    session.WriteTextAsync("\x03");
-                }
+            switch (e.Key)
+            {
+                case Key.C:
+                    if (CopySelection())
+                    {
+                        ClearSelection();
+                    }
+                    else
+                    {
+                        WriteInput(session, "\x03");
+                    }
 
-                e.Handled = true;
-                return;
-            case Key.V when control:
-                PasteClipboard();
-                e.Handled = true;
-                return;
+                    e.Handled = true;
+                    return;
+                case Key.V:
+                    PasteClipboard();
+                    e.Handled = true;
+                    return;
+                case >= Key.A and <= Key.Z:
+                    WriteInput(session, ((char)(e.Key - Key.A + 1)).ToString());
+                    e.Handled = true;
+                    return;
+            }
         }
 
-        if (control && e.Key is >= Key.A and <= Key.Z)
+        // 纯透传:VT 序列原样写给 shell——历史导航、光标移动、清行全部由 shell 原生处理,
+        // 端侧不加任何前缀/改写(改写会重置 PSReadLine 的历史枚举,表现为只能召回最近一条)。
+        var sequence = e.Key switch
         {
-            session.WriteTextAsync(((char)(e.Key - Key.A + 1)).ToString());
-            e.Handled = true;
+            Key.Tab when (Keyboard.Modifiers & ModifierKeys.Shift) != 0 => "\x1b[Z",
+            Key.Tab => "\t",
+            Key.Enter => "\r",
+            Key.Back => "\x7f",
+            Key.Escape => "\x1b",
+            Key.Up => ArrowUpSequence,
+            Key.Down => ArrowDownSequence,
+            Key.Right => "\x1b[C",
+            Key.Left => "\x1b[D",
+            Key.Home => "\x1b[H",
+            Key.End => "\x1b[F",
+            Key.PageUp => "\x1b[5~",
+            Key.PageDown => "\x1b[6~",
+            Key.Delete => "\x1b[3~",
+            _ => null,
+        };
+
+        if (sequence is null)
+        {
+            base.OnKeyDown(e);
             return;
         }
 
-        base.OnKeyDown(e);
+        WriteInput(session, sequence);
+        e.Handled = true;
     }
+
+    /// <summary>标准 VT 方向键序列(CSI A/B):直接透传给 shell,不加任何前缀处理。</summary>
+    internal const string ArrowUpSequence = "\x1b[A";
+    internal const string ArrowDownSequence = "\x1b[B";
 
     protected override void OnTextInput(TextCompositionEventArgs e)
     {
         if (Session is not null && !e.Handled && !string.IsNullOrEmpty(e.Text))
         {
-            Session.WriteTextAsync(e.Text);
+            WriteInput(Session, e.Text);
             e.Handled = true;
             return;
         }
@@ -624,6 +705,60 @@ public sealed class TerminalSurfaceControl : FrameworkElement
     }
 
     // ===== selection =====
+
+    /// <summary>输入发生时回到当前光标所在位置。鼠标滚轮允许用户查看历史,但继续输入
+    /// 必须恢复交互区,否则字符已经写入 shell 而视图仍停在旧的滚动缓冲区。</summary>
+    private void WriteInput(TerminalSession session, string text)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return;
+        }
+
+        _followCursor = true;
+        ScrollToCursor(session.Screen);
+        session.WriteTextAsync(text);
+    }
+
+    private void ScrollToCursor(TerminalScreen? screen, bool requestRender = true)
+    {
+        if (screen is null)
+        {
+            return;
+        }
+
+        var visibleRows = VisibleRowCount();
+        var (cursorRow, _) = screen.Cursor;
+        var offset = ScrollOffsetForCursor(cursorRow, screen.Rows, screen.TotalLines, visibleRows);
+        if (offset == _scrollOffset)
+        {
+            return;
+        }
+
+        _scrollOffset = offset;
+        if (requestRender)
+        {
+            RequestRender();
+        }
+    }
+
+    private int VisibleRowCount() => Math.Max(1, (int)(ActualHeight / _cellHeight));
+
+    private static int ClampScrollOffset(int offset, TerminalScreen screen, int visibleRows) =>
+        Math.Clamp(offset, 0, Math.Max(0, screen.TotalLines - Math.Max(1, visibleRows)));
+
+    /// <summary>返回能让光标落入视口的滚动偏移;偏移 0 表示当前屏幕底部。</summary>
+    internal static int ScrollOffsetForCursor(int cursorRow, int screenRows, int totalLines, int visibleRows)
+    {
+        if (screenRows <= 0 || totalLines <= 0 || visibleRows <= 0)
+        {
+            return 0;
+        }
+
+        var cursorLineFromBottom = Math.Clamp(screenRows - 1 - cursorRow, 0, screenRows - 1);
+        var maximumOffset = Math.Max(0, totalLines - visibleRows);
+        return Math.Clamp(cursorLineFromBottom, 0, maximumOffset);
+    }
 
     private void OnSurfaceMouseDown(object sender, MouseButtonEventArgs e)
     {
@@ -693,6 +828,7 @@ public sealed class TerminalSurfaceControl : FrameworkElement
         if (newOffset != _scrollOffset)
         {
             _scrollOffset = newOffset;
+            _followCursor = false;
             // T2: 行视觉内容与 y 解耦(平移变换定位)后,滚动不再需要让行缓存失效。
         }
 
@@ -822,7 +958,7 @@ public sealed class TerminalSurfaceControl : FrameworkElement
         var text = System.Windows.Clipboard.ContainsText() ? System.Windows.Clipboard.GetText() : string.Empty;
         if (!string.IsNullOrEmpty(text))
         {
-            session.WriteTextAsync(text);
+            WriteInput(session, text);
         }
     }
 

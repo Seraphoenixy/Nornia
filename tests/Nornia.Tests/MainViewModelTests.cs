@@ -45,16 +45,15 @@ public sealed class MainViewModelTests
             navigation,
             logService);
         var runtime = new RuntimeViewModel(runtimeInventory, packageProvider, packageInventory, resolver, confirmation, logService);
-        var tools = new ToolsViewModel(runtimeInventory, packageProvider, packageInventory, resolver, confirmation, logService);
+        var tools = new ToolsViewModel(runtimeInventory, packageProvider, packageInventory, resolver, confirmation, logService, new FakeToolExtensionInventoryService());
         var cache = new CacheViewModel(
             new FakeCacheInventory([]),
             new FakeCacheCleanup(),
-            new FakePackageRepository(),
-            new CachePackageAssociationService(),
+            new CacheClassificationService(),
             confirmation,
             logService,
             new FakeUiDispatcher());
-        var packages = new PackagesViewModel(packageProvider, packageInventory, confirmation, logService, cache);
+        var packages = new PackagesViewModel(packageProvider, packageInventory, confirmation, logService);
         var settingsService = new FakeSettingsService();
         var workspaceService = new FakeProjectWorkspaceService();
         var projects = new ProjectsViewModel(
@@ -99,7 +98,7 @@ public sealed class MainViewModelTests
         Assert.Equal(170, fixture.Main.SidebarWidth);
 
         fixture.Main.SidebarWidth = 9999;
-        Assert.Equal(720, fixture.Main.SidebarWidth);
+        Assert.Equal(WorkbenchLayoutMetrics.SidebarMaximumWidth, fixture.Main.SidebarWidth);
     }
 
     [Fact]

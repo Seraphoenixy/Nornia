@@ -32,13 +32,27 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     private readonly IClipboardService _clipboard;
     private readonly IGitRepositoryWatcher _repositoryWatcher;
     private readonly IProjectWorkspaceService _workspaceService;
+    private readonly SemaphoreSlim _repositoryContextGate = new(1, 1);
+    // The service publishes a new context before each consumer finishes rebinding. Keep the
+    // repository-side context separate until this view model has acquired the gate, so an
+    // in-flight Git operation can finish against its original repository without observing the
+    // service's already-updated Current value.
+    private ProjectWorkspaceContext? _workspaceContext;
+    // The view model is composed on the WPF UI thread in the application. Capture that owning
+    // context instead of consulting Application.Current from a timer continuation: tests and
+    // secondary WPF hosts can expose a global Dispatcher that belongs to another, idle thread.
+    private readonly SynchronizationContext? _uiContext;
 
     // Silent auto-refresh bookkeeping (watcher-driven): at most one refresh in flight, at most one
     // merged refresh pending; a pending refresh that hits a busy (user operation) state is deferred
     // until IsBusy goes back to false (see the OnPropertyChanged override). The in-flight flag is an
     // int taken with CAS because the retry timer can re-enter from a thread-pool thread.
     private int _quietRefreshInFlight; // 0 = idle, 1 = a refresh is in flight
-    private bool _quietRefreshPending;
+    private int _quietRefreshPending;
+    // A remote-tracking ref can move without moving local HEAD (for example after
+    // `git push --force-with-lease`). Preserve that signal across debounce/busy merging so the
+    // next quiet refresh reloads branches, incoming/outgoing commits and the commit graph.
+    private int _quietRefreshRequiresFullLoad;
     private bool _enableScmAutoRefresh = true;
     private readonly RevisionGate _settingsRevisionGate = new();
 
@@ -48,10 +62,13 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     // start a fresh `git status`. Bursts inside the window only record a pending refresh that a
     // single retry timer runs once the window elapses. Manual refreshes and the catch-up refresh
     // after a user operation are exempt (they pass immediate: true).
-    internal const long QuietRefreshMinimumIntervalMs = 2000;
+    // 500ms (was 2000ms): the watcher already debounces 200ms, so a 2s post-completion cooldown made
+    // every change landing right after a refresh wait ~2s (and mid-flight changes a second full
+    // cooldown) before the changes column updated — the "changes not picked up in time" complaint.
+    // 500ms caps git-status frequency at 2/s during bursts while keeping update latency < ~1s.
+    internal const long QuietRefreshMinimumIntervalMs = 500;
     private long _lastQuietRefreshCompletedUtcTicks; // Environment.TickCount64 value, monotonic
     private int _quietRefreshRetryScheduled; // at most one pending retry timer
-    private int _quietRefreshRetryRan; // guards the dispatcher-posted retry against its grace fallback
 
     // HEAD signature of the last full state load: working-tree edits cannot move HEAD, so quiet
     // refreshes stay status-only while a moved HEAD (external commit / branch switch) escalates
@@ -62,6 +79,11 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
 
     /// <summary>The shared editor area (diff tabs). Also the main content of this page.</summary>
     public EditorAreaViewModel Editor => _editor;
+
+    /// <summary>Workspace generation that owns the currently displayed Git status. Consumers of
+    /// <see cref="StatusRefreshed"/> use this identity to reject a delayed status from a previous
+    /// project when two projects share the same repository root.</summary>
+    public ProjectWorkspaceContext? WorkspaceContext => _workspaceContext;
 
     public BulkObservableCollection<GitChangeItem> StagedChanges { get; } = [];
     public BulkObservableCollection<GitChangeItem> UnstagedChanges { get; } = [];
@@ -257,8 +279,10 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         PruneSelection(SelectedStagedTreeRows, StagedTreeRows);
     }
 
+    /// <summary>前后缀差分同步树行:展开/折叠只对受影响区间发 Remove/Insert,其余行与容器
+    /// 保持不动(滚动锚点不跳),避免整列表 Reset 造成的全部可见行重排卡顿;无变化时不发事件。</summary>
     private static void FillTreeRows(BulkObservableCollection<ScmRowNode> target, IReadOnlyList<ScmRowNode> rows) =>
-        target.ReplaceRange(rows);
+        SyncCollection(target, rows);
 
     /// <summary>把更改按目录路径组织成扁平树行序列:文件夹行 + 缩进的文件行,同级条目按名称
     /// 混排(VS Code 树状视图)。collapsedFolders 记录折叠的目录。</summary>
@@ -298,18 +322,29 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         IReadOnlySet<string> collapsed,
         List<ScmRowNode> rows)
     {
-        var entries = folder.Folders.Select(pair => (Name: pair.Key, IsFolder: true))
-            .Concat(folder.Files.Select(file => (Name: file.FileName, IsFolder: false)))
-            .OrderBy(entry => entry.Name, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(entry => entry.IsFolder ? 0 : 1);
-        foreach (var entry in entries)
+        // 目录与文件按名称混排(OrdinalIgnoreCase,同名时目录在前)。旧实现对每个文件行做
+        // Files.First(...) 线性扫描,单文件夹 O(F²),大仓库展开/折叠会卡顿——改为排序后
+        // 双指针归并,每层 O(F log F),排序序与旧 OrderBy 完全一致。
+        var folderNames = folder.Folders.Keys.ToArray();
+        Array.Sort(folderNames, StringComparer.OrdinalIgnoreCase);
+        folder.Files.Sort(static (x, y) =>
+            string.Compare(x.FileName, y.FileName, StringComparison.OrdinalIgnoreCase));
+
+        var folderIndex = 0;
+        var fileIndex = 0;
+        while (folderIndex < folderNames.Length || fileIndex < folder.Files.Count)
         {
-            if (entry.IsFolder)
+            var takeFolder = folderIndex < folderNames.Length
+                && (fileIndex >= folder.Files.Count
+                    || string.Compare(folderNames[folderIndex], folder.Files[fileIndex].FileName,
+                        StringComparison.OrdinalIgnoreCase) <= 0);
+            if (takeFolder)
             {
-                var child = folder.Folders[entry.Name];
-                var fullPath = prefix.Length == 0 ? entry.Name : prefix + "/" + entry.Name;
+                var name = folderNames[folderIndex++];
+                var child = folder.Folders[name];
+                var fullPath = prefix.Length == 0 ? name : prefix + "/" + name;
                 var isCollapsed = collapsed.Contains(fullPath);
-                rows.Add(new ScmFolderNode(entry.Name, fullPath, isCollapsed, depth));
+                rows.Add(new ScmFolderNode(name, fullPath, isCollapsed, depth));
                 if (!isCollapsed)
                 {
                     FlattenTree(child, fullPath, depth + 1, collapsed, rows);
@@ -317,7 +352,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             }
             else
             {
-                rows.Add(new ScmFileNode(folder.Files.First(file => file.FileName == entry.Name), depth));
+                rows.Add(new ScmFileNode(folder.Files[fileIndex++], depth));
             }
         }
     }
@@ -637,9 +672,11 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         _clipboard = clipboard;
         _repositoryWatcher = repositoryWatcher;
         _workspaceService = workspaceService;
+        _workspaceContext = workspaceService.Current;
+        _uiContext = SynchronizationContext.Current;
         _stateStore = stateStore;
         _scopedSettings = settingsService;
-        _repositoryWatcher.ChangesDetected += (_, _) => HandleWatcherChanges();
+        _repositoryWatcher.ChangesDetected += (_, changes) => HandleWatcherChanges(changes);
         _workspaceService.ContextChanged += ApplyWorkspaceContextAsync;
         DiffOpenRequested += (_, request) => _ = _editor.OpenDiffAsync(request);
         _editor.DiffMutationCompleted += OnEditorDiffMutationCompleted;
@@ -787,6 +824,87 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         await _workspaceService.ActivateAsync(path);
     }
 
+    private static bool PathsEqual(string? left, string? right)
+    {
+        if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right)) return false;
+        try
+        {
+            var normalizedLeft = Path.GetFullPath(left)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var normalizedRight = Path.GetFullPath(right)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            return string.Equals(normalizedLeft, normalizedRight, StringComparison.OrdinalIgnoreCase);
+        }
+        catch (ArgumentException)
+        {
+            return string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    private bool IsRepositoryContextCurrent(ProjectWorkspaceContext? context, string? path)
+    {
+        // Isolated Git view tests/embedders can provide a repository path without a workspace
+        // service context. Preserve that mode while making the production path identity-based.
+        if (_workspaceService.Current is null && _workspaceContext is null)
+        {
+            return !string.IsNullOrWhiteSpace(path) && PathsEqual(RepositoryPath, path);
+        }
+
+        return context is not null
+            && ReferenceEquals(_workspaceContext, context)
+            && PathsEqual(RepositoryPath, path)
+            && PathsEqual(context.GitRepositoryPath, path);
+    }
+
+    private bool IsServiceContextCurrent()
+    {
+        if (_workspaceService.Current is null && _workspaceContext is null) return true;
+        return _workspaceContext is not null
+            && ReferenceEquals(_workspaceService.Current, _workspaceContext);
+    }
+
+    private bool IsSettingsContextCurrent(SettingsContext context)
+    {
+        var workspace = _workspaceContext?.ProjectPath;
+        return string.Equals(context.NormalizedWorkspacePath,
+            workspace is null ? null : Path.GetFullPath(workspace)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar),
+            StringComparison.OrdinalIgnoreCase);
+    }
+
+    private async Task<bool> RunRepositoryAsync(
+        string operation,
+        Func<CancellationToken, Task> action,
+        string recommendedNextStep = "",
+        bool canCancel = true)
+    {
+        await _repositoryContextGate.WaitAsync();
+        try
+        {
+            var context = _workspaceContext;
+            var path = RepositoryPath;
+            if (!IsRepositoryContextCurrent(context, path)) return false;
+
+            return await RunAsync(operation, async cancellationToken =>
+            {
+                if (!IsRepositoryContextCurrent(context, path))
+                {
+                    throw new OperationCanceledException(cancellationToken);
+                }
+
+                await action(cancellationToken);
+                if (!IsRepositoryContextCurrent(context, path))
+                {
+                    throw new OperationCanceledException(cancellationToken);
+                }
+            }, recommendedNextStep, canCancel);
+        }
+        finally
+        {
+            _repositoryContextGate.Release();
+        }
+    }
+
     [RelayCommand]
     private async Task OpenRepositoryAsync()
     {
@@ -800,24 +918,45 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     }
 
     [RelayCommand]
-    private Task RefreshAsync() => RunAsync("刷新 Git 状态", LoadStateAsync, "确认目录是 Git 仓库，或重新选择仓库。", canCancel: true);
+    private Task RefreshAsync() => RunRepositoryAsync("刷新 Git 状态", LoadStateAsync, "确认目录是 Git 仓库，或重新选择仓库。", canCancel: true);
 
     /// <summary>Creates a local repository for the currently open project only. The subsequent
     /// workspace reactivation re-discovers the Git root and notifies every workspace consumer.</summary>
     [RelayCommand(CanExecute = nameof(CanInitializeRepository))]
     private async Task InitializeRepositoryAsync()
     {
-        var projectPath = _workspaceService.Current?.ProjectPath;
-        if (string.IsNullOrWhiteSpace(projectPath))
+        var context = _workspaceContext ?? _workspaceService.Current;
+        var projectPath = context?.ProjectPath;
+        if (context is null || string.IsNullOrWhiteSpace(projectPath))
         {
             return;
         }
 
-        await RunAsync("初始化 Git 仓库", async cancellationToken =>
+        var initialized = false;
+        await _repositoryContextGate.WaitAsync();
+        try
         {
-            await _gitService.InitializeRepositoryAsync(projectPath, cancellationToken);
-            await _workspaceService.ActivateAsync(projectPath, cancellationToken);
-        }, "请确认已安装 Git，且当前项目目录可写。", canCancel: true);
+            if (!ReferenceEquals(_workspaceService.Current, context)
+                || !ReferenceEquals(_workspaceContext, context)) return;
+
+            initialized = await RunAsync("初始化 Git 仓库", async cancellationToken =>
+            {
+                await _gitService.InitializeRepositoryAsync(projectPath, cancellationToken);
+            }, "请确认已安装 Git，且当前项目目录可写。", canCancel: true);
+        }
+        finally
+        {
+            _repositoryContextGate.Release();
+        }
+
+        // Re-discover the Git root only after the repository operation has released the context
+        // gate. If the user requested another project meanwhile, its pending context event wins;
+        // never reactivate the old project after that switch.
+        if (initialized && ReferenceEquals(_workspaceService.Current, context)
+            && ReferenceEquals(_workspaceContext, context))
+        {
+            await _workspaceService.ActivateAsync(projectPath);
+        }
     }
 
     /// <summary>Publishes the only state a stage/unstage/discard operation can change: the index
@@ -838,7 +977,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     [RelayCommand(CanExecute = nameof(CanStageAll))]
     private async Task StageAllAsync()
     {
-        await RunAsync("全部暂存", async cancellationToken =>
+        await RunRepositoryAsync("全部暂存", async cancellationToken =>
         {
             await RefreshStatusAfterMutationAsync(
                 ct => _gitService.StageAsync(RepositoryPath, [], ct), [], cancellationToken);
@@ -849,7 +988,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     [RelayCommand(CanExecute = nameof(CanUnstageAll))]
     private async Task UnstageAllAsync()
     {
-        await RunAsync("取消全部暂存", async cancellationToken =>
+        await RunRepositoryAsync("取消全部暂存", async cancellationToken =>
         {
             await RefreshStatusAfterMutationAsync(
                 ct => _gitService.UnstageAsync(RepositoryPath, [], ct), [], cancellationToken);
@@ -867,7 +1006,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             return;
         }
 
-        await RunAsync("丢弃全部更改", async cancellationToken =>
+        await RunRepositoryAsync("丢弃全部更改", async cancellationToken =>
         {
             await RefreshStatusAfterMutationAsync(
                 ct => _gitService.DiscardUnstagedAsync(RepositoryPath, [], ct), null, cancellationToken);
@@ -883,7 +1022,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             return;
         }
 
-        await RunAsync($"暂存 {item.Path}", async cancellationToken =>
+        await RunRepositoryAsync($"暂存 {item.Path}", async cancellationToken =>
         {
             await RefreshStatusAfterMutationAsync(
                 ct => _gitService.StageAsync(RepositoryPath, [item.Path], ct), [], cancellationToken);
@@ -899,7 +1038,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             return;
         }
 
-        await RunAsync($"取消暂存 {item.Path}", async cancellationToken =>
+        await RunRepositoryAsync($"取消暂存 {item.Path}", async cancellationToken =>
         {
             await RefreshStatusAfterMutationAsync(
                 ct => _gitService.UnstageAsync(RepositoryPath, [item.Path], ct), [], cancellationToken);
@@ -921,7 +1060,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             return;
         }
 
-        await RunAsync($"丢弃 {item.DisplayPath}", async cancellationToken =>
+        await RunRepositoryAsync($"丢弃 {item.DisplayPath}", async cancellationToken =>
         {
             await RefreshStatusAfterMutationAsync(
                 ct => _gitService.DiscardUnstagedAsync(RepositoryPath, [item.Path], ct), [item.Path], cancellationToken);
@@ -930,18 +1069,27 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     }
 
     [RelayCommand(CanExecute = nameof(CanStageFolder))]
-    private async Task StageFolderAsync(ScmFolderNode? folder)
+    private async Task StageFolderAsync(ScmRowNode? node)
     {
-        var paths = ChangesUnderFolder(UnstagedChanges, folder)
-            .Select(change => change.Path)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-        if (paths.Length == 0 || folder is null)
+        // The tree context menu is hosted by the ListBox, so a file row can briefly remain
+        // its PlacementTarget.SelectedItem while the menu is being rebuilt. Accept the common
+        // tree-row base type and reject files here instead of letting the generated command
+        // throw while coercing ScmFileNode to ScmFolderNode.
+        if (node is not ScmFolderNode folder)
         {
             return;
         }
 
-        await RunAsync($"暂存文件夹 {folder.Name}（{paths.Length} 项）", async cancellationToken =>
+        var paths = ChangesUnderFolder(UnstagedChanges, folder)
+            .Select(change => change.Path)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (paths.Length == 0)
+        {
+            return;
+        }
+
+        await RunRepositoryAsync($"暂存文件夹 {folder.Name}（{paths.Length} 项）", async cancellationToken =>
         {
             await RefreshStatusAfterMutationAsync(
                 ct => _gitService.StageAsync(RepositoryPath, paths, ct), [], cancellationToken);
@@ -949,22 +1097,29 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         RefreshChangeCommands();
     }
 
-    private bool CanStageFolder(ScmFolderNode? folder) =>
-        IsRepository && ChangesUnderFolder(UnstagedChanges, folder).Count > 0;
+    private bool CanStageFolder(ScmRowNode? node) =>
+        node is ScmFolderNode folder
+        && IsRepository
+        && ChangesUnderFolder(UnstagedChanges, folder).Count > 0;
 
     [RelayCommand(CanExecute = nameof(CanUnstageFolder))]
-    private async Task UnstageFolderAsync(ScmFolderNode? folder)
+    private async Task UnstageFolderAsync(ScmRowNode? node)
     {
-        var paths = ChangesUnderFolder(StagedChanges, folder)
-            .Select(change => change.Path)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToArray();
-        if (paths.Length == 0 || folder is null)
+        if (node is not ScmFolderNode folder)
         {
             return;
         }
 
-        await RunAsync($"取消暂存文件夹 {folder.Name}（{paths.Length} 项）", async cancellationToken =>
+        var paths = ChangesUnderFolder(StagedChanges, folder)
+            .Select(change => change.Path)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (paths.Length == 0)
+        {
+            return;
+        }
+
+        await RunRepositoryAsync($"取消暂存文件夹 {folder.Name}（{paths.Length} 项）", async cancellationToken =>
         {
             await RefreshStatusAfterMutationAsync(
                 ct => _gitService.UnstageAsync(RepositoryPath, paths, ct), [], cancellationToken);
@@ -972,17 +1127,24 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         RefreshChangeCommands();
     }
 
-    private bool CanUnstageFolder(ScmFolderNode? folder) =>
-        IsRepository && ChangesUnderFolder(StagedChanges, folder).Count > 0;
+    private bool CanUnstageFolder(ScmRowNode? node) =>
+        node is ScmFolderNode folder
+        && IsRepository
+        && ChangesUnderFolder(StagedChanges, folder).Count > 0;
 
     [RelayCommand(CanExecute = nameof(CanDiscardFolder))]
-    private async Task DiscardFolderAsync(ScmFolderNode? folder)
+    private async Task DiscardFolderAsync(ScmRowNode? node)
     {
+        if (node is not ScmFolderNode folder)
+        {
+            return;
+        }
+
         var paths = ChangesUnderFolder(UnstagedChanges, folder)
             .Select(change => change.Path)
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
-        if (paths.Length == 0 || folder is null)
+        if (paths.Length == 0)
         {
             return;
         }
@@ -995,7 +1157,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             return;
         }
 
-        await RunAsync($"丢弃文件夹 {folder.Name}（{paths.Length} 项）", async cancellationToken =>
+        await RunRepositoryAsync($"丢弃文件夹 {folder.Name}（{paths.Length} 项）", async cancellationToken =>
         {
             await RefreshStatusAfterMutationAsync(
                 ct => _gitService.DiscardUnstagedAsync(RepositoryPath, paths, ct), paths, cancellationToken);
@@ -1003,14 +1165,16 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         RefreshChangeCommands();
     }
 
-    private bool CanDiscardFolder(ScmFolderNode? folder) =>
-        IsRepository && ChangesUnderFolder(UnstagedChanges, folder).Count > 0;
+    private bool CanDiscardFolder(ScmRowNode? node) =>
+        node is ScmFolderNode folder
+        && IsRepository
+        && ChangesUnderFolder(UnstagedChanges, folder).Count > 0;
 
     [RelayCommand(CanExecute = nameof(CanCommit))]
     private async Task CommitAsync()
     {
         var message = CommitMessage.Trim();
-        await RunAsync("提交更改", async cancellationToken =>
+        await RunRepositoryAsync("提交更改", async cancellationToken =>
         {
             await _gitService.CommitAsync(RepositoryPath, message, cancellationToken);
             CommitMessage = string.Empty;
@@ -1026,7 +1190,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     private async Task CommitAndPushAsync()
     {
         var message = CommitMessage.Trim();
-        await RunAsync("提交并推送", async cancellationToken =>
+        await RunRepositoryAsync("提交并推送", async cancellationToken =>
         {
             await _gitService.CommitAsync(RepositoryPath, message, cancellationToken);
             CommitMessage = string.Empty;
@@ -1043,7 +1207,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     private async Task CommitAndSyncAsync()
     {
         var message = CommitMessage.Trim();
-        await RunAsync("提交并同步", async cancellationToken =>
+        await RunRepositoryAsync("提交并同步", async cancellationToken =>
         {
             await _gitService.CommitAsync(RepositoryPath, message, cancellationToken);
             CommitMessage = string.Empty;
@@ -1063,7 +1227,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     [RelayCommand(CanExecute = nameof(CanSync))]
     private async Task FetchAsync()
     {
-        await RunAsync("获取远端更新", async cancellationToken =>
+        await RunRepositoryAsync("获取远端更新", async cancellationToken =>
         {
             await _gitService.FetchAsync(RepositoryPath, cancellationToken);
             await LoadStateAsync(cancellationToken);
@@ -1073,7 +1237,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     [RelayCommand(CanExecute = nameof(CanSync))]
     private async Task PullAsync()
     {
-        await RunAsync("拉取", async cancellationToken =>
+        await RunRepositoryAsync("拉取", async cancellationToken =>
         {
             await _gitService.PullAsync(RepositoryPath, cancellationToken);
             await LoadStateAsync(cancellationToken);
@@ -1083,7 +1247,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     [RelayCommand(CanExecute = nameof(CanSync))]
     private async Task PushAsync()
     {
-        await RunAsync("推送", async cancellationToken =>
+        await RunRepositoryAsync("推送", async cancellationToken =>
         {
             await _gitService.PushAsync(RepositoryPath, cancellationToken);
             await LoadStateAsync(cancellationToken);
@@ -1095,7 +1259,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     [RelayCommand(CanExecute = nameof(CanSync))]
     private async Task SyncAsync()
     {
-        await RunAsync("安全同步", async cancellationToken =>
+        await RunRepositoryAsync("安全同步", async cancellationToken =>
         {
             var status = await _gitService.GetStatusAsync(RepositoryPath, cancellationToken);
             if (!status.IsClean)
@@ -1223,7 +1387,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             return;
         }
 
-        await RunAsync($"暂存拖入的 {paths.Length} 项更改", async cancellationToken =>
+        await RunRepositoryAsync($"暂存拖入的 {paths.Length} 项更改", async cancellationToken =>
         {
             await RefreshStatusAfterMutationAsync(
                 ct => _gitService.StageAsync(RepositoryPath, paths, ct), [], cancellationToken);
@@ -1240,7 +1404,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             return;
         }
 
-        await RunAsync($"取消暂存拖入的 {paths.Length} 项更改", async cancellationToken =>
+        await RunRepositoryAsync($"取消暂存拖入的 {paths.Length} 项更改", async cancellationToken =>
         {
             await RefreshStatusAfterMutationAsync(
                 ct => _gitService.UnstageAsync(RepositoryPath, paths, ct), [], cancellationToken);
@@ -1286,7 +1450,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     private async Task CreateBranchAsync()
     {
         var name = NewBranchName.Trim();
-        await RunAsync($"创建分支 {name}", async cancellationToken =>
+        await RunRepositoryAsync($"创建分支 {name}", async cancellationToken =>
         {
             await _gitService.CreateBranchAsync(RepositoryPath, name, cancellationToken);
             NewBranchName = string.Empty;
@@ -1302,7 +1466,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             return;
         }
 
-        await RunAsync($"切换到分支 {branch.Name}", async cancellationToken =>
+        await RunRepositoryAsync($"切换到分支 {branch.Name}", async cancellationToken =>
         {
             await _gitService.SwitchBranchAsync(RepositoryPath, branch.Name, cancellationToken);
             await LoadStateAsync(cancellationToken);
@@ -1310,6 +1474,132 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     }
 
     private bool CanSwitchBranch(GitBranchInfo? branch) => branch is { IsCurrent: false };
+
+    // ===== Git 标签管理 =====
+
+    /// <summary>当前选中提交上的标签徽标(仅 Kind==Tag),供最近提交行右键菜单呈现每个标签的子操作。</summary>
+    public IReadOnlyList<GitLogRefBadge> SelectedLogRowTags =>
+        SelectedLogRow?.RefBadges.Where(badge => badge.IsTag).ToArray() ?? [];
+
+    /// <summary>选中提交上每个标签的完整操作节点,供最近提交行右键菜单渲染嵌套「标签」子菜单。
+    /// 数据源为 <see cref="SelectedLogRowTags"/>(仅 Kind==Tag),随选中提交变化重算。</summary>
+    public IReadOnlyList<GitTagMenuNode> SelectedLogRowTagMenus =>
+        SelectedLogRowTags
+            .Select(badge => new GitTagMenuNode(
+                badge.Name,
+                [
+                    // TagName 随条目携带:子菜单操作项位于嵌套弹出层,RelativeSource AncestorType
+                    // 不跨越 Popup 边界,靠祖先查找取标签名会解析为 null → 命令静默无操作
+                    // (删除标签点击无反应的根因)。
+                    new GitMenuCommandItem("复制标签名", CopyTagNameCommand, badge.Name),
+                    new GitMenuCommandItem("推送标签", PushTagCommand, badge.Name),
+                    new GitMenuCommandItem("检出标签", CheckoutTagCommand, badge.Name),
+                    new GitMenuCommandItem("删除标签", DeleteTagCommand, badge.Name),
+                ]))
+            .ToArray();
+
+    [RelayCommand]
+    private async Task CreateTagAtCommitAsync()
+    {
+        var row = SelectedLogRow;
+        var hash = row?.Commit.Hash;
+        await PromptAndCreateTagAsync(hash, hash is null ? "在 HEAD 创建标签" : $"在提交 {row!.Commit.ShortHash} 创建标签");
+    }
+
+    [RelayCommand]
+    private async Task CreateTagAtHeadAsync() => await PromptAndCreateTagAsync(null, "在 HEAD 创建标签");
+
+    /// <summary>弹出标签名对话框,确认后创建标签(轻量或注释化)并刷新历史徽标。</summary>
+    private async Task PromptAndCreateTagAsync(string? targetRef, string operation)
+    {
+        var owner = System.Windows.Application.Current?.MainWindow;
+        var result = Views.Dialogs.TextPromptDialog.ShowPrompt(owner, operation, "输入新标签名（可用空格分隔，不带 refs/tags/ 前缀）");
+        if (!result.Confirmed || string.IsNullOrWhiteSpace(result.Text))
+        {
+            LogService.Write("INFO", $"已取消：{operation}。");
+            return;
+        }
+
+        var name = result.Text;
+        await RunRepositoryAsync(operation, async cancellationToken =>
+        {
+            await _gitService.CreateTagAsync(RepositoryPath, name, result.Annotated, result.Message, targetRef, cancellationToken);
+            await LoadStateAsync(cancellationToken);
+        }, canCancel: true);
+    }
+
+    [RelayCommand]
+    private async Task CopyTagNameAsync(string? tagName)
+    {
+        if (string.IsNullOrWhiteSpace(tagName)) return;
+        _clipboard.SetText(tagName);
+        LogService.Write("INFO", $"已复制标签名：{tagName}");
+    }
+
+    [RelayCommand]
+    private async Task PushTagAsync(string? tagName)
+    {
+        if (string.IsNullOrWhiteSpace(tagName)) return;
+        await RunRepositoryAsync($"推送标签 {tagName}", async cancellationToken =>
+        {
+            await _gitService.PushTagAsync(RepositoryPath, tagName, cancellationToken);
+            await LoadStateAsync(cancellationToken);
+        }, canCancel: true);
+    }
+
+    [RelayCommand]
+    private async Task PushAllTagsAsync()
+    {
+        await RunRepositoryAsync("推送全部标签", async cancellationToken =>
+        {
+            await _gitService.PushAllTagsAsync(RepositoryPath, cancellationToken);
+            await LoadStateAsync(cancellationToken);
+        }, canCancel: true);
+    }
+
+    [RelayCommand]
+    private async Task FetchTagsAsync()
+    {
+        await RunRepositoryAsync("拉取所有标签", async cancellationToken =>
+        {
+            await _gitService.FetchTagsAsync(RepositoryPath, cancellationToken);
+            await LoadStateAsync(cancellationToken);
+        }, canCancel: true);
+    }
+
+    [RelayCommand]
+    private async Task DeleteTagAsync(string? tagName)
+    {
+        if (string.IsNullOrWhiteSpace(tagName)) return;
+        if (!_confirmationService.Confirm("删除标签", $"确定删除本地标签“{tagName}”？该操作不可撤销（远端标签需另行删除）。"))
+        {
+            LogService.Write("INFO", $"已取消删除标签：{tagName}。");
+            return;
+        }
+
+        await RunRepositoryAsync($"删除标签 {tagName}", async cancellationToken =>
+        {
+            await _gitService.DeleteTagAsync(RepositoryPath, tagName, cancellationToken);
+            await LoadStateAsync(cancellationToken);
+        }, canCancel: true);
+    }
+
+    [RelayCommand]
+    private async Task CheckoutTagAsync(string? tagName)
+    {
+        if (string.IsNullOrWhiteSpace(tagName)) return;
+        if (!_confirmationService.Confirm("检出标签", $"将检出到标签“{tagName}”，HEAD 会进入分离状态（detached HEAD）。此后提交不归属于任何分支，建议先在目标分支上新建分支再继续开发。确定继续？"))
+        {
+            LogService.Write("INFO", $"已取消检出标签：{tagName}。");
+            return;
+        }
+
+        await RunRepositoryAsync($"检出标签 {tagName}", async cancellationToken =>
+        {
+            await _gitService.CheckoutTagAsync(RepositoryPath, tagName, cancellationToken);
+            await LoadStateAsync(cancellationToken);
+        }, "已在分离 HEAD 状态；如需继续开发，请先创建或切换到新分支。", canCancel: true);
+    }
 
     // ===== Section expansion (session-only) =====
 
@@ -1377,7 +1667,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             return;
         }
 
-        await RunAsync($"暂存 {paths.Length} 项更改", async cancellationToken =>
+        await RunRepositoryAsync($"暂存 {paths.Length} 项更改", async cancellationToken =>
         {
             await RefreshStatusAfterMutationAsync(
                 ct => _gitService.StageAsync(RepositoryPath, paths, ct), [], cancellationToken);
@@ -1397,7 +1687,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             return;
         }
 
-        await RunAsync($"取消暂存 {paths.Length} 项更改", async cancellationToken =>
+        await RunRepositoryAsync($"取消暂存 {paths.Length} 项更改", async cancellationToken =>
         {
             await RefreshStatusAfterMutationAsync(
                 ct => _gitService.UnstageAsync(RepositoryPath, paths, ct), [], cancellationToken);
@@ -1425,7 +1715,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             return;
         }
 
-        await RunAsync($"丢弃 {paths.Length} 项更改", async cancellationToken =>
+        await RunRepositoryAsync($"丢弃 {paths.Length} 项更改", async cancellationToken =>
         {
             await RefreshStatusAfterMutationAsync(
                 ct => _gitService.DiscardUnstagedAsync(RepositoryPath, paths, ct), paths, cancellationToken);
@@ -1457,7 +1747,8 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
 
     private void RaiseDiffOpenRequested(GitChangeItem value, bool isPreview = false) =>
         DiffOpenRequested?.Invoke(this, new GitDiffRequest(RepositoryPath, value.Change.Path, value.IsStaged, value.IsUntracked,
-            IsPreview: isPreview, HeadBlobId: value.Change.HeadBlobId, IndexBlobId: value.Change.IndexBlobId));
+            IsPreview: isPreview, HeadBlobId: value.Change.HeadBlobId, IndexBlobId: value.Change.IndexBlobId,
+            WorkspaceContext: _workspaceContext));
 
     partial void OnRepositoryPathChanged(string value)
     {
@@ -1466,10 +1757,12 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         _repositoryWatcher.Detach();
         _hasFullStateLoad = false;
         _lastHeadSignature = null;
+        Interlocked.Exchange(ref _quietRefreshRequiresFullLoad, 0);
         _graphCollapsedForNoRepository = true;
         IsGraphViewExpanded = false;
         IsRepository = false;
         RepositorySummary = "未检测到 Git 仓库。";
+        ClearChanges();
     }
 
     /// <summary>Runs the deferred silent refresh once the user operation that owned IsBusy
@@ -1478,7 +1771,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     protected override void OnPropertyChanged(PropertyChangedEventArgs e)
     {
         base.OnPropertyChanged(e);
-        if (e.PropertyName == nameof(IsBusy) && !IsBusy && _quietRefreshPending)
+        if (e.PropertyName == nameof(IsBusy) && !IsBusy && Volatile.Read(ref _quietRefreshPending) == 1)
         {
             StartQuietRefresh(immediate: true);
         }
@@ -1493,7 +1786,20 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     /// <summary>Watcher-driven silent refresh entry point (single flight + merged pending + minimum
     /// interval). Runs outside <see cref="PageViewModel.RunAsync"/> on purpose: no status banner,
     /// no operation log entry, no cancel button (VS Code auto-refresh is invisible).</summary>
-    private void HandleWatcherChanges() => StartQuietRefresh(immediate: false);
+    private void HandleWatcherChanges(GitRepositoryChangesDetectedEventArgs? changes = null)
+    {
+        if (!IsServiceContextCurrent())
+        {
+            return;
+        }
+
+        if (changes is { HeadOrRefsChanged: true } or { IsUnknown: true })
+        {
+            Interlocked.Exchange(ref _quietRefreshRequiresFullLoad, 1);
+        }
+
+        StartQuietRefresh(immediate: false);
+    }
 
     /// <summary>Attempts to start the silent refresh. The in-flight flag is taken atomically so
     /// concurrent callers (watcher thread, retry timer, property-changed path) can never start two
@@ -1504,7 +1810,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     {
         if (Interlocked.CompareExchange(ref _quietRefreshInFlight, 1, 0) == 1)
         {
-            _quietRefreshPending = true;
+            Interlocked.Exchange(ref _quietRefreshPending, 1);
             return;
         }
 
@@ -1512,7 +1818,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         {
             // A user operation is running; catch up with the latest state when it finishes.
             Interlocked.Exchange(ref _quietRefreshInFlight, 0);
-            _quietRefreshPending = true;
+            Interlocked.Exchange(ref _quietRefreshPending, 1);
             return;
         }
 
@@ -1524,13 +1830,13 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
                 // Inside the cooldown after the last silent refresh: record the pending refresh
                 // and run it once the interval elapses (single retry timer, at most one).
                 Interlocked.Exchange(ref _quietRefreshInFlight, 0);
-                _quietRefreshPending = true;
+                Interlocked.Exchange(ref _quietRefreshPending, 1);
                 ScheduleQuietRefreshRetry(QuietRefreshMinimumIntervalMs - elapsedMs);
                 return;
             }
         }
 
-        _quietRefreshPending = false;
+        Interlocked.Exchange(ref _quietRefreshPending, 0);
         _ = RunQuietRefreshAsync(); // its finally releases the in-flight flag
     }
 
@@ -1547,49 +1853,42 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         _ = Task.Delay(TimeSpan.FromMilliseconds(delayMs)).ContinueWith(_ =>
         {
             Interlocked.Exchange(ref _quietRefreshRetryScheduled, 0);
-            if (!_quietRefreshPending)
+            if (Volatile.Read(ref _quietRefreshPending) == 0)
             {
                 return;
             }
 
-            var dispatcher = System.Windows.Application.Current?.Dispatcher;
-            if (dispatcher is null)
+            if (_uiContext is null)
             {
                 HandleWatcherChanges(); // no WPF app (unit tests without STA context)
                 return;
             }
 
-            // Marshaled to the UI thread: the refresh mutates bound observable state. The real
-            // app's message loop pumps the dispatcher within one frame; a grace-period fallback
-            // covers hosts that keep a WPF Application alive without pumping it (test processes
-            // sharing the STA context), where a plain BeginInvoke would park forever.
-            Interlocked.Exchange(ref _quietRefreshRetryRan, 0);
-            dispatcher.BeginInvoke(new Action(() =>
+            // Marshal back to the context that owns the ViewModel and its bound collections.
+            // Do not use Application.Current.Dispatcher here: it may belong to an unrelated WPF
+            // host (notably a shared STA test host) whose queue is not currently being pumped.
+            _uiContext.Post(_ =>
             {
-                if (Interlocked.Exchange(ref _quietRefreshRetryRan, 1) == 0)
-                {
-                    HandleWatcherChanges();
-                }
-            }));
-            _ = Task.Delay(1000).ContinueWith(_ =>
-            {
-                if (Interlocked.Exchange(ref _quietRefreshRetryRan, 1) == 0)
-                {
-                    HandleWatcherChanges();
-                }
-            });
+                HandleWatcherChanges();
+            }, null);
         });
     }
 
     private async Task RunQuietRefreshAsync()
     {
+        await _repositoryContextGate.WaitAsync();
         try
         {
+            var context = _workspaceContext;
+            var path = RepositoryPath;
+            if (!IsRepositoryContextCurrent(context, path)) return;
+
             // git may write back the index stat cache during/after the read pass; arm the
             // suppression window so those .git\index events do not retrigger a refresh.
             _repositoryWatcher.BeginSuppressionWindow();
-            var signature = ReadHeadSignature(RepositoryPath);
-            if (_hasFullStateLoad && string.Equals(signature, _lastHeadSignature, StringComparison.Ordinal))
+            var requiresFullLoad = Interlocked.Exchange(ref _quietRefreshRequiresFullLoad, 0) == 1;
+            var signature = ReadHeadSignature(path);
+            if (!requiresFullLoad && _hasFullStateLoad && string.Equals(signature, _lastHeadSignature, StringComparison.Ordinal))
             {
                 // HEAD did not move: edits cannot change branches / history / stashes, a single
                 // git status call keeps the view current without the full subprocess fan-out.
@@ -1607,14 +1906,14 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         }
         finally
         {
+            _repositoryContextGate.Release();
             Interlocked.Exchange(ref _quietRefreshInFlight, 0);
             // Post-completion cooldown (VS Code throttle): bursts observed while this refresh was
             // in flight (they set the pending flag above) may not restart another status for at
             // least QuietRefreshMinimumIntervalMs.
             _lastQuietRefreshCompletedUtcTicks = Environment.TickCount64;
-            if (_quietRefreshPending)
+            if (Interlocked.Exchange(ref _quietRefreshPending, 0) == 1)
             {
-                _quietRefreshPending = false;
                 HandleWatcherChanges();
             }
         }
@@ -1638,7 +1937,11 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             return;
         }
 
+        // 静默刷新与显式刷新一致,逐文件列出未跟踪内容(仿 VS Code):--untracked-files=normal
+        // 会把新建文件夹折叠成 "? dir/" 单条目,更改列表渲染成空名文件行,且无法对其中文件单独
+        // 暂存/丢弃/查看 diff。watcher 已忽略 bin/obj/node_modules,条目上限兜底病理仓库。
         var status = await _gitService.GetStatusAsync(path, cancellationToken);
+        if (!IsServiceContextCurrent()) return;
         StatusRefreshed?.Invoke(this, status);
         IsRepository = status.IsRepository;
         if (!status.IsRepository)
@@ -1738,6 +2041,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         }
 
         var status = await _gitService.GetStatusAsync(path, cancellationToken);
+        if (!IsServiceContextCurrent()) return;
         StatusRefreshed?.Invoke(this, status);
         IsRepository = status.IsRepository;
         if (!status.IsRepository)
@@ -1765,20 +2069,22 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
 
         // G3: 相互独立的 git 读命令一次性并发发出(总耗时从"和"变"最大值")。
         // G7: 折叠区段对应的读命令不发——其数据按展开懒加载(见 EnsureLazySectionsLoadedAsync)。
-        var branchesTask = _gitService.GetBranchesAsync(path, cancellationToken);
-        var remoteBranchesTask = _gitService.GetRemoteBranchesAsync(path, cancellationToken);
+        var branchesTask = LoadBranchesSectionAsync(path, cancellationToken);
+        var remoteBranchesTask = LoadRemoteBranchesSectionAsync(path, cancellationToken);
         var logTask = LoadLogSectionAsync(path, cancellationToken);
         var stashesTask = IsChangesViewExpanded
-            ? _gitService.GetStashesAsync(path, cancellationToken)
+            ? LoadStashesSectionAsync(path, cancellationToken)
             : Task.FromResult<IReadOnlyList<GitStashInfo>>([]);
-        var remoteCommitsTask = FetchRemoteCommitsAsync(status.Upstream, cancellationToken);
+        var remoteCommitsTask = FetchRemoteCommitsAsync(path, status.Upstream, cancellationToken);
 
+        // Observe every sibling before consuming any one result. If a later section fails, the
+        // other process tasks must still be awaited so their exceptions are not left unobserved.
+        await Task.WhenAll(branchesTask, remoteBranchesTask, logTask, stashesTask, remoteCommitsTask);
         var branches = await branchesTask;
-        IReadOnlyList<GitBranchInfo> remoteBranches;
-        try { remoteBranches = await remoteBranchesTask; }
-        catch { remoteBranches = []; }
+        var remoteBranches = await remoteBranchesTask;
         var commits = await logTask;
         var stashes = await stashesTask;
+        if (!IsServiceContextCurrent()) return;
 
         var branchesChanged = SyncCollection(Branches, branches);
         var remoteChanged = SyncCollection(RemoteBranches, remoteBranches);
@@ -1810,10 +2116,12 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             {
                 OnPropertyChanged(nameof(HasOutgoing));
                 OnPropertyChanged(nameof(HasIncoming));
+                // 最近提交图直接包含传入/传出的真实提交；即使 ahead/behind 数量未变，
+                // 提交集合变化也必须重建，否则边界下面仍显示上一轮内容。
+                RebuildLogRows();
             }
 
-            // 同步折叠栏行(传入/传出)由 上游与 ahead/behind 计数驱动:签名变化才重建行集合,
-            // 其余静默刷新不重建(避免清空/重填闪烁与展开态丢失)。
+            // 同步边界由上游与 ahead/behind 计数驱动；签名变化时更新边界位置与标签。
             var syncSignature = $"{status.Upstream}|{status.AheadCount}|{status.BehindCount}";
             if (syncSignature != _lastSyncSignature)
             {
@@ -2009,7 +2317,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     [RelayCommand]
     private async Task ToggleLogRowAsync(GitLogRow? row)
     {
-        if (row is null)
+        if (row is null || !IsServiceContextCurrent())
         {
             return;
         }
@@ -2020,10 +2328,20 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             return;
         }
 
+        await _repositoryContextGate.WaitAsync();
+        if (!IsServiceContextCurrent())
+        {
+            _repositoryContextGate.Release();
+            return;
+        }
+
         row.IsLoading = true;
         try
         {
-            var changes = await _gitService.GetCommitFilesAsync(RepositoryPath, row.Commit.Hash);
+            var path = RepositoryPath;
+            var context = _workspaceContext;
+            var changes = await _gitService.GetCommitFilesAsync(path, row.Commit.Hash);
+            if (!IsRepositoryContextCurrent(context, path)) return;
             foreach (var change in changes)
             {
                 row.Files.Add(new LogFileRow(row, change));
@@ -2038,6 +2356,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         finally
         {
             row.IsLoading = false;
+            _repositoryContextGate.Release();
         }
     }
 
@@ -2045,12 +2364,14 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     [RelayCommand]
     private void OpenLogFileDiff(LogFileRow? file)
     {
-        if (file is null)
+        if (file is null || !IsServiceContextCurrent())
         {
             return;
         }
 
-        DiffOpenRequested?.Invoke(this, new GitDiffRequest(RepositoryPath, file.Change.Path, false, false, file.Row.Commit.Hash));
+        var path = RepositoryPath;
+        DiffOpenRequested?.Invoke(this, new GitDiffRequest(path, file.Change.Path, false, false, file.Row.Commit.Hash,
+            WorkspaceContext: _workspaceContext));
     }
 
     private bool CanCopyLogFilePath(LogFileRow? file) => file is not null;
@@ -2073,7 +2394,11 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     /// <summary>历史列表行 = 提交 + 左缘图形泳道(折叠栏;ListBox SelectedItem 仅用于行高亮与多选)。</summary>
     public BulkObservableCollection<GitLogRow> LogRows { get; } = [];
 
-    [ObservableProperty] private GitLogRow? selectedLogRow;
+    /// <summary>选中行变化必须联动通知标签菜单的两个派生属性:ContextMenu 子树的绑定只在
+    /// 打开时求值一次,缺少通知会让子菜单永远停留在首次打开时的快照(过期标签/空菜单)。</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(SelectedLogRowTags), nameof(SelectedLogRowTagMenus))]
+    private GitLogRow? selectedLogRow;
 
     public bool CanLoadMoreCommits => IsRepository && !_logsExhausted && Logs.Count > 0;
 
@@ -2081,17 +2406,84 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     [RelayCommand(CanExecute = nameof(CanLoadMoreCommits))]
     private async Task LoadMoreCommitsAsync()
     {
-        var prior = Logs.Count;
-        var fetched = await _gitService.GetLogAsync(RepositoryPath, prior + LogPageSize);
-        foreach (var commit in fetched.Skip(prior))
+        await _repositoryContextGate.WaitAsync();
+        try
         {
-            Logs.Add(commit);
-        }
+            var context = _workspaceContext;
+            var path = RepositoryPath;
+            if (!IsRepositoryContextCurrent(context, path)) return;
 
-        _logsExhausted = fetched.Count < prior + LogPageSize;
-        RebuildLogRows();
-        OnPropertyChanged(nameof(GraphViewBadgeCount));
-        LoadMoreCommitsCommand.NotifyCanExecuteChanged();
+            var prior = Logs.Count;
+            var fetched = await _gitService.GetLogAsync(path, prior + LogPageSize);
+            if (!IsRepositoryContextCurrent(context, path)) return;
+            foreach (var commit in fetched.Skip(prior))
+            {
+                Logs.Add(commit);
+            }
+
+            _logsExhausted = fetched.Count < prior + LogPageSize;
+            RebuildLogRows();
+            OnPropertyChanged(nameof(GraphViewBadgeCount));
+            LoadMoreCommitsCommand.NotifyCanExecuteChanged();
+        }
+        finally
+        {
+            _repositoryContextGate.Release();
+        }
+    }
+
+    private async Task<IReadOnlyList<GitBranchInfo>> LoadBranchesSectionAsync(
+        string path, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await _gitService.GetBranchesAsync(path, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            LogService.Write("WARNING", $"加载本地分支失败：{ex.Message}");
+            return [];
+        }
+    }
+
+    private async Task<IReadOnlyList<GitBranchInfo>> LoadRemoteBranchesSectionAsync(
+        string path, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await _gitService.GetRemoteBranchesAsync(path, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            LogService.Write("WARNING", $"加载远程分支失败：{ex.Message}");
+            return [];
+        }
+    }
+
+    private async Task<IReadOnlyList<GitStashInfo>> LoadStashesSectionAsync(
+        string path, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await _gitService.GetStashesAsync(path, cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            LogService.Write("WARNING", $"加载贮藏列表失败：{ex.Message}");
+            return [];
+        }
     }
 
     /// <summary>当前分支(本地)的泳道色键:传出的更改行使用。</summary>
@@ -2099,38 +2491,87 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
 
     internal void RebuildLogRows()
     {
-        var graph = BuildCommitGraph(Logs, GraphBranchRefs).ToList();
-        var rows = new List<GitLogRow>(Logs.Count + 2);
-
-        // 分支顶端的两个同步折叠栏行(与提交行同一模板,单击展开合并文件影响):
-        // 传入的更改 = 远端色空心圆点(上游 tip 位置),传出的更改 = 本地色空心圆点。
-        var remoteKey = UpstreamColorKey(UpstreamName, GraphBranchRefs);
-        if (HasUpstream && BehindCount > 0)
+        // 同时把本地 HEAD 与上游 tip 放入一张拓扑图：两个同步边界先各自占据一条泳道，
+        // 传出/传入提交沿各自的父链向下，最后在共同历史汇合。不能先画完整本地历史再把
+        // “传入的更改”追加到底部——那会把上游误画成一条线性历史，而非第二条分支。
+        var outgoing = OutgoingCommits.Select(row => row.Commit).DistinctBy(commit => commit.Hash, StringComparer.OrdinalIgnoreCase).ToList();
+        var outgoingHashes = outgoing.Select(commit => commit.Hash).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        if (outgoing.Count < AheadCount)
         {
-            rows.Add(SyncGroupRow(
-                $"HEAD...{UpstreamName}", Codicons.ArrowDown, $"传入的更改 {BehindCount}", UpstreamName,
-                remoteKey, continuesFromAbove: false, incomingKey: null,
-                IncomingCommits.FirstOrDefault()?.Commit.AuthorDate));
+            foreach (var commit in Logs.Where(commit => !outgoingHashes.Contains(commit.Hash)).Take(AheadCount - outgoing.Count))
+            {
+                outgoing.Add(commit);
+                outgoingHashes.Add(commit.Hash);
+            }
         }
+
+        var common = Logs.Where(commit => !outgoingHashes.Contains(commit.Hash)).ToArray();
+        var occupiedHashes = Logs.Select(commit => commit.Hash).Concat(outgoingHashes).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var incoming = IncomingCommits.Select(row => row.Commit)
+            .Where(commit => occupiedHashes.Add(commit.Hash))
+            .DistinctBy(commit => commit.Hash, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        const string outgoingBoundaryHash = "refs/nornia/sync/outgoing";
+        const string incomingBoundaryHash = "refs/nornia/sync/incoming";
+        var commonTip = common.FirstOrDefault()?.Hash;
+        var outgoingGraphCommits = ConnectGraphSequence(outgoing, commonTip);
+        // 远端独有提交先沿上游泳道向下，最后接到“传入的更改”边界；该边界再汇入
+        // 共同历史。因此分界行视觉上位于远端提交与本地/共同提交之间。
+        var incomingGraphCommits = ConnectGraphSequence(
+            incoming,
+            HasUpstream && BehindCount > 0 ? incomingBoundaryHash : commonTip,
+            forceTailParent: HasUpstream && BehindCount > 0);
+        var commonGraphCommits = ConnectGraphSequence(common, null);
+
+        var graphCommits = new List<GitCommitInfo>();
+        var displayCommits = new List<GitCommitInfo?>();
+        var outgoingBoundaryIndex = -1;
+        var incomingBoundaryIndex = -1;
 
         if (HasUpstream && AheadCount > 0)
         {
-            var hasIncomingRow = BehindCount > 0;
-            rows.Add(SyncGroupRow(
-                $"{UpstreamName}...HEAD", Codicons.ArrowUp, $"传出的更改 {AheadCount}", UpstreamName,
-                LocalColorKey, continuesFromAbove: hasIncomingRow, incomingKey: hasIncomingRow ? remoteKey : null,
-                OutgoingCommits.FirstOrDefault()?.Commit.AuthorDate));
+            outgoingBoundaryIndex = graphCommits.Count;
+            graphCommits.Add(GraphBoundaryCommit(outgoingBoundaryHash, outgoingGraphCommits.FirstOrDefault()?.Hash ?? commonTip));
+            displayCommits.Add(null);
         }
 
-        if (graph.Count > 0 && rows.Count > 0)
+        AppendGraphCommits(outgoingGraphCommits, outgoing, graphCommits, displayCommits);
+
+        AppendGraphCommits(incomingGraphCommits, incoming, graphCommits, displayCommits);
+
+        if (HasUpstream && BehindCount > 0)
         {
-            // 首提交从上方接入同步栏:上段竖线入色取最下方同步栏的色键,连线全程单色。
-            graph[0] = graph[0] with { DotLaneContinuesFromAbove = true, LaneIncomingColorKeys = rows[^1].Graph!.LaneColorKeys };
+            incomingBoundaryIndex = graphCommits.Count;
+            graphCommits.Add(GraphBoundaryCommit(incomingBoundaryHash, commonTip));
+            displayCommits.Add(null);
         }
 
-        for (var i = 0; i < Logs.Count; i++)
+        AppendGraphCommits(commonGraphCommits, common, graphCommits, displayCommits);
+
+        var graphBranches = GraphBranchRefs.ToList();
+        if (outgoingBoundaryIndex >= 0)
+            graphBranches.Add(new GitBranchInfo(CurrentBranch, true, TipHash: outgoingBoundaryHash));
+        if (incomingBoundaryIndex >= 0)
+            graphBranches.Add(new GitBranchInfo(UpstreamName, false, IsRemote: true, TipHash: incomingBoundaryHash));
+
+        var graph = BuildCommitGraph(graphCommits, graphBranches);
+        var rows = new List<GitLogRow>(graph.Count);
+        for (var i = 0; i < graph.Count; i++)
         {
-            rows.Add(new GitLogRow(Logs[i], graph[i]));
+            if (i == outgoingBoundaryIndex)
+            {
+                rows.Add(SyncGroupRow($"{UpstreamName}...HEAD", "传出的更改", CurrentBranch,
+                    graph[i], OutgoingCommits.FirstOrDefault()?.Commit.AuthorDate));
+            }
+            else if (i == incomingBoundaryIndex)
+            {
+                rows.Add(SyncGroupRow($"HEAD...{UpstreamName}", "传入的更改", UpstreamName,
+                    graph[i], IncomingCommits.FirstOrDefault()?.Commit.AuthorDate));
+            }
+            else
+            {
+                rows.Add(new GitLogRow(displayCommits[i]!, graph[i]));
+            }
         }
 
         // 一次 Replace(单条 Reset)取代 Clear()+逐行 Add:行对象按快照整体重建(图形泳道 /
@@ -2138,28 +2579,63 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         LogRows.ReplaceRange(rows);
     }
 
-    /// <summary>同步折叠栏行:空心圆点 + 下段竖线;Commit.Hash 为 diff 范围
+    /// <summary>同步边界行:虚线空心圆点 + 下段竖线;Commit.Hash 为 diff 范围
     /// (HEAD...upstream / upstream...HEAD),展开懒加载的正是该范围的合并文件影响。</summary>
     private static GitLogRow SyncGroupRow(
         string rangeHash,
-        string directionGlyph,
         string subject,
-        string meta,
-        string colorKey,
-        bool continuesFromAbove,
-        string? incomingKey,
+        string target,
+        GitGraphRow graph,
         DateTimeOffset? date)
     {
-        var graph = new GitGraphRow(
-            0, [], [new GitGraphLink(0, 0)], 1,
-            DotLaneContinuesFromAbove: continuesFromAbove,
-            LaneColorKeys: [colorKey],
-            LaneIncomingColorKeys: incomingKey is null ? null : [incomingKey],
-            DotHollow: true);
         return new GitLogRow(
-            new GitCommitInfo(rangeHash, directionGlyph, subject, null, meta, "-", date ?? DateTimeOffset.MinValue),
-            graph,
-            directionGlyph);
+            new GitCommitInfo(rangeHash, "", subject, null, target, "-", date ?? DateTimeOffset.MinValue),
+            graph with { DotHollow = true, DotDashed = true },
+            syncTarget: target);
+    }
+
+    private static GitCommitInfo GraphBoundaryCommit(string hash, string? parent) =>
+        new(hash, hash, hash, null, "Nornia", "-", DateTimeOffset.MinValue,
+            string.IsNullOrWhiteSpace(parent) ? [] : [parent]);
+
+    private static IReadOnlyList<GitCommitInfo> ConnectGraphSequence(
+        IReadOnlyList<GitCommitInfo> commits,
+        string? tailParent,
+        bool forceTailParent = false)
+    {
+        var result = commits.ToArray();
+        for (var i = 0; i < result.Length; i++)
+        {
+            if (forceTailParent && i == result.Length - 1 && !string.IsNullOrWhiteSpace(tailParent))
+            {
+                // 在远端独有段与其原首父(共同历史)之间插入可见的同步边界节点。
+                // 保留合并提交的其它父边，只替换首父链上的这一段。
+                result[i] = result[i] with { Parents = [tailParent, .. result[i].ParentList.Skip(1)] };
+                continue;
+            }
+
+            if (result[i].ParentList.Count > 0)
+                continue;
+
+            var inferredParent = i + 1 < result.Length ? result[i + 1].Hash : tailParent;
+            if (!string.IsNullOrWhiteSpace(inferredParent))
+                result[i] = result[i] with { Parents = [inferredParent] };
+        }
+
+        return result;
+    }
+
+    private static void AppendGraphCommits(
+        IReadOnlyList<GitCommitInfo> graphSource,
+        IReadOnlyList<GitCommitInfo> displaySource,
+        ICollection<GitCommitInfo> graphTarget,
+        ICollection<GitCommitInfo?> displayTarget)
+    {
+        for (var i = 0; i < graphSource.Count; i++)
+        {
+            graphTarget.Add(graphSource[i]);
+            displayTarget.Add(displaySource[i]);
+        }
     }
 
     /// <summary>上游分支的语义色键(上游通常是远端分支 → GraphRemote*;分支列表里找不到时
@@ -2181,7 +2657,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         return key;
     }
 
-    // ===== 传入 / 传出更改提交集(数据;同步折叠栏行由 RebuildLogRows 按计数生成) =====
+    // ===== 传入 / 传出真实提交集（由 RebuildLogRows 排到对应同步边界之后） =====
 
     public BulkObservableCollection<GitLogRow> OutgoingCommits { get; } = [];
 
@@ -2216,12 +2692,10 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         {
             return await _gitService.GetLogAsync(path, LogPageSize, cancellationToken);
         }
-        catch (GitOperationException ex)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             // 全新 init 且尚无提交的仓库:git log 报 "no commits yet" —— 按空历史处理。
-            // 此处 git status/branch 均已成功,log 单独失败即此正常状态;若继续上抛,
-            // 异常会沿 ProjectWorkspaceService.PublishAsync → 工作区激活链变成
-            // 未观察的 Task 异常(自动刷新路径 RunQuietRefreshAsync 已有同类兜底)。
+            // 其它区段读取失败也只影响该区段；不能让并发的其它区段任务变成未观察异常。
             LogService.Write("WARNING", $"加载提交历史失败：{ex.Message}");
             return [];
         }
@@ -2230,6 +2704,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     /// <summary>并发拉取传入/传出提交(G3:两个进程并行,不再串行 await);上游为空或图分区
     /// 折叠时不发进程(G7),返回空结果。</summary>
     private async Task<(IReadOnlyList<GitLogRow> Outgoing, IReadOnlyList<GitLogRow> Incoming)> FetchRemoteCommitsAsync(
+        string path,
         string? upstream,
         CancellationToken cancellationToken)
     {
@@ -2238,12 +2713,24 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             return ([], []);
         }
 
-        var outgoingTask = _gitService.GetOutgoingCommitsAsync(RepositoryPath, upstream, LogPageSize, cancellationToken);
-        var incomingTask = _gitService.GetIncomingCommitsAsync(RepositoryPath, upstream, LogPageSize, cancellationToken);
-        await Task.WhenAll(outgoingTask, incomingTask);
-        var outgoing = (await outgoingTask).Select(commit => new GitLogRow(commit, null)).ToArray();
-        var incoming = (await incomingTask).Select(commit => new GitLogRow(commit, null)).ToArray();
-        return (outgoing, incoming);
+        try
+        {
+            var outgoingTask = _gitService.GetOutgoingCommitsAsync(path, upstream, LogPageSize, cancellationToken);
+            var incomingTask = _gitService.GetIncomingCommitsAsync(path, upstream, LogPageSize, cancellationToken);
+            await Task.WhenAll(outgoingTask, incomingTask);
+            var outgoing = (await outgoingTask).Select(commit => new GitLogRow(commit, null)).ToArray();
+            var incoming = (await incomingTask).Select(commit => new GitLogRow(commit, null)).ToArray();
+            return (outgoing, incoming);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            LogService.Write("WARNING", $"加载传入/传出提交失败：{ex.Message}");
+            return ([], []);
+        }
     }
 
     /// <summary>分区展开后的懒加载:图视图/更改视图从折叠转为展开时,补齐跳过的
@@ -2260,30 +2747,53 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             return;
         }
 
+        await _repositoryContextGate.WaitAsync();
         try
         {
+            var context = _workspaceContext;
+            var path = RepositoryPath;
+            if (!IsRepositoryContextCurrent(context, path) || !IsRepository
+                || Volatile.Read(ref _fullLoadRunning) == 1) return;
+
             if (IsGraphViewExpanded && !_logSectionLoaded)
             {
-                await LoadLogAndRemoteSectionsLazyAsync();
+                await LoadLogAndRemoteSectionsLazyAsync(path, context);
+                if (!IsRepositoryContextCurrent(context, path)) return;
                 _logSectionLoaded = true;
             }
 
             if (IsChangesViewExpanded && !_stashesLoaded)
             {
-                var stashes = await _gitService.GetStashesAsync(RepositoryPath);
+                var stashes = await _gitService.GetStashesAsync(path);
+                if (!IsRepositoryContextCurrent(context, path)) return;
                 SyncCollection(Stashes, stashes);
                 _stashesLoaded = true;
             }
         }
+        catch (OperationCanceledException)
+        {
+            // A context switch or shutdown can invalidate a lazy request while the settings/view
+            // event is still unwinding. There is no user operation to report this cancellation to.
+        }
+        catch (Exception ex)
+        {
+            // Expansion is started from PropertyChanged and therefore is fire-and-forget. Keep a
+            // failed git command observable in Output without allowing an async-void-equivalent
+            // continuation to reach the dispatcher as an unhandled exception. The section stays
+            // marked unloaded so collapsing/reopening it can retry.
+            LogService.Write("WARNING", $"加载 Git 懒加载区段失败：{ex.Message}");
+        }
         finally
         {
+            _repositoryContextGate.Release();
             Interlocked.Exchange(ref _lazySectionsRunning, 0);
         }
     }
 
-    private async Task LoadLogAndRemoteSectionsLazyAsync()
+    private async Task LoadLogAndRemoteSectionsLazyAsync(string path, ProjectWorkspaceContext? context)
     {
-        var commits = await LoadLogSectionAsync(RepositoryPath, CancellationToken.None);
+        var commits = await LoadLogSectionAsync(path, CancellationToken.None);
+        if (!IsRepositoryContextCurrent(context, path)) return;
         var logsChanged = SyncCollection(Logs, commits);
         _logsExhausted = Logs.Count < LogPageSize;
         if (logsChanged)
@@ -2293,7 +2803,8 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             LoadMoreCommitsCommand.NotifyCanExecuteChanged();
         }
 
-        var (outgoing, incoming) = await FetchRemoteCommitsAsync(UpstreamName, CancellationToken.None);
+        var (outgoing, incoming) = await FetchRemoteCommitsAsync(path, UpstreamName, CancellationToken.None);
+        if (!IsRepositoryContextCurrent(context, path)) return;
         var outgoingChanged = SyncCollection(OutgoingCommits, outgoing);
         var incomingChanged = SyncCollection(IncomingCommits, incoming);
         if (outgoingChanged || incomingChanged)
@@ -2307,7 +2818,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     /// <summary>当前分支是否有上游。</summary>
     [ObservableProperty] private bool hasUpstream;
 
-    /// <summary>上游短名(如 origin/main),显示在同步折叠栏行的元信息。</summary>
+    /// <summary>上游短名(如 origin/main),显示在传入同步边界旁。</summary>
     [ObservableProperty] private string upstreamName = string.Empty;
 
     /// <summary>上次重建行集合时的同步签名(上游|ahead|behind):变化才重建,避免静默刷新闪烁。</summary>
@@ -2321,7 +2832,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     [RelayCommand(CanExecute = nameof(CanStashAllChanges))]
     private async Task StashAllChangesAsync()
     {
-        await RunAsync("贮藏全部更改", async cancellationToken =>
+        await RunRepositoryAsync("贮藏全部更改", async cancellationToken =>
         {
             await _gitService.StashAsync(RepositoryPath, cancellationToken);
             await LoadStateAsync(cancellationToken);
@@ -2340,7 +2851,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             return;
         }
 
-        await RunAsync($"应用贮藏 {stash.Index}", async cancellationToken =>
+        await RunRepositoryAsync($"应用贮藏 {stash.Index}", async cancellationToken =>
         {
             await _gitService.PopStashAsync(RepositoryPath, stash.Index, cancellationToken);
             await LoadStateAsync(cancellationToken);
@@ -2362,7 +2873,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             return;
         }
 
-        await RunAsync($"丢弃贮藏 {stash.Index}", async cancellationToken =>
+        await RunRepositoryAsync($"丢弃贮藏 {stash.Index}", async cancellationToken =>
         {
             await _gitService.DropStashAsync(RepositoryPath, stash.Index, cancellationToken);
             await LoadStateAsync(cancellationToken);
@@ -2403,15 +2914,43 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
 
     private async Task BindScopedSettingsAsync()
     {
-        if (_settingsSession is not null) await _settingsSession.DisposeAsync();
-        _settingsSession = await _scopedSettings.OpenSessionAsync(new(_workspaceService.Current?.ProjectPath),
+        var context = _workspaceContext ?? _workspaceService.Current;
+        var session = await _scopedSettings.OpenSessionAsync(new(context?.ProjectPath),
             [BuiltInSettingsCatalog.GitAutoRefresh.Id]);
-        _settingsSession.Changed += (_, _) => ApplyScopedSettings(_settingsSession.Current!);
-        ApplyScopedSettings(_settingsSession.Current!);
+        if (!ReferenceEquals(_workspaceContext, context)
+            || !ReferenceEquals(_workspaceService.Current, context))
+        {
+            await session.DisposeAsync();
+            return;
+        }
+
+        var previous = _settingsSession;
+        _settingsSession = session;
+        if (previous is not null) await previous.DisposeAsync();
+        session.Changed += (_, _) => ApplyScopedSettingsSafely(session);
+        ApplyScopedSettingsSafely(session);
+    }
+
+    private void ApplyScopedSettingsSafely(ISettingsSession session)
+    {
+        if (session.Current is not { } snapshot)
+        {
+            return;
+        }
+
+        try
+        {
+            ApplyScopedSettings(snapshot);
+        }
+        catch (Exception ex)
+        {
+            LogService.Write("WARNING", $"Git 设置应用失败：{ex.Message}");
+        }
     }
 
     private void ApplyScopedSettings(SettingsSnapshot snapshot)
     {
+        if (!IsSettingsContextCurrent(snapshot.Context)) return;
         if (!_settingsRevisionGate.TryAccept(snapshot)) return;
         _enableScmAutoRefresh = snapshot.Effective(BuiltInSettingsCatalog.GitAutoRefresh);
         if (_enableScmAutoRefresh && IsRepository) _repositoryWatcher.Attach(RepositoryPath);
@@ -2420,22 +2959,39 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
 
     private async Task ApplyWorkspaceContextAsync(ProjectWorkspaceContext? context)
     {
-        HasWorkspace = context is not null;
-        if (context?.GitRepositoryPath is not { Length: > 0 } repositoryPath)
+        await _repositoryContextGate.WaitAsync();
+        try
         {
-            RepositoryPath = string.Empty;
-            _repositoryWatcher.Detach();
-            _hasFullStateLoad = false;
-            IsRepository = false;
-            RepositorySummary = context is null ? "未打开项目。" : "当前项目未关联 Git 仓库。";
-            ResetBranchStatus();
-            ClearChanges();
-            StatusRefreshed?.Invoke(this, GitRepositoryStatus.NotARepository);
-            return;
-        }
+            _workspaceContext = context;
+            HasWorkspace = context is not null;
+            if (context?.GitRepositoryPath is not { Length: > 0 } repositoryPath)
+            {
+                RepositoryPath = string.Empty;
+                _repositoryWatcher.Detach();
+                _hasFullStateLoad = false;
+                IsRepository = false;
+                RepositorySummary = context is null ? "未打开项目。" : "当前项目未关联 Git 仓库。";
+                ResetBranchStatus();
+                ClearChanges();
+                StatusRefreshed?.Invoke(this, GitRepositoryStatus.NotARepository);
+                return;
+            }
 
-        RepositoryPath = repositoryPath;
-        await LoadStateAsync();
+            var repositoryChanged = !PathsEqual(RepositoryPath, repositoryPath);
+            RepositoryPath = repositoryPath;
+            // Re-activating the same repository creates a new workspace generation. Do not let
+            // equal Git rows/logs from the old generation suppress the first load of the new one.
+            if (!repositoryChanged)
+            {
+                ClearChanges();
+            }
+
+            await LoadStateAsync();
+        }
+        finally
+        {
+            _repositoryContextGate.Release();
+        }
     }
 
     private bool CanStageAll() => IsRepository && UnstagedChanges.Count > 0;
@@ -2568,11 +3124,12 @@ public sealed record ScmFileNode(GitChangeItem Change, int Depth) : ScmRowNode(D
 /// 展开状态与已加载文件随之存活。Graph 为 null 表示该列表不带泳道图(传入/传出)。</summary>
 public sealed partial class GitLogRow : ObservableObject
 {
-    public GitLogRow(GitCommitInfo commit, GitGraphRow? graph, string? directionGlyph = null)
+    public GitLogRow(GitCommitInfo commit, GitGraphRow? graph, string? directionGlyph = null, string? syncTarget = null)
     {
         Commit = commit;
         Graph = graph;
         DirectionGlyph = directionGlyph;
+        SyncTarget = syncTarget;
 
         // 提交引用转成徽标(名称 + 图标字形 + 分支色键):本地分支用 git-branch、远端分支用
         // cloud、标签用 pin,三类引用在提交折叠栏和悬浮窗中共用同一套徽标模板。
@@ -2594,7 +3151,7 @@ public sealed partial class GitLogRow : ObservableObject
                     : reference.Kind == GitRefKind.Tag
                         ? "InfoAccentBrush"
                         : $"GraphLane{(GitViewModel.StableHash(reference.Name) % 6) + 1}Brush";
-            badges.Add(new GitLogRefBadge(reference.Name, glyph, colorKey));
+            badges.Add(new GitLogRefBadge(reference.Name, glyph, colorKey, reference.Kind));
         }
 
         RefBadges = badges;
@@ -2606,6 +3163,11 @@ public sealed partial class GitLogRow : ObservableObject
 
     /// <summary>Codicon direction marker used by incoming/outgoing synchronization rows.</summary>
     public string? DirectionGlyph { get; }
+
+    /// <summary>同步边界对应的本地/上游分支名；普通提交行为 null。</summary>
+    public string? SyncTarget { get; }
+
+    public bool IsSyncBoundary => !string.IsNullOrWhiteSpace(SyncTarget);
 
     /// <summary>折叠栏是否展开(展开后显示该提交的更改文件)。</summary>
     [ObservableProperty] private bool isExpanded;
@@ -2636,14 +3198,15 @@ public sealed partial class GitLogRow : ObservableObject
     {
         get
         {
-            var body = string.IsNullOrWhiteSpace(Commit.Body) ? string.Empty : "\n" + Commit.Body.Trim();
-            return $"提交: {Commit.ShortHash} ({Commit.Hash})\n提交人: {Commit.AuthorName} <{Commit.AuthorEmail}>\n提交时间: {Commit.AuthorDate:yyyy-MM-dd HH:mm}（距今 {CommitAgeText}）\n{Commit.Subject}{body}";
+            return $"提交: {Commit.ShortHash} ({Commit.Hash})\n提交人: {Commit.AuthorName} <{Commit.AuthorEmail}>\n提交时间: {Commit.AuthorDate:yyyy-MM-dd HH:mm}（距今 {CommitAgeText}）\n{FullMessage}";
         }
     }
 
     /// <summary>提交信息全文(主题 + 正文),交悬浮窗的 markdown 渲染器使用。</summary>
     public string FullMessage =>
-        string.IsNullOrWhiteSpace(Commit.Body) ? Commit.Subject : Commit.Subject + "\n\n" + Commit.Body;
+        !string.IsNullOrWhiteSpace(Commit.Message)
+            ? Commit.Message.TrimEnd()
+            : string.IsNullOrWhiteSpace(Commit.Body) ? Commit.Subject : Commit.Subject + "\n\n" + Commit.Body;
 
     /// <summary>提交时间相对当前本地时间的间隔,用于悬浮窗中的人类可读时间提示。</summary>
     public string CommitAgeText => FormatCommitAge(Commit.AuthorDate, DateTimeOffset.Now);
@@ -2692,9 +3255,21 @@ public sealed partial class GitLogRow : ObservableObject
     public override int GetHashCode() => Commit.GetHashCode();
 }
 
-/// <summary>提交行/悬浮窗里的一个分支徽标:显示名 + 图标字形(本地分支 git-branch,
-/// 远端分支 cloud)+ 分支色键(主题令牌名,与图形泳道同源,随主题换肤)。</summary>
-public sealed record GitLogRefBadge(string Name, string Glyph, string ColorKey);
+/// <summary>提交行/悬浮窗里的一个引用徽标:显示名 + 图标字形(本地分支 git-branch,
+/// 远端分支 cloud,标签 tag)+ 分支色键(主题令牌名,与图形泳道同源,随主题换肤)+ 引用类型,
+/// 用于让"标签操作"仅对标签徽标生效。</summary>
+public sealed record GitLogRefBadge(string Name, string Glyph, string ColorKey, GitRefKind Kind)
+{
+    public bool IsTag => Kind == GitRefKind.Tag;
+}
+
+/// <summary>右键子菜单里一项可执行操作(标题 + 命令 + 目标标签名)。TagName 随条目携带:
+/// 嵌套弹出层内的项无法用 RelativeSource AncestorType 跨 Popup 查找父项取参,祖先查找
+/// 解析为 null 会让命令静默无操作。</summary>
+public sealed record GitMenuCommandItem(string Header, System.Windows.Input.ICommand Command, string TagName);
+
+/// <summary>「选中提交的标签」子菜单中的一个标签节点(标签名 + 它的全部操作)。</summary>
+public sealed record GitTagMenuNode(string TagName, IReadOnlyList<GitMenuCommandItem> Actions);
 
 /// <summary>折叠栏内联的一个更改文件:包住 <see cref="GitFileChange"/> 并提供显示派生与所属行
 /// (行携带提交哈希,点击文件即可打开该提交的 diff)。</summary>
@@ -2728,7 +3303,8 @@ public sealed record GitGraphRow(
     IReadOnlyList<int>? MergeFromLanes = null,
     IReadOnlyList<string>? LaneColorKeys = null,
     IReadOnlyList<string>? LaneIncomingColorKeys = null,
-    bool DotHollow = false);
+    bool DotHollow = false,
+    bool DotDashed = false);
 
 /// <summary>圆点泳道到父提交泳道的连线(同泳道为直线,异泳道为分叉曲线)。</summary>
 public sealed record GitGraphLink(int FromLane, int ToLane);

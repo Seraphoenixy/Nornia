@@ -402,28 +402,38 @@ public sealed class SearchPerformanceTests : IDisposable
         vm.SearchText = "a";
         await WaitUntilAsync(() => counting.SearchCount == 1 && !vm.IsSearching);
 
-        // Keystroke 2 ("ab") must wait the probe-scaled 900ms, not the 300ms base.
+        // Keystroke 2 ("ab") must wait the probe-scaled 900ms, not the 300ms base. We measure
+        // elapsed time instead of racing two timers with a fixed 450ms sleep — under heavy
+        // parallel CI load a Task.Delay can return late and spuriously fail.
+        var regexKeystrokeAt = Environment.TickCount64;
         vm.SearchText = "ab";
-        await Task.Delay(450);
-        Assert.True(1 == counting.SearchCount, "the 900ms probe-scaled debounce must not have elapsed yet");
-        await WaitUntilAsync(() => counting.SearchCount == 2);
+        while (counting.SearchCount < 2 && Environment.TickCount64 - regexKeystrokeAt < 3000)
+        {
+            await Task.Delay(20);
+        }
+
+        Assert.True(2 == counting.SearchCount, "the scaled regex search should have started");
+        // Scaled to ~900ms (3× base), so it must land well past the 300ms base window. Only the
+        // lower edge is asserted, keeping the check robust to load-induced delays pushing it up.
+        Assert.True(Environment.TickCount64 - regexKeystrokeAt >= 650,
+            $"regex debounce should be probe-scaled to 900ms, but the scan started after {Environment.TickCount64 - regexKeystrokeAt}ms");
 
         // Plain literal searches keep the 300ms base regardless of the regex probe history.
         vm.SearchUseRegex = false;
         await WaitUntilAsync(() => counting.SearchCount == 3 && !vm.IsSearching);
         var literalKeystrokeAt = Environment.TickCount64;
         vm.SearchText = "abc";
-        await Task.Delay(200);
-        Assert.True(3 == counting.SearchCount, "the 300ms base debounce must not have elapsed yet");
-        var deadline = Environment.TickCount64 + 2000;
-        while (counting.SearchCount < 4 && Environment.TickCount64 < deadline)
+        while (counting.SearchCount < 4 && Environment.TickCount64 - literalKeystrokeAt < 2000)
         {
             await Task.Delay(20);
         }
 
         Assert.True(4 == counting.SearchCount, "the literal search should have started");
-        Assert.True(Environment.TickCount64 - literalKeystrokeAt < 700,
-            $"literal debounce should be the 300ms base, but the scan took {Environment.TickCount64 - literalKeystrokeAt}ms to start");
+        var literalElapsedMs = Environment.TickCount64 - literalKeystrokeAt;
+        // Base ≈300ms: not instant (which would indicate the scaled delay leaked into a literal
+        // search) and well under 700ms, far clear of the 900ms probe window. The 250–700ms band
+        // absorbs scheduler slack without accepting an instant or a scaled debounce.
+        Assert.InRange(literalElapsedMs, 250, 700);
     }
 
     // ─────────────────────────── S9: per-level tree index ───────────────────────────

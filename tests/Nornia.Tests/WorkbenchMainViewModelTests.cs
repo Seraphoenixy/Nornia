@@ -44,10 +44,10 @@ public sealed class WorkbenchMainViewModelTests
             new FakeSummaryReader(new DashboardSummary(0, 0, 0)),
             new FakeCacheInventory([]), navigation, logs);
         var runtime = new RuntimeViewModel(runtimeInventory, packageProvider, packageInventory, resolver, confirmation, logs);
-        var tools = new ToolsViewModel(runtimeInventory, packageProvider, packageInventory, resolver, confirmation, logs);
+        var tools = new ToolsViewModel(runtimeInventory, packageProvider, packageInventory, resolver, confirmation, logs, new FakeToolExtensionInventoryService());
         var cache = new CacheViewModel(new FakeCacheInventory([]), new FakeCacheCleanup(),
-            new FakePackageRepository(), new CachePackageAssociationService(), confirmation, logs, new FakeUiDispatcher());
-        var packages = new PackagesViewModel(packageProvider, packageInventory, confirmation, logs, cache);
+            new CacheClassificationService(), confirmation, logs, new FakeUiDispatcher());
+        var packages = new PackagesViewModel(packageProvider, packageInventory, confirmation, logs);
         var environment = new EnvironmentManagementViewModel(dashboard, runtime, tools, packages, cache, logs, clipboard);
 
         var settingsService = new FakeSettingsService();
@@ -89,19 +89,37 @@ public sealed class WorkbenchMainViewModelTests
         return new Fixture(main, logs, navigation, terminal, terminalService, editor);
     }
 
-    // ===== Startup: no page tab is auto-opened =====
+    // ===== Startup: explorer is selected; content pages open only on navigation =====
 
     [Fact]
-    public void Startup_OpensNoPageTab_ActivityBarStillDefaultsToEnvironment()
+    public void Startup_OpensNoPageTab_ActivityBarDefaultsToExplorer()
     {
         var fixture = Create();
 
-        // 启动不再自动打开环境管理页面标签:条带为空,主内容区呈空状态。
+        // 启动显示资源管理器欢迎页，不自动打开环境管理标签。
         Assert.Empty(fixture.Main.Workbench.Tabs);
         Assert.False(fixture.Main.Workbench.HasTabs);
         Assert.Null(fixture.Main.Workbench.SelectedTab);
-        // 活动栏/二级左侧栏仍默认定位环境管理。
+        // 环境管理位于项目管理之后，默认选中资源管理器。
+        Assert.Equal(
+            new[] { NavigationTargets.Explorer, NavigationTargets.Git, NavigationTargets.Projects, NavigationTargets.Dashboard, NavigationTargets.Settings },
+            fixture.Main.NavigationItems.Select(item => item.NavigationIds.First()));
         Assert.Same(fixture.Main.NavigationItems[0], fixture.Main.SelectedNavigationItem);
+        Assert.True(fixture.Main.ShowViewPageWelcome);
+    }
+
+    [Fact]
+    public void EnvironmentNavigation_FirstClickOpensPage()
+    {
+        var fixture = Create();
+        var environment = fixture.Main.NavigationItems.Single(item => item.Page is EnvironmentManagementViewModel);
+
+        fixture.Main.SelectedNavigationItem = environment;
+
+        var tab = Assert.Single(fixture.Main.Workbench.Tabs);
+        Assert.Same(environment.Page, tab.Content);
+        Assert.Same(tab, fixture.Main.Workbench.SelectedTab);
+        Assert.Same(environment.Page, fixture.Main.CurrentPage);
     }
 
     // ===== Content pages open as tabs; view pages never do =====
@@ -111,14 +129,14 @@ public sealed class WorkbenchMainViewModelTests
     {
         var fixture = Create();
 
-        fixture.Main.NavigateByIndexCommand.Execute(3); // 项目管理
+        fixture.Main.NavigateByIndexCommand.Execute(2); // 项目管理
         fixture.Main.NavigateByIndexCommand.Execute(4); // 设置
-        fixture.Main.NavigateByIndexCommand.Execute(3); // 项目管理(重复导航)
+        fixture.Main.NavigateByIndexCommand.Execute(2); // 项目管理(重复导航)
 
         // 启动不再自动打开环境管理页:导航仅产生 项目管理 + 设置 两个标签。
         Assert.Equal(2, fixture.Main.Workbench.Tabs.Count);
-        Assert.Same(fixture.Main.NavigationItems[3].Page, fixture.Main.CurrentPage);
-        var projectsTab = fixture.Main.Workbench.Tabs.Single(tab => ReferenceEquals(tab.Content, fixture.Main.NavigationItems[3].Page));
+        Assert.Same(fixture.Main.NavigationItems[2].Page, fixture.Main.CurrentPage);
+        var projectsTab = fixture.Main.Workbench.Tabs.Single(tab => ReferenceEquals(tab.Content, fixture.Main.NavigationItems[2].Page));
         Assert.Same(projectsTab, fixture.Main.Workbench.SelectedTab);
     }
 
@@ -128,8 +146,8 @@ public sealed class WorkbenchMainViewModelTests
         var fixture = Create();
         var tabsBefore = fixture.Main.Workbench.Tabs.Count;
 
-        fixture.Main.NavigateByIndexCommand.Execute(1); // 资源管理器
-        fixture.Main.NavigateByIndexCommand.Execute(2); // 源代码管理
+        fixture.Main.NavigateByIndexCommand.Execute(0); // 资源管理器
+        fixture.Main.NavigateByIndexCommand.Execute(1); // 源代码管理
 
         // 视图页永不产生标签。
         Assert.Equal(tabsBefore, fixture.Main.Workbench.Tabs.Count);
@@ -145,7 +163,7 @@ public sealed class WorkbenchMainViewModelTests
         await OpenEditorTabsAsync(fixture, "a.cs");
         var document = Assert.IsType<EditorWorkbenchTab>(fixture.Main.Workbench.SelectedTab);
 
-        fixture.Main.NavigateByIndexCommand.Execute(2); // 源代码管理
+        fixture.Main.NavigateByIndexCommand.Execute(1); // 源代码管理
 
         // 活动文档保持选中 → 欢迎层不出现。
         Assert.Same(document, fixture.Main.Workbench.SelectedTab);
@@ -159,15 +177,15 @@ public sealed class WorkbenchMainViewModelTests
     {
         var fixture = Create();
         // 启动不再自动打开环境管理页标签,先显式打开(重复导航不复制)。
-        fixture.Main.Workbench.OpenOrActivatePage(fixture.Main.NavigationItems[0].Page);
-        fixture.Main.NavigateByIndexCommand.Execute(3); // 项目管理标签打开并选中
-        var environmentTab = fixture.Main.Workbench.Tabs.Single(tab => ReferenceEquals(tab.Content, fixture.Main.NavigationItems[0].Page));
+        fixture.Main.Workbench.OpenOrActivatePage(fixture.Main.NavigationItems[3].Page);
+        fixture.Main.NavigateByIndexCommand.Execute(2); // 项目管理标签打开并选中
+        var environmentTab = fixture.Main.Workbench.Tabs.Single(tab => ReferenceEquals(tab.Content, fixture.Main.NavigationItems[3].Page));
 
         fixture.Main.Workbench.OpenOrActivateTab(environmentTab);
 
         // 标签→活动栏:高亮所属活动项,页面标签不重复打开。
-        Assert.Same(fixture.Main.NavigationItems[0], fixture.Main.SelectedNavigationItem);
-        Assert.Same(fixture.Main.NavigationItems[0].Page, fixture.Main.CurrentPage);
+        Assert.Same(fixture.Main.NavigationItems[3], fixture.Main.SelectedNavigationItem);
+        Assert.Same(fixture.Main.NavigationItems[3].Page, fixture.Main.CurrentPage);
         Assert.Equal(2, fixture.Main.Workbench.Tabs.Count);
         Assert.Same(environmentTab, fixture.Main.Workbench.SelectedTab);
     }
@@ -178,7 +196,7 @@ public sealed class WorkbenchMainViewModelTests
     public void OperationPage_FollowsSelectionAndEnvironmentSection()
     {
         var fixture = Create();
-        var environment = Assert.IsType<EnvironmentManagementViewModel>(fixture.Main.NavigationItems[0].Page);
+        var environment = Assert.IsType<EnvironmentManagementViewModel>(fixture.Main.NavigationItems[3].Page);
 
         // 启动不再自动打开环境管理页标签,先显式打开(反馈源跟随其当前小节)。
         fixture.Main.Workbench.OpenOrActivatePage(environment);
@@ -186,17 +204,24 @@ public sealed class WorkbenchMainViewModelTests
         // 环境页标签选中 → 反馈源是其当前小节页(默认概览)。
         Assert.Same(environment.CurrentPage, fixture.Main.OperationPage);
         Assert.IsType<DashboardViewModel>(fixture.Main.OperationPage);
+        Assert.True(fixture.Main.ShowStatusBarProgressPercentage);
 
         // 页内切小节 → 反馈源跟随。
         environment.SelectSection(EnvironmentSection.Runtime);
         Assert.IsType<RuntimeViewModel>(fixture.Main.OperationPage);
+        Assert.True(fixture.Main.ShowStatusBarProgressPercentage);
+
+        environment.SelectSection(EnvironmentSection.Packages);
+        Assert.IsType<PackagesViewModel>(fixture.Main.OperationPage);
+        Assert.False(fixture.Main.ShowStatusBarProgressPercentage);
 
         // 其它内容页标签选中 → 反馈源是该页本身。
-        fixture.Main.NavigateByIndexCommand.Execute(3); // 项目管理
-        Assert.Same(fixture.Main.NavigationItems[3].Page, fixture.Main.OperationPage);
+        fixture.Main.NavigateByIndexCommand.Execute(2); // 项目管理
+        Assert.Same(fixture.Main.NavigationItems[2].Page, fixture.Main.OperationPage);
+        Assert.True(fixture.Main.ShowStatusBarProgressPercentage);
 
         // 视图页 → 反馈源回落到当前活动栏页。
-        fixture.Main.NavigateByIndexCommand.Execute(1); // 资源管理器
+        fixture.Main.NavigateByIndexCommand.Execute(0); // 资源管理器
         Assert.Same(fixture.Main.CurrentPage, fixture.Main.OperationPage);
     }
 
@@ -442,9 +467,10 @@ public sealed class WorkbenchMainViewModelTests
 
         // 默认配置已切换并持久化(写入用户作用域);已有会话保持不变(仍用创建时的 Shell)。
         // PersistDefaultShellAsync 在后台异步写入(真实 jsonc 文件读改写);轮询直到设置落盘。
-        // 预算给到 5 秒:并行测试负载下本地文件 IO 偶发超过 1 秒(此前因此偶发 flake)。
+        // 预算给到 30 秒:并行测试负载下本地文件 IO 偶发超过 1 秒(此前因此偶发 flake),
+        // 2 核 CI 全量套件下实测会超过 5 秒。
         var persisted = false;
-        for (var i = 0; i < 100; i++)
+        for (var i = 0; i < 600; i++)
         {
             var snapshot = await settingsService.GetSnapshotAsync(new SettingsContext());
             if (string.Equals("cmd", snapshot.Effective(BuiltInSettingsCatalog.TerminalDefaultProfile), StringComparison.Ordinal))
@@ -459,9 +485,55 @@ public sealed class WorkbenchMainViewModelTests
             var final = await settingsService.GetSnapshotAsync(new SettingsContext());
             persisted = string.Equals("cmd", final.Effective(BuiltInSettingsCatalog.TerminalDefaultProfile), StringComparison.Ordinal);
         }
-        Assert.True(persisted, "Default shell was not persisted within the expected time.");
+        if (!persisted)
+        {
+            // 诊断:失败时dump日志(含持久化失败原因)与落盘文件内容,避免只有超时表象。
+            var file = File.Exists(settingsService.SettingsPath)
+                ? File.ReadAllText(settingsService.SettingsPath)
+                : "<missing>";
+            var logs = string.Join("\n", logService.Entries.Select(entry => $"[{entry.Level}] {entry.Message}"));
+            Assert.Fail($"""
+                Default shell was not persisted within the expected time.
+                Settings file ({settingsService.SettingsPath}): {file}
+                Log entries:
+                {logs}
+                """);
+        }
         Assert.Same(session, Assert.Single(terminal.Sessions));
         Assert.Equal("test-Terminal-A", session.Session.Profile.Id);
+    }
+
+    /// <summary>磁盘压力下(原子替换重试耗尽 → FileError)单次提交失败不应让默认 Shell
+    /// 静默丢失:持久化必须带退避重试直至落盘。回归自 ProfileSwitch 全量并行下的偶发超时。</summary>
+    [Theory]
+    [InlineData(SettingsCommitStatus.FileError)]
+    [InlineData(SettingsCommitStatus.Conflict)]
+    public async Task ProfileSwitch_RetriesTransientPersistFailure(SettingsCommitStatus failureStatus)
+    {
+        var settingsService = new FlakySettingsService(failureStatus, initialFailures: 2);
+        var terminalService = Substitute.For<ITerminalService>();
+        terminalService.DiscoverProfiles().Returns([
+            new ShellProfile("pwsh", "PowerShell 7", "pwsh.exe"),
+            new ShellProfile("cmd", "命令提示符", "cmd.exe")]);
+        var terminal = new TerminalViewModel(terminalService, settingsService, new FakeProjectWorkspaceService(),
+            new FakeUiLogService(), new FakeClipboardService());
+        await terminal.ActivateAsync();
+        await AddSessionToAsync(terminal, terminalService, "Terminal-A");
+
+        var cmdProfile = terminal.Profiles.ToArray().Single(profile => profile.Id == "cmd");
+        terminal.SelectedProfile = cmdProfile;
+
+        // 前两次提交被注入失败,重试路径(Conflict 先刷新会话基线)最终必须落盘。
+        var persisted = false;
+        for (var i = 0; i < 100 && !persisted; i++)
+        {
+            var snapshot = await settingsService.GetSnapshotAsync(new SettingsContext());
+            persisted = string.Equals("cmd", snapshot.Effective(BuiltInSettingsCatalog.TerminalDefaultProfile), StringComparison.Ordinal);
+            if (!persisted) await Task.Delay(50);
+        }
+
+        Assert.True(persisted, $"默认 Shell 未在重试后落盘(failureStatus={failureStatus})");
+        Assert.True(settingsService.CommitCount >= 3, "应观察到重试(至少 3 次提交)");
     }
 
     // ===== Helpers =====

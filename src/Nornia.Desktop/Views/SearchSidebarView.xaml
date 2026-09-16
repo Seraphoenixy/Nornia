@@ -6,6 +6,65 @@
              xmlns:controls="clr-namespace:Nornia.Desktop.Views.Controls"
              xmlns:loc="clr-namespace:Nornia.Desktop.Localization">
   <UserControl.Resources>
+    <!-- VS Code-style search option toggles. The controls remain boolean CheckBoxes for
+         binding/accessibility, but visually belong to the search toolbar rather than a form. -->
+    <Style x:Key="SearchOptionToggleStyle" TargetType="CheckBox">
+      <Setter Property="MinWidth" Value="28" />
+      <Setter Property="Height" Value="22" />
+      <Setter Property="Padding" Value="3,0" />
+      <Setter Property="Foreground" Value="{DynamicResource TextBrush}" />
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderBrush" Value="Transparent" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="HorizontalContentAlignment" Value="Center" />
+      <Setter Property="VerticalContentAlignment" Value="Center" />
+      <Setter Property="Cursor" Value="Hand" />
+      <Setter Property="FocusVisualStyle" Value="{StaticResource AppFocusRing}" />
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="CheckBox">
+            <Border x:Name="ToggleSurface"
+                    Background="{TemplateBinding Background}"
+                    BorderBrush="{TemplateBinding BorderBrush}"
+                    BorderThickness="{TemplateBinding BorderThickness}"
+                    CornerRadius="{StaticResource RadiusSm}"
+                    Padding="{TemplateBinding Padding}"
+                    SnapsToDevicePixels="True">
+              <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
+                                RecognizesAccessKey="True" />
+            </Border>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsMouseOver" Value="True">
+                <Setter TargetName="ToggleSurface" Property="Background" Value="{DynamicResource HoverBrush}" />
+                <Setter Property="Foreground" Value="{DynamicResource BrightTextBrush}" />
+              </Trigger>
+              <Trigger Property="IsChecked" Value="True">
+                <Setter TargetName="ToggleSurface" Property="Background" Value="{DynamicResource SelectionActiveBrush}" />
+                <Setter TargetName="ToggleSurface" Property="BorderBrush" Value="{DynamicResource AccentBrush}" />
+                <Setter Property="Foreground" Value="{DynamicResource BrightTextBrush}" />
+              </Trigger>
+              <MultiTrigger>
+                <MultiTrigger.Conditions>
+                  <Condition Property="IsMouseOver" Value="True" />
+                  <Condition Property="IsPressed" Value="True" />
+                </MultiTrigger.Conditions>
+                <Setter TargetName="ToggleSurface" Property="Background" Value="{DynamicResource PressedBrush}" />
+                <Setter TargetName="ToggleSurface" Property="BorderBrush" Value="{DynamicResource PressedBorderBrush}" />
+              </MultiTrigger>
+              <Trigger Property="IsKeyboardFocused" Value="True">
+                <Setter TargetName="ToggleSurface" Property="BorderBrush" Value="{DynamicResource FocusBorderBrush}" />
+              </Trigger>
+              <Trigger Property="IsEnabled" Value="False">
+                <Setter Property="Opacity" Value="0.55" />
+                <Setter Property="Cursor" Value="Arrow" />
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+
     <DataTemplate DataType="{x:Type local:SearchTreeNode}">
       <Grid MinHeight="{DynamicResource SizeRowSm}">
         <controls:SidebarTreeGuideLayer GuideLefts="{Binding AncestorGuideLefts}" ShowGuides="True" />
@@ -120,9 +179,12 @@
         <TextBox Text="{Binding SearchText, UpdateSourceTrigger=PropertyChanged}"
                  ToolTip="{loc:StringLoc Key=Search_Placeholder}" AutomationProperties.Name="{loc:StringLoc Key=Search_Placeholder}" />
         <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
-          <CheckBox Content="Aa" IsChecked="{Binding SearchCaseSensitive}" ToolTip="{loc:StringLoc Key=Search_CaseSensitive}" Margin="0,0,8,0" />
-          <CheckBox Content="ab" IsChecked="{Binding SearchWholeWord}" ToolTip="{loc:StringLoc Key=Search_WholeWord}" Margin="0,0,8,0" />
-          <CheckBox Content=".*" IsChecked="{Binding SearchUseRegex}" ToolTip="{loc:StringLoc Key=Search_Regex}" />
+          <CheckBox Style="{StaticResource SearchOptionToggleStyle}" Width="28" Content="Aa" IsChecked="{Binding SearchCaseSensitive}"
+                    ToolTip="{loc:StringLoc Key=Search_CaseSensitive}" Margin="0,0,4,0" />
+          <CheckBox Style="{StaticResource SearchOptionToggleStyle}" Width="28" Content="ab" IsChecked="{Binding SearchWholeWord}"
+                    ToolTip="{loc:StringLoc Key=Search_WholeWord}" Margin="0,0,4,0" />
+          <CheckBox Style="{StaticResource SearchOptionToggleStyle}" Width="28" Content=".*" IsChecked="{Binding SearchUseRegex}"
+                    ToolTip="{loc:StringLoc Key=Search_Regex}" />
           <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconMore}" FontFamily="{StaticResource IconFontFamily}"
                   ToolTip="{loc:StringLoc Key=Search_ToggleDetails}" Command="{Binding ToggleSearchDetailsCommand}" Margin="8,0,0,0" />
         </StackPanel>
@@ -131,7 +193,9 @@
           <TextBox Text="{Binding IncludePattern, UpdateSourceTrigger=PropertyChanged}" ToolTip="{loc:StringLoc Key=Search_Include}" Margin="0,2,0,0" />
           <TextBlock Text="{loc:StringLoc Key=Search_ExcludeLabel}" Foreground="{DynamicResource SubtleTextBrush}" FontSize="{DynamicResource TypeBody}" Margin="0,5,0,0" />
           <TextBox Text="{Binding ExcludePattern, UpdateSourceTrigger=PropertyChanged}" ToolTip="{loc:StringLoc Key=Search_Exclude}" Margin="0,2,0,0" />
-          <CheckBox Content="{loc:StringLoc Key=Search_UseIgnoreFiles}" IsChecked="{Binding UseIgnoreFiles}" Margin="0,5,0,0" />
+          <CheckBox Style="{StaticResource SearchOptionToggleStyle}"
+                    Content="{loc:StringLoc Key=Search_UseIgnoreFiles}" IsChecked="{Binding UseIgnoreFiles}"
+                    HorizontalAlignment="Left" Padding="6,0" Margin="0,5,0,0" />
         </StackPanel>
         <TextBlock Text="{Binding SearchErrorMessage}" Foreground="{DynamicResource ErrorTextBrush}" TextWrapping="Wrap" Margin="0,4,0,0"
                    Visibility="{Binding HasSearchError, Converter={StaticResource BooleanToVisibilityConverter}}" />

@@ -334,6 +334,30 @@ public sealed class AnsiParser
             case 'K':
                 _screen.EraseInLine(ValueAt(parameters, 0));
                 break;
+            case 'X':
+                // ECH:行中段擦除(ConPTY 差分渲染在短内容替换长内容时使用)。
+                _screen.EraseCharacters(DefaultOne(parameters, 0));
+                break;
+            case 'P':
+                // DCH:光标起删除字符,右侧左移。
+                _screen.DeleteCharacters(DefaultOne(parameters, 0));
+                break;
+            case '@':
+                // ICH:光标起插入空白格,右侧右移。
+                _screen.InsertCharacters(DefaultOne(parameters, 0));
+                break;
+            case 'b':
+                // REP:重复上一个图形字符(ConPTY 压缩重复段)。
+                _screen.RepeatLastCharacter(DefaultOne(parameters, 0));
+                break;
+            case 'L':
+                // IL:滚动区域内插入空行。
+                _screen.InsertLines(DefaultOne(parameters, 0));
+                break;
+            case 'M':
+                // DL:滚动区域内删除行。
+                _screen.DeleteLines(DefaultOne(parameters, 0));
+                break;
             case 'm':
                 ApplySgr(parameters);
                 break;
@@ -364,7 +388,7 @@ public sealed class AnsiParser
                 // Unimplemented standard modes: ignore.
                 break;
             default:
-                // Unsupported CSI (insert/delete, repeat, device status...): ignore.
+                // Unsupported CSI (device status, window ops...): ignore.
                 break;
         }
     }

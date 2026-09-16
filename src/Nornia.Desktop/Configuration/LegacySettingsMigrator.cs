@@ -51,7 +51,7 @@ public sealed class LegacySettingsMigrator(ISettingsService settings, IApplicati
                 Set(BuiltInSettingsCatalog.IndentationGuides.Id, old.Reading.ShowIndentGuides),
                 Set(BuiltInSettingsCatalog.Folding.Id, old.Reading.ShowFoldingControls),
                 Set(BuiltInSettingsCatalog.DiffSideBySide.Id,
-                    EnumName(old.Diff.DefaultLayout, ["Inline", "SideBySide"], "Inline") == "SideBySide"),
+                    EnumName(old.Diff.DefaultLayout, ["Inline", "SideBySide"], "SideBySide") == "SideBySide"),
                 Set(BuiltInSettingsCatalog.DiffHideUnchanged.Id, old.Diff.CollapseUnchangedContext),
                 Set(BuiltInSettingsCatalog.DiffIntraline.Id, old.Diff.ShowIntralineChanges),
                 Set(BuiltInSettingsCatalog.DiffOverview.Id, old.Diff.ShowOverviewRuler),

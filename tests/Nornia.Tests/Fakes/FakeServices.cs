@@ -6,6 +6,7 @@ using Nornia.Desktop.Configuration;
 using Nornia.Desktop.Services;
 using Nornia.Project.Models;
 using Nornia.Project.Services;
+using Nornia.Runtime.Extensions;
 using CoreRuntime = Nornia.Core.Models.Runtime;
 
 namespace Nornia.Tests.Fakes;
@@ -115,6 +116,33 @@ internal sealed class FakeGitRepositoryWatcher : IGitRepositoryWatcher
     }
 }
 
+/// <summary>Watcher fake for the explorer tree auto-refresh tests: records attach calls and lets
+/// the test raise <see cref="FilesChanged"/> deterministically (the production watcher debounces
+/// and marshals; the VM tests drive the post-debounce event directly).</summary>
+internal sealed class FakeWorkspaceFileWatcher : IWorkspaceFileWatcher
+{
+    public List<string> AttachedPaths { get; } = [];
+    public List<IReadOnlyCollection<string>> WatchedDirectorySets { get; } = [];
+    public int DetachCalls { get; private set; }
+    public bool Disposed { get; private set; }
+
+    public event EventHandler<WorkspaceFilesChangedEventArgs>? FilesChanged;
+
+    public void Attach(string rootPath) => AttachedPaths.Add(rootPath);
+
+    public void UpdateDirectories(IEnumerable<string> directories) =>
+        WatchedDirectorySets.Add(directories.ToArray());
+
+    public void Detach() => DetachCalls++;
+
+    public void RaiseChanged(string rootPath, params string[] fullPaths) =>
+        FilesChanged?.Invoke(this, new WorkspaceFilesChangedEventArgs(
+            rootPath,
+            new HashSet<string>(fullPaths, StringComparer.OrdinalIgnoreCase)));
+
+    public void Dispose() => Disposed = true;
+}
+
 internal sealed class FakeRuntimeInventory(
     IReadOnlyList<CoreRuntime> refreshResult,
     IReadOnlyList<CoreRuntime>? persisted = null) : IRuntimeInventoryService
@@ -161,16 +189,20 @@ internal sealed class FakePackageRepository : IPackageRepository
 internal sealed class FakeCacheInventory(IReadOnlyList<CacheCandidate> candidates) : ICacheInventoryService
 {
     public int ScanCalls { get; private set; }
+    public int ForcedScanCalls { get; private set; }
+    public int CachedScanCalls { get; private set; }
 
     public Task<IReadOnlyList<CacheCandidate>> ScanAsync(IProgress<string>? progress = null, CancellationToken cancellationToken = default)
     {
         ScanCalls++;
+        CachedScanCalls++;
         return Task.FromResult(candidates);
     }
 
     public Task<IReadOnlyList<CacheCandidate>> ScanForcedAsync(IProgress<string>? progress = null, CancellationToken cancellationToken = default)
     {
         ScanCalls++;
+        ForcedScanCalls++;
         return Task.FromResult(candidates);
     }
 }
@@ -228,10 +260,17 @@ internal sealed class FakePackageProvider : IPackageProvider
 internal sealed class FakePackageInventory(IReadOnlyList<PackageInfo> packages) : IPackageInventoryService
 {
     public int RefreshCalls { get; private set; }
+    public int ForcedRefreshCalls { get; private set; }
 
     public Task<IReadOnlyList<PackageInfo>> RefreshAsync(IProgress<ProcessOutput>? progress = null, CancellationToken cancellationToken = default)
     {
         RefreshCalls++;
+        return Task.FromResult(packages);
+    }
+
+    public Task<IReadOnlyList<PackageInfo>> RefreshForcedAsync(IProgress<ProcessOutput>? progress = null, CancellationToken cancellationToken = default)
+    {
+        ForcedRefreshCalls++;
         return Task.FromResult(packages);
     }
 
@@ -367,10 +406,84 @@ internal sealed class FakeSettingsService : ISettingsService
         CancellationToken cancellationToken = default) => _inner.OpenSessionAsync(context, keys, cancellationToken);
 }
 
+/// <summary>模拟瞬时提交失败(磁盘压力/杀软实时扫描下的 FileError、会话基线过期 → Conflict):
+/// 打开的会话前 <see cref="InitialFailures"/> 次提交返回指定状态,之后透传内部真实服务,用于
+/// 验证默认 Shell 持久化的重试路径。拦截在会话层:SettingsSession 绑定创建它的服务实例,
+/// 只包装 ISettingsService 的 CommitAsync 拦不到会话提交。</summary>
+internal sealed class FlakySettingsService : ISettingsService
+{
+    private readonly FakeSettingsService _inner = new();
+    private int _commits;
+
+    public FlakySettingsService(SettingsCommitStatus failureStatus = SettingsCommitStatus.FileError, int initialFailures = 2)
+    {
+        FailureStatus = failureStatus;
+        InitialFailures = initialFailures;
+    }
+
+    public SettingsCommitStatus FailureStatus { get; }
+    public int InitialFailures { get; }
+
+    /// <summary>收到的会话提交总数(含注入的失败),供断言"发生了重试"。</summary>
+    public int CommitCount => _commits;
+
+    public string SettingsPath => _inner.SettingsPath;
+
+    public Task<SettingsSnapshot> GetSnapshotAsync(SettingsContext context, CancellationToken cancellationToken = default) =>
+        _inner.GetSnapshotAsync(context, cancellationToken);
+
+    public Task<SettingsCommitResult> CommitAsync(SettingsTransaction transaction, CancellationToken cancellationToken = default) =>
+        _inner.CommitAsync(transaction, cancellationToken);
+
+    public Task<SettingsCommitResult> ResetAsync(string key, SettingScope scope, SettingsContext context,
+        string? languageId = null, CancellationToken cancellationToken = default) =>
+        _inner.ResetAsync(key, scope, context, languageId, cancellationToken);
+
+    public IAsyncEnumerable<SettingsChangeSet> WatchAsync(SettingsContext context, CancellationToken cancellationToken = default) =>
+        _inner.WatchAsync(context, cancellationToken);
+
+    public async Task<ISettingsSession> OpenSessionAsync(SettingsContext context, IReadOnlyCollection<string>? keys = null,
+        CancellationToken cancellationToken = default)
+    {
+        var inner = await _inner.OpenSessionAsync(context, keys, cancellationToken);
+        return new FlakySession(inner, this);
+    }
+
+    private sealed class FlakySession(ISettingsSession inner, FlakySettingsService owner) : ISettingsSession
+    {
+        public SettingsContext Context => inner.Context;
+        public SettingsSnapshot? Current => inner.Current;
+        public IReadOnlyCollection<string>? SubscribedKeys => inner.SubscribedKeys;
+
+        public event EventHandler<SettingsChangeSet>? Changed
+        {
+            add => inner.Changed += value;
+            remove => inner.Changed -= value;
+        }
+
+        public Task<SettingsSnapshot> RefreshAsync(CancellationToken cancellationToken = default) =>
+            inner.RefreshAsync(cancellationToken);
+
+        public async Task<SettingsCommitResult> CommitAsync(SettingScope scope, IReadOnlyList<SettingOperation> operations,
+            CancellationToken cancellationToken = default)
+        {
+            if (Interlocked.Increment(ref owner._commits) <= owner.InitialFailures)
+            {
+                return new SettingsCommitResult(owner.FailureStatus, ErrorMessage: "simulated transient failure");
+            }
+
+            return await inner.CommitAsync(scope, operations, cancellationToken);
+        }
+
+        public ValueTask DisposeAsync() => inner.DisposeAsync();
+    }
+}
+
 /// <summary>Workspace service fake. By default reports no active workspace; tests can set
 /// <see cref="Current"/> directly when a context is required.</summary>
 internal sealed class FakeProjectWorkspaceService : IProjectWorkspaceService
 {
+    private long _generation;
     public ProjectWorkspaceContext? Current { get; set; }
     public bool IsStartupAutoRestore { get; set; }
     public event Func<ProjectWorkspaceContext?, Task>? ContextChanged;
@@ -382,7 +495,9 @@ internal sealed class FakeProjectWorkspaceService : IProjectWorkspaceService
         ActivatedPaths.Add(path);
         if (ActivateResultFactory is not null)
         {
-            Current = ActivateResultFactory(path);
+            Current = ActivateResultFactory(path) is { } next
+                ? next with { Generation = Interlocked.Increment(ref _generation) }
+                : null;
         }
 
         return ContextChanged?.Invoke(Current) ?? Task.CompletedTask;
@@ -410,6 +525,12 @@ internal sealed class FakeGitService : IGitService
     public GitRepositoryStatus? StatusAfterInitialization { get; set; }
     public Exception? InitializeException { get; set; }
     public GitFileDiff? DiffResult { get; set; }
+
+    /// <summary>When set, takes precedence over <see cref="DiffResult"/> per side
+    /// (key: staged flag + untracked flag) — used to simulate "requested side empty, other side has
+    /// content" for the diff empty-fallback tests.</summary>
+    public Dictionary<(bool Staged, bool Untracked), GitFileDiff?>? DiffResultBySide { get; set; }
+
     public string DiffRevision { get; set; } = "revision-1";
     public Dictionary<string, string> DiffRevisions { get; } = new(StringComparer.OrdinalIgnoreCase);
     public List<(string RepositoryPath, string Path, bool Staged, bool IsUntracked)> DiffRequests { get; } = [];
@@ -421,6 +542,9 @@ internal sealed class FakeGitService : IGitService
     public GitFileDiff? CommitFileDiff { get; set; }
 
     public List<string> StatusRequests { get; } = [];
+    /// <summary>Per-status untracked mode; the silent (lite) refresh must request every untracked
+    /// file (includeAllUntracked == true) so new files inside new folders stay individually trackable.</summary>
+    public List<bool> IncludeAllUntrackedRequests { get; } = [];
     public List<string> InitializedRepositoryPaths { get; } = [];
 
     /// <summary>Optional gate: status calls await it so tests can hold a refresh in flight.</summary>
@@ -456,11 +580,12 @@ internal sealed class FakeGitService : IGitService
     public int StashListCalls { get; private set; }
     public int CommitFileListCalls { get; private set; }
     public List<string> CommitFileListRequests { get; } = [];
-    public List<(string RepositoryPath, string Path, bool Staged, GitDiffHunk Hunk, GitHunkOperation Operation)> HunkOperations { get; } = [];
+    public List<(string RepositoryPath, string Path, bool Staged, GitDiffHunk Hunk, GitHunkOperation Operation, int? BlockOrdinal)> HunkOperations { get; } = [];
 
-    public async Task<GitRepositoryStatus> GetStatusAsync(string repositoryPath, CancellationToken cancellationToken = default)
+    public async Task<GitRepositoryStatus> GetStatusAsync(string repositoryPath, CancellationToken cancellationToken = default, bool includeAllUntracked = true)
     {
         StatusRequests.Add(repositoryPath);
+        IncludeAllUntrackedRequests.Add(includeAllUntracked);
         if (StatusGate is not null)
         {
             await StatusGate;
@@ -488,7 +613,10 @@ internal sealed class FakeGitService : IGitService
     public Task<GitFileDiff?> GetDiffAsync(string repositoryPath, string path, bool staged, bool isUntracked = false, CancellationToken cancellationToken = default)
     {
         DiffRequests.Add((repositoryPath, path, staged, isUntracked));
-        return Task.FromResult(DiffResult);
+        var result = DiffResultBySide is { } bySide && bySide.TryGetValue((staged, isUntracked), out var sideResult)
+            ? sideResult
+            : DiffResult;
+        return Task.FromResult(result);
     }
 
     public Task<string> GetDiffRevisionAsync(string repositoryPath, string path, bool staged, bool isUntracked = false, CancellationToken cancellationToken = default) =>
@@ -497,9 +625,9 @@ internal sealed class FakeGitService : IGitService
     public Task<string> GetRawDiffAsync(string repositoryPath, bool staged, IReadOnlyList<string>? paths = null, CancellationToken cancellationToken = default) =>
         Task.FromResult(RawDiff);
 
-    public Task ApplyHunkAsync(string repositoryPath, string path, bool staged, GitDiffHunk hunk, GitHunkOperation operation, CancellationToken cancellationToken = default)
+    public Task ApplyHunkAsync(string repositoryPath, string path, bool staged, GitDiffHunk hunk, GitHunkOperation operation, int? blockOrdinal = null, CancellationToken cancellationToken = default)
     {
-        HunkOperations.Add((repositoryPath, path, staged, hunk, operation));
+        HunkOperations.Add((repositoryPath, path, staged, hunk, operation, blockOrdinal));
         return Task.CompletedTask;
     }
 
@@ -556,6 +684,32 @@ internal sealed class FakeGitService : IGitService
 
     public Task<IReadOnlyList<GitBranchInfo>> GetRemoteBranchesAsync(string repositoryPath, CancellationToken cancellationToken = default) =>
         Task.FromResult(RemoteBranches);
+
+    public Task<IReadOnlyList<GitTagInfo>> GetTagsAsync(string repositoryPath, CancellationToken cancellationToken = default) =>
+        Task.FromResult<IReadOnlyList<GitTagInfo>>([]);
+
+    public Task CreateTagAsync(string repositoryPath, string tagName, bool annotate = false, string? message = null, string? targetRef = null, CancellationToken cancellationToken = default) =>
+        Task.CompletedTask;
+
+    public List<string> DeletedTags { get; } = [];
+
+    public Task DeleteTagAsync(string repositoryPath, string tagName, CancellationToken cancellationToken = default)
+    {
+        DeletedTags.Add(tagName);
+        return Task.CompletedTask;
+    }
+
+    public Task PushTagAsync(string repositoryPath, string tagName, CancellationToken cancellationToken = default) =>
+        Task.CompletedTask;
+
+    public Task PushAllTagsAsync(string repositoryPath, CancellationToken cancellationToken = default) =>
+        Task.CompletedTask;
+
+    public Task FetchTagsAsync(string repositoryPath, CancellationToken cancellationToken = default) =>
+        Task.CompletedTask;
+
+    public Task CheckoutTagAsync(string repositoryPath, string tagName, CancellationToken cancellationToken = default) =>
+        Task.CompletedTask;
 
     public Task CreateBranchAsync(string repositoryPath, string branchName, CancellationToken cancellationToken = default)
     {
@@ -681,6 +835,107 @@ internal sealed class FakeConfirmationService : IConfirmationService
         Calls++;
         Requests.Add((title, message));
         return Result;
+    }
+}
+
+/// <summary>In-memory <see cref="IToolExtensionProvider"/> for the extension-dependency panel
+/// tests: canned installed/outdated lists plus per-method call recordings.</summary>
+internal sealed class FakeToolExtensionProvider : IToolExtensionProvider
+{
+    public FakeToolExtensionProvider(ToolExtensionEcosystem ecosystem, string ecosystemName)
+    {
+        Ecosystem = ecosystem;
+        EcosystemName = ecosystemName;
+    }
+
+    public ToolExtensionEcosystem Ecosystem { get; }
+    public string EcosystemName { get; }
+
+    public IReadOnlyList<ToolExtension> Installed { get; set; } = [];
+    public IReadOnlyList<ToolExtension> Outdated { get; set; } = [];
+    public int ListInstalledCalls { get; private set; }
+    public int ListOutdatedCalls { get; private set; }
+    public List<(string Name, string? Version)> InstallRequests { get; } = [];
+    public List<string> UninstalledPackages { get; } = [];
+    public List<string> UpgradedPackages { get; } = [];
+    /// <summary>按包名返回依赖(懒加载罐头)。</summary>
+    public Dictionary<string, IReadOnlyList<ToolExtensionDependency>> Dependencies { get; } = new(StringComparer.OrdinalIgnoreCase);
+    public List<string> GetDependenciesCalls { get; } = [];
+    /// <summary>置为非 null 时 GetDependenciesAsync 抛此异常(测依赖树错误路径)。</summary>
+    public Exception? GetDependenciesException { get; set; }
+
+    public Task<IReadOnlyList<ToolExtension>> ListInstalledAsync(IProgress<ProcessOutput>? progress = null, CancellationToken cancellationToken = default)
+    {
+        ListInstalledCalls++;
+        return Task.FromResult(Installed);
+    }
+
+    public Task<IReadOnlyList<ToolExtension>> ListOutdatedAsync(IProgress<ProcessOutput>? progress = null, CancellationToken cancellationToken = default)
+    {
+        ListOutdatedCalls++;
+        return Task.FromResult(Outdated);
+    }
+
+    public Task InstallAsync(string name, string? version = null, IProgress<ProcessOutput>? progress = null, CancellationToken cancellationToken = default)
+    {
+        InstallRequests.Add((name, version));
+        return Task.CompletedTask;
+    }
+
+    public Task UninstallAsync(string name, IProgress<ProcessOutput>? progress = null, CancellationToken cancellationToken = default)
+    {
+        UninstalledPackages.Add(name);
+        return Task.CompletedTask;
+    }
+
+    public Task UpgradeAsync(string name, IProgress<ProcessOutput>? progress = null, CancellationToken cancellationToken = default)
+    {
+        UpgradedPackages.Add(name);
+        return Task.CompletedTask;
+    }
+
+    public Task<IReadOnlyList<ToolExtensionDependency>> GetDependenciesAsync(string name, IProgress<ProcessOutput>? progress = null, CancellationToken cancellationToken = default)
+    {
+        GetDependenciesCalls.Add(name);
+        if (GetDependenciesException is not null)
+        {
+            return Task.FromException<IReadOnlyList<ToolExtensionDependency>>(GetDependenciesException);
+        }
+
+        return Task.FromResult(Dependencies.TryGetValue(name, out var dependencies) ? dependencies : []);
+    }
+}
+
+/// <summary>In-memory <see cref="IToolExtensionInventoryService"/>: ecosystem lookup via the real
+/// <see cref="ToolEcosystemMap"/>, canned refresh results, and (ecosystem, force) call records.</summary>
+internal sealed class FakeToolExtensionInventoryService : IToolExtensionInventoryService
+{
+    public FakeToolExtensionInventoryService(params IToolExtensionProvider[] providers)
+    {
+        Providers = providers.ToDictionary(provider => provider.Ecosystem);
+    }
+
+    public IReadOnlyDictionary<ToolExtensionEcosystem, IToolExtensionProvider> Providers { get; }
+    public List<(ToolExtensionEcosystem Ecosystem, bool Force)> RefreshRequests { get; } = [];
+
+    /// <summary>覆盖组件→生态映射(默认真实映射):测试可借此让任意工具拥有生态。</summary>
+    public ToolExtensionEcosystem? ComponentEcosystemOverride { get; set; }
+
+    public IReadOnlyList<ToolExtension>? RefreshResult { get; set; }
+
+    public ToolExtensionEcosystem? GetEcosystemForComponent(string componentId) =>
+        ComponentEcosystemOverride ?? (ToolEcosystemMap.TryGet(componentId, out var ecosystem) ? ecosystem : null);
+
+    public IToolExtensionProvider GetProvider(ToolExtensionEcosystem ecosystem) =>
+        Providers.TryGetValue(ecosystem, out var provider)
+            ? provider
+            : throw new InvalidOperationException($"不支持的扩展依赖生态 '{ecosystem}'。");
+
+    public Task<IReadOnlyList<ToolExtension>> RefreshAsync(ToolExtensionEcosystem ecosystem, bool force,
+        IProgress<ProcessOutput>? progress = null, CancellationToken cancellationToken = default)
+    {
+        RefreshRequests.Add((ecosystem, force));
+        return Task.FromResult(RefreshResult ?? []);
     }
 }
 

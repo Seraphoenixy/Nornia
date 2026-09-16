@@ -7,6 +7,7 @@ using ICSharpCode.AvalonEdit.Rendering;
 using Nornia.Desktop.Code;
 using Nornia.Desktop.Services;
 using Nornia.Desktop.ViewModels;
+using Serilog;
 using System.Globalization;
 using System.Windows;
 using System.Windows.Controls;
@@ -157,8 +158,7 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
     private FoldGutterMargin? _foldGutter;
     private readonly FoldBackgroundRenderer _foldBackground;
     private IReadOnlyList<CodeFoldSection> _foldSections = [];
-    private IHighlightingDefinition? _highlightingDefinition;
-    // 最近发布的语义快照(驱动内置兜底策略;部分快照只覆盖首屏)。
+    // 最近发布的语义快照(驱动文本高亮;部分快照只覆盖首屏)。
     private CodePresentationSnapshot? _presentationSnapshot;
 
     /// <summary>Raised after the document text is replaced (the preview view re-applies folding and
@@ -392,17 +392,15 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
             var line = Math.Clamp(current.Line, 1, Math.Max(1, CodeEditor.Document.LineCount));
             var safeOffset = Math.Clamp(current.Offset, 0, documentLength);
             var safeLength = Math.Clamp(current.Length, 0, documentLength - safeOffset);
-            CodeEditor.ScrollTo(line, 0);
+            CenterLine(line);
             CodeEditor.CaretOffset = safeOffset;
             CodeEditor.SelectionStart = safeOffset;
             CodeEditor.SelectionLength = safeLength;
         }
         else if (matches.Count == 0)
         {
-            // 无匹配:清空选择。当前匹配不在可见子集中(窗口化查找切换窗口期间)时
-            // 不动光标——新窗口载入后按落位结果重新定位。
-            CodeEditor.CaretOffset = 0;
-            CodeEditor.SelectionStart = CodeEditor.CaretOffset;
+            // 无匹配:只清选择,不动光标——光标要么已由文档替换置于 0(首次加载),
+            // 要么是刚落位的跳转目标(搜索结果);这里重置会把跳转打回文件顶部。
             CodeEditor.SelectionLength = 0;
         }
         // 匹配行是迷你地图内容(右侧标记条)的一部分 → 内容版本失效。
@@ -422,11 +420,14 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
 
     /// <summary>Jumps to a 1-based line, centers it in the viewport and — when requested — briefly
     /// emphasizes the target line (go-to-line feedback).</summary>
-    public void JumpToLine(int line, bool emphasize = true)
+    public void JumpToLine(int line, bool emphasize = true, bool deferCentering = false)
     {
         var doc = CodeEditor.Document;
-        if (doc is null || doc.LineCount == 0)
+        if (doc is null || doc.TextLength == 0)
         {
+            // 文档尚未装入(空文档的 LineCount 是 1,钳制会把跳转塌缩到第 1 行后随整体替换丢在文件顶)
+            // ——挂起,由 SetDocument 落位;否则搜索结果跳转被静默丢弃。
+            _pendingJump = (line, 1, emphasize);
             return;
         }
 
@@ -434,7 +435,7 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
         var documentLine = doc.GetLineByNumber(number);
         CodeEditor.CaretOffset = documentLine.Offset;
         CodeEditor.TextArea.Caret.BringCaretToView();
-        CenterLine(number);
+        CenterLineAfterLayout(number, CodeEditor.CaretOffset, deferCentering);
         CodeEditor.TextArea.Focus();
 
         if (emphasize)
@@ -459,13 +460,81 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
         e.Handled = true;
     }
 
+    /// <summary>跳转前挂起的位置(1-based 行/列 + 是否强调);文档未装入时暂存,
+    /// 下一次非空 <see cref="SetDocument"/> 装入后落位,避免搜索结果跳转丢失。</summary>
+    private (int Line, int Column, bool Emphasize)? _pendingJump;
+
     private void CenterLine(int lineNumber)
     {
-        // Approximate centering without internal scroll APIs: scroll so the target sits roughly in
-        // the middle of the visible line window.
+        // 用像素偏移 API 精确居中(与迷你地图同一模式):AvalonEdit 的 ScrollTo(line, col)
+        // 是"最小滚动使可见"语义,不保证目标行顶对齐视口顶,居中误差可达十几行。
+        HookEditorScroll();
+        if (_editorScroll is not { ViewportHeight: > 0 } scroll)
+        {
+            return; // 视口未就绪:由 CenterLineAfterLayout 的延迟机制兜底。
+        }
+
         var textView = CodeEditor.TextArea.TextView;
-        var visibleLines = Math.Max(1, (int)Math.Ceiling(textView.ActualHeight / Math.Max(1, textView.DefaultLineHeight)));
-        CodeEditor.ScrollTo(Math.Max(1, lineNumber - visibleLines / 2), 0);
+        var visualLine = textView.GetVisualLine(lineNumber);
+        if (visualLine is null)
+        {
+            // 视觉行未物化且按需构建失败:用统一行高的算术坐标兜底(等宽字体下精确,
+            // 换行开启时近似)。
+            var topPx = (lineNumber - 1) * Math.Max(1, textView.DefaultLineHeight);
+            var rowH = Math.Max(1, textView.DefaultLineHeight);
+            var fallbackTarget = Math.Clamp(topPx - (scroll.ViewportHeight - rowH) / 2, 0, Math.Max(0, scroll.ExtentHeight - scroll.ViewportHeight));
+            scroll.ScrollToVerticalOffset(fallbackTarget);
+            return;
+        }
+
+        var target = Math.Clamp(
+            visualLine.VisualTop - (scroll.ViewportHeight - visualLine.Height) / 2,
+            0,
+            Math.Max(0, scroll.ExtentHeight - scroll.ViewportHeight));
+        scroll.ScrollToVerticalOffset(target);
+    }
+
+    /// <summary>布局无关的居中:文本视图已布局且文档非刚装入时直接居中;否则(新打开文件首次
+    /// 布局前的跳转,或文档装入瞬间的延迟落位——对刚 Replace 完的旧几何滚动不生效,布局后会
+    /// 回到顶部)把居中排队到布局之后的调度槽,且仅当文档与光标都未变时应用——更新的跳转或
+    /// 用户操作优先。</summary>
+    private void CenterLineAfterLayout(int lineNumber, int caretOffset, bool forceDefer)
+    {
+        var document = CodeEditor.Document;
+        if (forceDefer || CodeEditor.TextArea.TextView.ActualHeight <= 0)
+        {
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (ReferenceEquals(CodeEditor.Document, document) && CodeEditor.CaretOffset == caretOffset)
+                {
+                    CenterLine(lineNumber);
+                }
+            }), DispatcherPriority.Loaded);
+            return;
+        }
+
+        CenterLine(lineNumber);
+    }
+
+    /// <summary>文档装入后落位挂起的跳转(搜索结果/快速打开在内容就绪瞬间发起的跳转)。</summary>
+    private void TryApplyPendingJump()
+    {
+        if (_pendingJump is not { } pending
+            || CodeEditor.Document is not { TextLength: > 0 })
+        {
+            return; // 文档仍为空(占位/重置):继续挂起,等下一次装入。
+        }
+
+        _pendingJump = null;
+        // 文档刚装入:对旧几何滚动不生效,强制延迟到布局之后居中。
+        if (pending.Column > 1)
+        {
+            JumpToPosition(pending.Line, pending.Column, pending.Emphasize, deferCentering: true);
+        }
+        else
+        {
+            JumpToLine(pending.Line, pending.Emphasize, deferCentering: true);
+        }
     }
 
     private static void OnSourceTextChanged(DependencyObject source, DependencyPropertyChangedEventArgs args)
@@ -477,10 +546,6 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
     private static void OnHighlightingNameChanged(DependencyObject source, DependencyPropertyChangedEventArgs args)
     {
         var view = (CodeDocumentView)source;
-        var name = args.NewValue as string;
-        view._highlightingDefinition = string.IsNullOrEmpty(name)
-            ? null
-            : HighlightingManager.Instance.GetDefinition(name);
         view.UpdateHighlightingFallback();
         view.ApplyHighlightingTheme();
     }
@@ -608,6 +673,8 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
         InvalidateMinimapContent();
         _documentContentVersion++;
         RequestMinimapDraw();
+        // 内容就绪后落位挂起的跳转(搜索结果在内容发布瞬间发起、文档未装入时暂存的请求)。
+        TryApplyPendingJump();
         DocumentChanged?.Invoke(this, EventArgs.Empty);
     }
 
@@ -952,11 +1019,14 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
     }
 
     /// <summary>Jumps to a symbol selection position and keeps the target line centered.</summary>
-    public void JumpToPosition(int line, int column, bool emphasize = true)
+    public void JumpToPosition(int line, int column, bool emphasize = true, bool deferCentering = false)
     {
         var doc = CodeEditor.Document;
-        if (doc is null || doc.LineCount == 0)
+        if (doc is null || doc.TextLength == 0)
         {
+            // 文档尚未装入(空文档的 LineCount 是 1,钳制会把跳转塌缩到第 1 行后随整体替换丢在文件顶)
+            // ——挂起,由 SetDocument 落位;否则搜索结果跳转被静默丢弃。
+            _pendingJump = (line, column, emphasize);
             return;
         }
 
@@ -965,7 +1035,7 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
         var position = new TextViewPosition(number, Math.Clamp(column, 1, documentLine.Length + 1));
         CodeEditor.TextArea.Caret.Position = position;
         CodeEditor.TextArea.Caret.BringCaretToView();
-        CenterLine(number);
+        CenterLineAfterLayout(number, CodeEditor.CaretOffset, deferCentering);
         CodeEditor.TextArea.Focus();
         if (emphasize)
         {
@@ -1033,6 +1103,7 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
 
     public void RestoreViewState(EditorViewState? state)
     {
+        HookEditorScroll(); // 无 Loaded 的离线路径(集成测试)下模板就绪时兜底挂接,幂等。
         if (state is null)
         {
             ClearSelectionAt(0);
@@ -1052,13 +1123,16 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
         }
     }
 
-    public EditorViewState CaptureViewState() =>
-        new(
+    public EditorViewState CaptureViewState()
+    {
+        HookEditorScroll(); // 无 Loaded 的离线路径(集成测试)下模板就绪时兜底挂接,幂等。
+        return new(
             _editorScroll?.VerticalOffset ?? 0,
             CodeEditor.TextArea.Caret.Line,
             CodeEditor.TextArea.Caret.Column,
             CaptureFoldedOffsets(),
             CaptureFoldedSymbolIds());
+    }
 
     private void ClearSelectionAt(int offset)
     {
@@ -1085,7 +1159,26 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
         }
     }
 
-    private async void OnEditorScrollChanged(object sender, ScrollChangedEventArgs args)
+    private void OnEditorScrollChanged(object sender, ScrollChangedEventArgs args) =>
+        _ = HandleEditorScrollChangedSafelyAsync(sender, args);
+
+    private async Task HandleEditorScrollChangedSafelyAsync(object sender, ScrollChangedEventArgs args)
+    {
+        try
+        {
+            await HandleEditorScrollChangedAsync(sender, args);
+        }
+        catch (OperationCanceledException)
+        {
+            // The editor can be unloaded while an adjacent window is loading.
+        }
+        catch (Exception exception)
+        {
+            Log.Error(exception, "编辑器滚动触发窗口分页失败");
+        }
+    }
+
+    private async Task HandleEditorScrollChangedAsync(object sender, ScrollChangedEventArgs args)
     {
         RequestMinimapDraw();
         // 概览标尺/sticky 合帧:高频滚动事件合并为下一渲染帧一次更新。
@@ -1449,7 +1542,8 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
         var normalizedY = Math.Clamp(mapY / MinimapCanvas.ActualHeight, 0, 1);
         var editorLine = MinimapLayout.EditorLineFromMapY(normalizedY, _minimapLayout);
         var lineHeight = Math.Max(1, CodeEditor.TextArea.TextView.DefaultLineHeight);
-        _editorScroll.ScrollToVerticalOffset(MinimapLayout.ScrollOffsetForLine(editorLine, lineHeight));
+        // 点击/拖动跳转:目标行显示在编辑器视口垂直居中位置。
+        _editorScroll.ScrollToVerticalOffset(MinimapLayout.ScrollOffsetForLine(editorLine, lineHeight, _editorScroll.ViewportHeight));
         RequestMinimapDraw();
     }
 
@@ -1547,31 +1641,34 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
         UpdateSticky();
     }
 
-    /// <summary>内置兜底只在"完整快照(IsComplete)且有 token"时才关闭:部分快照窗口内,已分词
-    /// 行由 colorizer 覆盖为最终配色,未分词行保留内置/缺省色——否则首屏之外的行会整篇
-    /// "缺省色 → 正确高亮"闪一遍。空快照(初始/释放)HasTokens=false,走内置兜底。</summary>
+    /// <summary>编辑器不挂载 AvalonEdit 内置上色；文本高亮完全由 TextMate token colorizer 提供
+    /// （分词完成/首屏增量后立即覆盖），从而避免打开文件时“默认上色 → 文本高亮”的闪变。
+    /// 无 token 的纯文本/未分词行显示为纯文本（TextBrush）。</summary>
     private void UpdateHighlightingFallback()
     {
-        CodeEditor.SyntaxHighlighting =
-            _presentationSnapshot is { IsComplete: true } && _semanticTokens.HasTokens
-                ? null
-                : _highlightingDefinition;
+        CodeEditor.SyntaxHighlighting = null;
     }
 
-    /// <summary>Recolors the current syntax-highlighting definition from the theme palette and
-    /// redraws, so code colors follow live theme switches (not just the built-in light defaults).</summary>
+    /// <summary>重绘编辑器。语法主题已由 token colorizer 的主题回调接管，这里不再应用 AvalonEdit
+    /// 内置定义主题。</summary>
     private void ApplyHighlightingTheme()
     {
-        if (_highlightingDefinition is null)
-        {
-            return;
-        }
-
-        ThemeHighlightingColorizer.ApplyDefinitionTheme(_highlightingDefinition);
         CodeEditor.TextArea.TextView.Redraw();
     }
 
-    private void OnThemeChanged(object? sender, AppTheme theme) => ApplyTheme();
+    private void OnThemeChanged(object? sender, AppTheme theme)
+    {
+        // 主题广播在生产路径恒为 UI 线程;测试进程里 xunit 并行测试类可能从工作线程 Raise,
+        // 而已加载视图(含未及卸载的残留实例)的订阅会收到回调——非宿主线程只归组回宿主
+        // Dispatcher,避免跨线程触碰 DependencyObject(其余视图订阅者同此模式)。
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.InvokeAsync(ApplyTheme);
+            return;
+        }
+
+        ApplyTheme();
+    }
 
     private Brush? Brush(string key) => TryFindResource(key) as Brush ?? Application.Current?.TryFindResource(key) as Brush;
 

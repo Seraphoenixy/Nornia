@@ -14,7 +14,10 @@ namespace Nornia.Package.Providers;
 /// timeouts without retry (unlike mutations), and truncated display names are backfilled with
 /// bounded concurrency and per-Id deduplication.
 /// </summary>
-public sealed partial class WingetProvider(IProcessRunner processRunner, WingetProbe? probe = null) : IPackageProvider, IPackageProviderAvailability
+public sealed partial class WingetProvider(
+    IProcessRunner processRunner,
+    WingetProbe? probe = null,
+    IInteractiveProcessRunner? interactiveProcessRunner = null) : IPackageProvider, IPackageProviderAvailability
 {
     private const int BackfillMaxConcurrency = 4;
     private const int BackfillCacheMaxEntries = 512;
@@ -30,8 +33,25 @@ public sealed partial class WingetProvider(IProcessRunner processRunner, WingetP
 
     public string Name => "winget";
 
-    public async Task<bool> IsAvailableAsync(CancellationToken cancellationToken = default) =>
-        (await processRunner.RunAsync("where.exe", ["winget.exe"], cancellationToken: cancellationToken)).IsSuccess;
+    public async Task<bool> IsAvailableAsync(CancellationToken cancellationToken = default)
+    {
+        // `where.exe` does not resolve Windows App Execution Aliases. A functional winget
+        // installation can therefore be reported as missing, while a stale alias can be
+        // reported as present. Starting the harmless version command is the capability check
+        // that matches the operation path used by every package command.
+        try
+        {
+            return (await processRunner.RunAsync("winget.exe", ["--version"], cancellationToken: cancellationToken)).IsSuccess;
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return false;
+        }
+        catch (Exception exception) when (exception is IOException or System.ComponentModel.Win32Exception or InvalidOperationException)
+        {
+            return false;
+        }
+    }
 
     public async Task<IReadOnlyList<PackageInfo>> SearchAsync(
         string query,
@@ -241,11 +261,17 @@ public sealed partial class WingetProvider(IProcessRunner processRunner, WingetP
             timeout.CancelAfter(MutationTimeout);
             try
             {
-                var result = await processRunner.RunAsync("winget.exe", arguments, progress, timeout.Token);
+                // WinGet suppresses its progress stream when stdout/stderr are redirected. The
+                // desktop host supplies a ConPTY-backed runner so WinGet believes it is attached
+                // to a terminal and emits the OSC 9;4 frames consumed by the UI. CLI/test hosts
+                // may not provide that capability and safely fall back to the regular runner.
+                var result = interactiveProcessRunner is null
+                    ? await processRunner.RunAsync("winget.exe", arguments, progress, timeout.Token)
+                    : await interactiveProcessRunner.RunInteractiveAsync("winget.exe", arguments, progress, timeout.Token);
                 // A declined UAC request ultimately appears as installer exit 1602. Retrying it
                 // automatically just opens another elevation prompt and makes the operation look
                 // stuck; return immediately so ThrowIfFailed can give an actionable explanation.
-                if (result.IsSuccess || WingetExitCodes.IsNoMatch(result.ExitCode) ||
+                if (result.IsSuccess || result.ExitCode == -1 || WingetExitCodes.IsNoMatch(result.ExitCode) ||
                     WingetExitCodes.IsInstallerCancelled(result.ExitCode, result.StandardOutput + Environment.NewLine + result.StandardError) ||
                     attempt == 2)
                 {
@@ -304,6 +330,15 @@ public sealed partial class WingetProvider(IProcessRunner processRunner, WingetP
         // stderr 通常干净,同样过一遍保持一致。
         var raw = string.IsNullOrWhiteSpace(result.StandardError) ? result.StandardOutput : result.StandardError;
         var detail = WingetOutputText.SanitizeDetail(raw);
+        if (result.ExitCode == -1)
+        {
+            if (detail.Length > 0)
+            {
+                detail += Environment.NewLine;
+            }
+
+            detail += WingetText.Get("Winget_ProcessStartHint");
+        }
         if (WingetExitCodes.IsInstallerCancelled(result.ExitCode, detail))
         {
             if (detail.Length > 0)
@@ -421,8 +456,11 @@ public sealed partial class WingetProvider(IProcessRunner processRunner, WingetP
         return fullName;
     }
 
+    /// <summary>折叠完全相同的重复枚举行;多版本实例(Windows App Runtime / .NET SDK 等
+    /// side-by-side 安装)必须逐版本保留——winget 的「可用」更新也是逐行标注的,折叠会
+    /// 把真正可升级实例的可用值留下来,再被上层当成包级可用值贴到所有实例上。</summary>
     private static IReadOnlyList<PackageInfo> Deduplicate(IEnumerable<PackageInfo> packages) => packages
-        .GroupBy(package => $"{package.Id}\u001F{package.Provider}\u001F{package.Architecture}", StringComparer.OrdinalIgnoreCase)
+        .GroupBy(package => $"{package.Id}\u001F{package.Version}\u001F{package.Provider}\u001F{package.Architecture}", StringComparer.OrdinalIgnoreCase)
         .Select(group => group.OrderByDescending(package => package.AvailableVersion is not null).ThenByDescending(package => package.Version, StringComparer.OrdinalIgnoreCase).First())
         .ToArray();
 

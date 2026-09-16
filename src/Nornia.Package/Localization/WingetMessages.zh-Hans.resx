@@ -21,6 +21,7 @@
   <data name="Winget_UninstallMultipleFallback" xml:space="preserve"><value>检测到该包安装了多个版本，将按已安装版本逐个卸载。</value></data>
   <data name="Winget_UninstallByVersion" xml:space="preserve"><value>卸载 {0}（版本 {1}）。</value></data>
   <data name="Winget_InstallerCancelledHint" xml:space="preserve"><value>安装程序请求管理员权限时被取消。请在出现的 UAC 提示中选择“是”后重试；若未显示提示，请重启后以管理员身份运行终端并执行相同的 winget upgrade 命令。</value></data>
+  <data name="Winget_ProcessStartHint" xml:space="preserve"><value>无法启动 winget。请安装或更新“应用安装程序”（Windows 包管理器），确认已启用 winget 应用执行别名，然后重启 Nornia。</value></data>
   <data name="Package_NoProviderAvailable" xml:space="preserve"><value>没有可用的受支持包管理器。请安装 Winget、Scoop 或 Chocolatey 后重试。</value></data>
   <data name="Package_WingetFailed" xml:space="preserve"><value>winget {0} 失败（退出码 {1}）：{2}</value></data>
   <data name="Repair_UsingProvider" xml:space="preserve"><value>使用 {1} 修复 {0}。</value></data>

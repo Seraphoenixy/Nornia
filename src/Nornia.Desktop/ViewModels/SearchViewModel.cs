@@ -498,15 +498,35 @@ public partial class SearchViewModel : PageViewModel
     [RelayCommand]
     private async Task OpenMatchAsync(SearchTreeNode? node)
     {
-        if (node?.Match is not { } match || string.IsNullOrWhiteSpace(node.FullPath)) return;
-        await _editor.OpenFileAtAsync(node.FullPath, match.Line, match.Column, permanent: false);
+        if (node?.Match is not { } match || string.IsNullOrWhiteSpace(node.FullPath)
+            || !IsCurrentResultNode(node)) return;
+        var context = _workspace.Current;
+        if (context is null) return;
+        await _editor.OpenFileAtAsync(node.FullPath, match.Line, match.Column,
+            permanent: false, expectedWorkspaceContext: context);
     }
 
     [RelayCommand]
     private async Task OpenMatchPermanentAsync(SearchTreeNode? node)
     {
-        if (node?.Match is not { } match || string.IsNullOrWhiteSpace(node.FullPath)) return;
-        await _editor.OpenFileAtAsync(node.FullPath, match.Line, match.Column, permanent: true);
+        if (node?.Match is not { } match || string.IsNullOrWhiteSpace(node.FullPath)
+            || !IsCurrentResultNode(node)) return;
+        var context = _workspace.Current;
+        if (context is null) return;
+        await _editor.OpenFileAtAsync(node.FullPath, match.Line, match.Column,
+            permanent: true, expectedWorkspaceContext: context);
+    }
+
+    private bool IsCurrentResultNode(SearchTreeNode node)
+    {
+        if (!Rows.Contains(node) || _root is null) return false;
+        var root = node;
+        while (root.Parent is not null)
+        {
+            root = root.Parent;
+        }
+
+        return ReferenceEquals(root, _root);
     }
 
     private void ScheduleSearch()

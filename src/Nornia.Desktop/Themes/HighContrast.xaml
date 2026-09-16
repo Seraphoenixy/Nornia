@@ -15,6 +15,11 @@
   <SolidColorBrush x:Key="PanelBrush" Color="#000000" />
   <SolidColorBrush x:Key="CardBrush" Color="#000000" />
   <SolidColorBrush x:Key="InputBrush" Color="#000000" />
+  <!-- 高对比度:不透明纯黑,不引入半透明/阶梯(层级全靠白色边框表达)。 -->
+  <Color x:Key="LayerColor">#000000</Color>
+  <Color x:Key="LayerAltColor">#000000</Color>
+  <SolidColorBrush x:Key="LayerBrush" Color="{StaticResource LayerColor}" />
+  <SolidColorBrush x:Key="LayerAltBrush" Color="{StaticResource LayerAltColor}" />
   <SolidColorBrush x:Key="CaretBrush" Color="#FFFFFF" />
   <SolidColorBrush x:Key="HoverBrush" Color="#1F1F1F" />
   <SolidColorBrush x:Key="SelectionBrush" Color="#2A2A2A" />

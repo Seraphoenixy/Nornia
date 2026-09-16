@@ -23,13 +23,17 @@ public partial class RuntimeViewModel(
     IConfirmationService confirmationService,
     IUiLogService logService,
     IClipboardService? clipboard = null,
-    IUiPerformanceMetrics? performanceMetrics = null) : PageViewModel("运行库", logService), INavigationTarget
+    IUiPerformanceMetrics? performanceMetrics = null,
+    IInventoryScanStateRepository? scanStateRepository = null) : PageViewModel("运行库", logService), INavigationTarget
 {
     private readonly IClipboardService _clipboard = clipboard ?? NullClipboardService.Instance;
 
     public BulkObservableCollection<ManagedComponentItem> Runtimes { get; } = [];
     public ObservableCollection<ManagedComponentItem> SelectedRuntimes { get; } = [];
     public ICollectionView FilteredRuntimes => CollectionViewSource.GetDefaultView(Runtimes);
+
+    /// <summary>页头新鲜度提示:快照何时扫描,由 scan_state 提供(空表示不可用/未注册仓库)。</summary>
+    [ObservableProperty] private string lastScanDisplay = string.Empty;
 
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(RemoveCommand))]
@@ -39,7 +43,7 @@ public partial class RuntimeViewModel(
     [ObservableProperty] private string filterText = string.Empty;
     public string SelectedRuntimeSummary => SelectedRuntime is null ? "选择 Runtime 查看版本、路径和可用操作。" : $"{SelectedRuntime.Name} {SelectedRuntime.Version} · {SelectedRuntime.Architecture} · {SelectedRuntime.InstallPath}";
 
-    protected override Task OnFirstActivatedAsync()
+    protected override async Task OnFirstActivatedAsync()
     {
         SelectedRuntimes.CollectionChanged += (_, _) =>
         {
@@ -48,7 +52,27 @@ public partial class RuntimeViewModel(
             NotifyCopyCommands();
         };
         FilteredRuntimes.Filter = MatchesFilter;
-        return ScanAsync();
+        // 快照优先:先用持久化清单立即渲染首屏(扫描可能长达数秒),再走 TTL 门控刷新;
+        // 快照足够新且环境指纹未变时,门控刷新直接返回库内数据,不派生任何进程。
+        await SeedPersistedAsync();
+        await LoadFromInventoryAsync();
+    }
+
+    /// <summary>从持久化快照立即填充列表,失败静默(门控刷新会落回全扫兜底)。</summary>
+    private async Task SeedPersistedAsync()
+    {
+        try
+        {
+            var runtimes = await inventoryService.GetPersistedAsync();
+            var packages = await packageInventoryService.GetPersistedAsync();
+            PublishRuntimes(runtimes, packages);
+            LastScanDisplay = await InventoryScanAgeText.LoadAsync(
+                scanStateRepository, InventoryScanAgeText.RuntimeScanKind);
+        }
+        catch
+        {
+            // 持久化暂不可用(如表未建好):交给下面的门控刷新处理。
+        }
     }
 
     // ===== Copy commands (grid 复制选中 / 复制全部) =====
@@ -74,21 +98,31 @@ public partial class RuntimeViewModel(
 
     private bool CanCopyAllRuntimes() => Runtimes.Count > 0;
 
+    /// <summary>首激活的门控加载:快照新鲜时直接返回库内数据(零进程派生),否则全量扫描。</summary>
+    private Task LoadFromInventoryAsync() => RunAsync("读取运行库", async cancellationToken =>
+    {
+        SetPageLoading();
+        try
+        {
+            await ReloadRuntimesAsync(forceRescan: false, cancellationToken);
+            PublishListState();
+        }
+        catch (Exception ex)
+        {
+            SetPageError($"读取失败：{ex.Message}");
+            throw;
+        }
+    }, "确认相关命令已加入 PATH，或查看 Problems。", canCancel: true);
+
+    /// <summary>用户显式发起的扫描:永远强制重扫并更新持久化快照与 scan_state。</summary>
     [RelayCommand]
     private Task ScanAsync() => RunAsync("扫描 Runtime", async cancellationToken =>
     {
         SetPageLoading();
         try
         {
-            await ReloadRuntimesAsync(cancellationToken);
-            if (Runtimes.Count == 0)
-            {
-                SetPageEmpty("没有已扫描到的 Runtime。点击「重新扫描」开始。");
-            }
-            else
-            {
-                SetPageReady();
-            }
+            await ReloadRuntimesAsync(forceRescan: true, cancellationToken);
+            PublishListState();
         }
         catch (Exception ex)
         {
@@ -96,6 +130,18 @@ public partial class RuntimeViewModel(
             throw;
         }
     }, "确认相关命令已加入 PATH，或查看 Problems。", canCancel: true);
+
+    private void PublishListState()
+    {
+        if (Runtimes.Count == 0)
+        {
+            SetPageEmpty("没有已扫描到的 Runtime。点击「重新扫描」开始。");
+        }
+        else
+        {
+            SetPageReady();
+        }
+    }
 
     [RelayCommand(CanExecute = nameof(CanRemoveSelected))]
     private Task RemoveAsync() => RunAsync("移除 Runtime", async cancellationToken =>
@@ -124,6 +170,7 @@ public partial class RuntimeViewModel(
             return;
         }
 
+        var refreshedAfterMutation = false;
         foreach (var runtime in selectedRuntimes)
         {
             foreach (var package in packageResolver.ResolveMany(runtime.Name, runtime.Version))
@@ -144,9 +191,19 @@ public partial class RuntimeViewModel(
                     throw new InvalidOperationException(
                         $"卸载 Runtime 包 {package.PackageId} 失败。", exception);
                 }
+
+                // Re-scan immediately after each completed winget mutation. This keeps the
+                // runtime row and its detail form current during a multi-package removal.
+                await ReloadRuntimesAsync(forceRescan: true, cancellationToken);
+                refreshedAfterMutation = true;
             }
         }
-        await ReloadRuntimesAsync(cancellationToken);
+        if (!refreshedAfterMutation)
+        {
+            // A resolver may legitimately return no package (for example, an unsupported
+            // mapping). Still refresh the form once so it cannot retain a stale snapshot.
+            await ReloadRuntimesAsync(forceRescan: true, cancellationToken);
+        }
     }, "确认 Runtime 未被占用，再查看 Problems。", canCancel: true);
 
     [RelayCommand(CanExecute = nameof(CanUpgradeSelected))]
@@ -166,6 +223,7 @@ public partial class RuntimeViewModel(
             return;
         }
 
+        var refreshedAfterMutation = false;
         foreach (var runtime in selectedRuntimes)
         {
             var packages = SelectUpgradePackages(
@@ -186,24 +244,159 @@ public partial class RuntimeViewModel(
                     LogService.Write("WARNING",
                         $"跳过 {package.PackageId}：WinGet 没有适用的更新（{WingetExitCodes.Format(exception.ExitCode)}）。");
                 }
+
+                // Whether winget upgraded the package or reported that the advertised update is
+                // no longer applicable, refresh the affected form before the next item.
+                await ReloadRuntimesAsync(forceRescan: true, cancellationToken);
+                refreshedAfterMutation = true;
             }
         }
-        await ReloadRuntimesAsync(cancellationToken);
+        if (!refreshedAfterMutation)
+        {
+            await ReloadRuntimesAsync(forceRescan: true, cancellationToken);
+        }
     }, "查看 Output 中的安装器诊断后重试。", canCancel: true);
 
-    private async Task ReloadRuntimesAsync(CancellationToken cancellationToken = default)
+    /// <summary>重载运行库列表。forceRescan=true 用于显式扫描与移除/升级等变更后的重载
+    /// (两个清单都绕过合并缓存与持久化快照 TTL);false 用于页面首激活的门控加载。</summary>
+    private async Task ReloadRuntimesAsync(bool forceRescan, CancellationToken cancellationToken = default)
     {
-        var runtimes = await inventoryService.RefreshForcedAsync(cancellationToken);
-        var packages = await packageInventoryService.RefreshAsync(OperationProgress, cancellationToken);
-        var snapshot = runtimes
-                     .Where(runtime => EnvironmentComponentCatalog.Get(runtime.Name)?.Category == EnvironmentComponentCategory.Runtime)
-                     .OrderBy(runtime => runtime.Name).ThenByDescending(runtime => runtime.Version)
-            .Select(runtime => new ManagedComponentItem(runtime, FindAvailableVersion(runtime, packages)))
+        var runtimes = forceRescan
+            ? await inventoryService.RefreshForcedAsync(cancellationToken)
+            : await inventoryService.RefreshAsync(cancellationToken);
+        var packages = forceRescan
+            ? await packageInventoryService.RefreshForcedAsync(OperationProgress, cancellationToken)
+            : await packageInventoryService.RefreshAsync(OperationProgress, cancellationToken);
+        PublishRuntimes(runtimes, packages);
+        LastScanDisplay = await InventoryScanAgeText.LoadAsync(
+            scanStateRepository, InventoryScanAgeText.RuntimeScanKind, cancellationToken);
+    }
+
+    private void PublishRuntimes(IReadOnlyList<CoreRuntime> runtimes, IReadOnlyList<PackageInfo> packages)
+    {
+        // 逐行解析 winget 包并匹配包级可用版本;再按解析出的 winget 包 Id 分组,把可用更新
+        // 只标注到组内最新已装版本上。winget 的升级作用于包本身(更新其最新实例,Windows App
+        // Runtime 的 side-by-side 旧构建不会被同一升级触及),winget list 也只在真正可升级的
+        // 实例行标注「可用」——把包级可用值贴到每一行,会让 6000.318~6000.457 全部显示 1.6.9。
+        var annotated = runtimes
+            .Where(runtime => EnvironmentComponentCatalog.Get(runtime.Name)?.Category == EnvironmentComponentCategory.Runtime)
+            .Select(runtime =>
+            {
+                string? available = null;
+                var groupKey = $"unresolved\u001F{runtime.Name}";
+                try
+                {
+                    var resolved = packageResolver.ResolveMany(runtime.Name, runtime.Version);
+                    if (resolved.Count > 0)
+                    {
+                        groupKey = resolved[0].PackageId;
+                        available = SelectAvailableVersion(runtime, packages, resolved);
+                    }
+                }
+                catch (ArgumentException)
+                {
+                    // 不支持的组件映射:保持未解析分组,不标注可用更新。
+                }
+
+                return (Runtime: runtime, GroupKey: groupKey, Available: available);
+            })
+            .ToArray();
+        var snapshot = RestrictToLatestInstalls(annotated)
+            .OrderBy(item => item.Runtime.Name).ThenByDescending(item => item.Runtime.Version)
+            .Select(item => new ManagedComponentItem(item.Runtime, item.Available))
             .ToArray();
         using var performance = performanceMetrics?.Begin("runtime.list.publish", snapshot.Length, "ui-batch");
+        var selectedItems = SelectedRuntimes.ToArray();
+        var selectedItem = SelectedRuntime;
         Runtimes.ReplaceRange(snapshot);
+        ReselectPublishedItems(snapshot, selectedItems, selectedItem);
         FilteredRuntimes.Refresh();
         NotifyCopyCommands();
+    }
+
+    /// <summary>把包级可用更新限定到「同一 winget 包组内最新已装版本」(并列最新全部保留,
+    /// 如 x86/x64 同构建)。旧 side-by-side 实例返回 null,避免显示 winget 升级触及不到的
+    /// 虚假可用更新;分组键为解析出的 winget 包 Id,.NET 等不同 major 解析为不同包,互不影响。</summary>
+    internal static IReadOnlyList<(CoreRuntime Runtime, string? Available)> RestrictToLatestInstalls(
+        IReadOnlyList<(CoreRuntime Runtime, string GroupKey, string? Available)> annotated)
+    {
+        return annotated
+            .GroupBy(item => item.GroupKey, StringComparer.OrdinalIgnoreCase)
+            .SelectMany(group =>
+            {
+                var latest = group.MaxBy(item => item.Runtime.Version, RuntimeVersionComparer.Instance).Runtime.Version;
+                return group.Where(item => string.Equals(item.Runtime.Version, latest, StringComparison.OrdinalIgnoreCase));
+            })
+            .Select(item => (item.Runtime, item.Available))
+            .ToArray();
+    }
+
+    /// <summary>运行库版本比较:能按 System.Version 解析时数值比较(6000.424 > 6000.401),
+    /// 否则退回大小写不敏感的字符串比较。</summary>
+    private sealed class RuntimeVersionComparer : IComparer<string>
+    {
+        public static readonly RuntimeVersionComparer Instance = new();
+
+        public int Compare(string? x, string? y)
+        {
+            var parsedX = Version.TryParse(x, out var versionX);
+            var parsedY = Version.TryParse(y, out var versionY);
+            if (parsedX && parsedY) return versionX!.CompareTo(versionY);
+            return string.Compare(x, y, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    private void ReselectPublishedItems(
+        IReadOnlyList<ManagedComponentItem> snapshot,
+        IReadOnlyList<ManagedComponentItem> selectedItems,
+        ManagedComponentItem? selectedItem)
+    {
+        var selected = selectedItems
+            .Select(item => FindReplacement(snapshot, item))
+            .Where(item => item is not null)
+            .Cast<ManagedComponentItem>()
+            .Distinct()
+            .ToArray();
+        SelectedRuntimes.Clear();
+        foreach (var item in selected)
+        {
+            SelectedRuntimes.Add(item);
+        }
+
+        // Keep the detail form attached to the freshly scanned row when its stable location is
+        // unchanged. If the row disappeared, clear it instead of displaying stale data.
+        SelectedRuntime = selectedItem is null
+            ? null
+            : FindReplacement(snapshot, selectedItem);
+    }
+
+    private static string GetSelectionKey(ManagedComponentItem item) =>
+        $"{item.Name}\u001F{item.Architecture}\u001F{item.InstallPath}";
+
+    private static ManagedComponentItem? FindReplacement(
+        IReadOnlyList<ManagedComponentItem> snapshot,
+        ManagedComponentItem previous)
+    {
+        var exact = snapshot.FirstOrDefault(item => string.Equals(GetSelectionKey(item), GetSelectionKey(previous), StringComparison.OrdinalIgnoreCase));
+        if (exact is not null) return exact;
+
+        // Some detectors include the version in InstallPath (notably .NET). Prefer the row that
+        // matches the advertised target version before falling back to a unique same-component
+        // row; never keep the old object when the scan cannot identify a replacement.
+        if (!string.IsNullOrWhiteSpace(previous.AvailableVersion))
+        {
+            var target = snapshot.FirstOrDefault(item =>
+                string.Equals(item.Name, previous.Name, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(item.Architecture, previous.Architecture, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(item.Version, previous.AvailableVersion, StringComparison.OrdinalIgnoreCase));
+            if (target is not null) return target;
+        }
+
+        var candidates = snapshot.Where(item =>
+                string.Equals(item.Name, previous.Name, StringComparison.OrdinalIgnoreCase)
+                && string.Equals(item.Architecture, previous.Architecture, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        return candidates.Length == 1 ? candidates[0] : null;
     }
     partial void OnFilterTextChanged(string value) => FilteredRuntimes.Refresh();
     partial void OnSelectedRuntimeChanged(ManagedComponentItem? value)
@@ -253,16 +446,6 @@ public partial class RuntimeViewModel(
     private bool CanUpgradeSelected() =>
         (SelectedRuntime?.HasUpdate == true || SelectedRuntimes.Any(r => r.HasUpdate))
         && (SelectedRuntime is not null ? EnvironmentComponentCatalog.Get(SelectedRuntime.Name)?.CanManageWithWinget == true : SelectedRuntimes.Any(r => r.HasUpdate && EnvironmentComponentCatalog.Get(r.Name)?.CanManageWithWinget == true));
-
-    private string? FindAvailableVersion(CoreRuntime component, IReadOnlyList<PackageInfo> packages)
-    {
-        try
-        {
-            var resolved = packageResolver.ResolveMany(component.Name, component.Version);
-            return SelectAvailableVersion(component, packages, resolved);
-        }
-        catch (ArgumentException) { return null; }
-    }
 
     /// <summary>Limits Visual C++ upgrades to the architecture represented by the selected runtime.
     /// The mapping intentionally includes x86 for repair/install scenarios, but an upgrade of one

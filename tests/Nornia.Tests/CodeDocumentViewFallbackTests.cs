@@ -3,14 +3,15 @@ using Nornia.Desktop.Views;
 
 namespace Nornia.Tests;
 
-/// <summary>编辑器内置兜底策略:部分快照(首屏未分词完,IsComplete=false)期间保留 AvalonEdit
-/// 内置定义(首屏之外的行保持回退色,不闪"缺省色 → 正确高亮");完整快照到达后才关闭,
-/// 语义配色全面接管。</summary>
+/// <summary>编辑器不挂载 AvalonEdit 内置定义,文本高亮完全由 TextMate token colorizer(行索引)
+/// 提供——避免打开文件时“默认上色 → 文本高亮”的闪变。无 token 的纯文本/未分词行显示为纯文本。
+/// 首屏增量快照(IsComplete=false)已覆盖首个可见屏幕,因此不会出现整篇缺省色。</summary>
 public sealed class CodeDocumentViewFallbackTests
 {
     [Fact]
-    public void PartialSnapshotKeepsBuiltInFallback_CompleteSnapshotDisablesIt()
+    public void EditorNeverUsesBuiltInAvalonEditHighlighting()
     {
+        object? initial = null;
         object? duringPartial = null;
         object? afterComplete = null;
 
@@ -19,7 +20,7 @@ public sealed class CodeDocumentViewFallbackTests
             var view = new CodeDocumentView();
             view.HighlightingName = "C#";
             view.SourceText = "public class A { }";
-            Assert.NotNull(view.Editor.SyntaxHighlighting); // 初始:内置 C# 兜底就位
+            initial = view.Editor.SyntaxHighlighting; // 初始:不挂内置定义
 
             var partial = new CodePresentationSnapshot(
                 1,
@@ -38,12 +39,13 @@ public sealed class CodeDocumentViewFallbackTests
             afterComplete = view.Editor.SyntaxHighlighting;
         });
 
-        Assert.NotNull(duringPartial); // 部分快照:内置兜底保留(未分词行不退回纯缺省色)
-        Assert.Null(afterComplete);   // 完整快照:语义配色接管
+        Assert.Null(initial);       // 初始:无内置上色
+        Assert.Null(duringPartial); // 部分快照:仍无内置上色(token 由 colorizer 绘制)
+        Assert.Null(afterComplete); // 完整快照:语义配色接管
     }
 
     [Fact]
-    public void EmptySnapshotKeepsBuiltInFallback()
+    public void EmptySnapshotKeepsSyntaxHighlightingNull()
     {
         object? afterEmpty = null;
 
@@ -55,6 +57,6 @@ public sealed class CodeDocumentViewFallbackTests
             afterEmpty = view.Editor.SyntaxHighlighting;
         });
 
-        Assert.NotNull(afterEmpty);
+        Assert.Null(afterEmpty);
     }
 }

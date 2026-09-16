@@ -12,6 +12,7 @@ public sealed class AppDataCacheService : ICacheInventoryService, ICacheCleanupS
     private readonly object _scanLock = new();
     private IReadOnlyList<CacheCandidate>? _lastScan;
     private long _lastScanAt;
+    private Task<IReadOnlyList<CacheCandidate>>? _scanInFlight;
 
     private static readonly HashSet<string> ExactCacheNames = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -69,41 +70,64 @@ public sealed class AppDataCacheService : ICacheInventoryService, ICacheCleanupS
         // Scanning the entire user profile tree is expensive; reuse a recent result so dashboard and
         // cache-page refreshes do not re-walk the filesystem on every activation.
         var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+        Task<IReadOnlyList<CacheCandidate>> scanTask;
         lock (_scanLock)
         {
             if (!forceRescan && _lastScan is not null && now - _lastScanAt < Nornia.Core.NorniaSettings.CacheScanCacheSeconds)
             {
                 return _lastScan;
             }
+
+            // Forced refreshes still share an in-flight walk. This prevents simultaneous page
+            // activation and cleanup refreshes from traversing the user profile more than once.
+            _scanInFlight ??= ScanAndCacheAsync(progress, cancellationToken);
+            scanTask = _scanInFlight;
         }
 
-        progress?.Report($"缓存扫描开始：根目录数={_roots.Count}，强制重扫={forceRescan}");
+        try
+        {
+            return await scanTask.ConfigureAwait(false);
+        }
+        finally
+        {
+            lock (_scanLock)
+            {
+                if (ReferenceEquals(_scanInFlight, scanTask))
+                {
+                    _scanInFlight = null;
+                }
+            }
+        }
+    }
+
+    private async Task<IReadOnlyList<CacheCandidate>> ScanAndCacheAsync(
+        IProgress<string>? progress,
+        CancellationToken cancellationToken)
+    {
         if (_roots.Count == 0)
         {
-            progress?.Report(
-                $"缓存扫描根目录为空。探测：LocalAppData='{Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData)}'（env LOCALAPPDATA='{Environment.GetEnvironmentVariable("LOCALAPPDATA")}'），" +
-                $"AppData='{Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData)}'（env APPDATA='{Environment.GetEnvironmentVariable("APPDATA")}'），" +
-                $"UserProfile='{Environment.GetFolderPath(Environment.SpecialFolder.UserProfile)}'（env USERPROFILE='{Environment.GetEnvironmentVariable("USERPROFILE")}'）");
             return [];
         }
 
-        var candidates = new List<CacheCandidate>();
+        var rootScans = new List<Task<IReadOnlyList<CacheCandidate>>>(_roots.Count);
         foreach (var root in _roots)
         {
             cancellationToken.ThrowIfCancellationRequested();
             if (!Directory.Exists(root))
             {
-                progress?.Report($"跳过缓存扫描根目录（不存在）：{root}");
                 continue;
             }
 
-            var before = candidates.Count;
-            progress?.Report($"扫描缓存根目录：{root}");
-            await Task.Run(() => ScanRoot(root, candidates, progress, cancellationToken), cancellationToken);
-            progress?.Report($"根目录扫描完成：{root}，新增 {candidates.Count - before} 个候选");
+            progress?.Report($"正在扫描 {root}");
+            rootScans.Add(Task.Run<IReadOnlyList<CacheCandidate>>(() =>
+            {
+                var rootCandidates = new List<CacheCandidate>();
+                ScanRoot(root, rootCandidates, cancellationToken);
+                return rootCandidates;
+            }, cancellationToken));
         }
 
-        progress?.Report($"缓存扫描完成：共 {candidates.Count} 个候选");
+        var candidates = (await Task.WhenAll(rootScans).ConfigureAwait(false)).SelectMany(items => items).ToList();
 
         var result = candidates
             .OrderByDescending(candidate => candidate.Confidence)
@@ -113,7 +137,7 @@ public sealed class AppDataCacheService : ICacheInventoryService, ICacheCleanupS
         lock (_scanLock)
         {
             _lastScan = result;
-            _lastScanAt = now;
+            _lastScanAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
         }
 
         return result;
@@ -133,6 +157,7 @@ public sealed class AppDataCacheService : ICacheInventoryService, ICacheCleanupS
 
         // Cleanup targets must be resolved against a fresh scan: cached candidates may be stale or gone.
         var currentCandidates = await ScanCoreAsync(forceRescan: true, progress, cancellationToken);
+        var completed = false;
         try
         {
             var byId = currentCandidates.ToDictionary(candidate => candidate.Id, StringComparer.OrdinalIgnoreCase);
@@ -146,7 +171,6 @@ public sealed class AppDataCacheService : ICacheInventoryService, ICacheCleanupS
                     continue;
                 }
 
-                progress?.Report($"清理缓存：{candidate.Path}");
                 try
                 {
                     var reclaimed = await Task.Run(() => ClearContents(candidate.Path, cancellationToken), cancellationToken);
@@ -162,20 +186,41 @@ public sealed class AppDataCacheService : ICacheInventoryService, ICacheCleanupS
                 }
             }
 
+            var cleanedIds = results
+                .Where(result => result.Status == CacheCleanupStatus.Cleaned)
+                .Select(result => result.Id)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            if (cleanedIds.Count > 0)
+            {
+                var updated = currentCandidates
+                    .Select(candidate => cleanedIds.Contains(candidate.Id) ? candidate with { SizeBytes = 0 } : candidate)
+                    .ToArray();
+                lock (_scanLock)
+                {
+                    _lastScan = updated;
+                    _lastScanAt = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                }
+            }
+
+            completed = true;
             return results;
         }
         finally
         {
-            // The cache inventory changed; drop the shared snapshot so the next scan is fresh.
-            lock (_scanLock)
+            if (!completed)
             {
-                _lastScan = null;
-                _lastScanAt = 0;
+                // A cancelled/partially failed cleanup may have changed the file system without a
+                // complete snapshot update, so force the next inventory request to re-scan.
+                lock (_scanLock)
+                {
+                    _lastScan = null;
+                    _lastScanAt = 0;
+                }
             }
         }
     }
 
-    private static void ScanRoot(string root, List<CacheCandidate> candidates, IProgress<string>? progress, CancellationToken cancellationToken)
+    private static void ScanRoot(string root, List<CacheCandidate> candidates, CancellationToken cancellationToken)
     {
         var normalizedRoot = Path.GetFullPath(root);
         var pending = new Stack<string>();
@@ -203,7 +248,6 @@ public sealed class AppDataCacheService : ICacheInventoryService, ICacheCleanupS
                 if (TryCreateCandidate(normalizedRoot, child, out var candidate))
                 {
                     candidates.Add(candidate);
-                    progress?.Report($"发现 {candidate.Confidence} 置信缓存：{candidate.Path}");
                     continue;
                 }
 
@@ -260,7 +304,7 @@ public sealed class AppDataCacheService : ICacheInventoryService, ICacheCleanupS
             GetDirectorySize(path),
             confidence,
             reason,
-            CacheType: CachePackageAssociationService.ResolveCacheType(normalizedRelative),
+            CacheType: CacheClassificationService.ResolveCacheType(normalizedRelative),
             UserDirectory: root);
         return true;
     }

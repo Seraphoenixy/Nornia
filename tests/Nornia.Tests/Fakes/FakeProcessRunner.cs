@@ -9,6 +9,10 @@ internal sealed class FakeProcessRunner(
 {
     public List<(string FileName, IReadOnlyList<string> Arguments, IReadOnlyDictionary<string, string>? Environment)> Calls { get; } = [];
 
+    /// <summary>Shell-execute launches (external editors). Recorded separately so tests can pin
+    /// that editor launch goes through the shell path rather than a redirected CreateProcess.</summary>
+    public List<(string FileName, IReadOnlyList<string> Arguments)> ShellCalls { get; } = [];
+
     /// <summary>Raw-bytes path: uses <c>rawHandler</c> when provided (legacy-encoded payloads can
     /// only be faked at the byte level), otherwise re-encodes the text handler's output (lossless
     /// for the ASCII/UTF-8 fixtures the tests produce).</summary>
@@ -47,5 +51,14 @@ internal sealed class FakeProcessRunner(
         }
 
         return Task.FromResult(result);
+    }
+
+    public Task<ProcessResult> RunShellAsync(
+        string fileName,
+        IReadOnlyList<string> arguments,
+        CancellationToken cancellationToken = default)
+    {
+        ShellCalls.Add((fileName, arguments));
+        return Task.FromResult(handler(fileName, arguments));
     }
 }

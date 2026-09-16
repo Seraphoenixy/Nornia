@@ -51,7 +51,7 @@ public sealed class MarkdownPreviewView : FlowDocumentScrollViewer
     private MarkdownWpfRenderer.MarkdownFlowDocumentRenderSession? _renderSession;
     private int _renderGeneration;
     // 标题段落查找缓存(名称 → 段落):ComputeCurrentHeading 每个滚动批次对每个标题各做一次
-    // 顶层块遍历(O(标题×块)),缓存后降为 O(1) 查找。增量渲染期只对每批新增块增量合并
+    // 块树遍历(O(标题×块)),缓存后降为 O(1) 查找。增量渲染期只对每批新增块增量合并
     // (M4,UpdateHeadingParagraphs),不再每批全文档重建。
     private Dictionary<string, Paragraph>? _headingParagraphs;
     // M10: 排队等待文档布局后应用的"存储值"(≤1 = 垂直进度,>1 = 旧版像素偏移)。
@@ -81,10 +81,6 @@ public sealed class MarkdownPreviewView : FlowDocumentScrollViewer
 
     /// <summary>当前文档引用的图片路径(与渲染器逐处 Acquire 对称);文档替换/清空时统一释放。</summary>
     private IReadOnlyList<string>? _acquiredImagePaths;
-
-    /// <summary>当前文档对应解析的预热引用路径(M6);渲染器首处嵌入渲染时逐张"消费"
-    /// (交接给嵌入引用),文档替换/清空/渲染失败时统一释放保证对称。</summary>
-    private IReadOnlyList<string>? _acquiredPreheatPaths;
 
     /// <summary>产出当前 FlowDocument 的结果对象;共享视图换标签时据此区分"同一结果重绑"
     /// 与"必须换文档",绝不让旧标签的文档残留在新标签下。</summary>
@@ -223,6 +219,15 @@ public sealed class MarkdownPreviewView : FlowDocumentScrollViewer
         return Math.Clamp(offset / extent, 0, 1);
     }
 
+    /// <summary>纯函数:把内容坐标 <paramref name="contentY"/> 处的跳转目标滚动到视口垂直
+    /// 居中位置的偏移(点击跳转:目标显示在屏幕中间)。结果恒在 [0, extent − viewport] 内;
+    /// 文档比视口短时停在 0。</summary>
+    internal static double CenterVerticalOffset(double contentY, double viewportHeight, double extentHeight)
+    {
+        var maxScroll = Math.Max(0, extentHeight - viewportHeight);
+        return Math.Clamp(contentY - Math.Max(0, viewportHeight) / 2, 0, maxScroll);
+    }
+
     private void RequestJump(MarkdownHeading? heading)
     {
         if (heading is null || FindHeadingParagraph(heading.DocumentName) is null)
@@ -253,12 +258,41 @@ public sealed class MarkdownPreviewView : FlowDocumentScrollViewer
         _pendingJumpHeading = null;
         _suppressHeadingSync = true;
         paragraph.BringIntoView(); // 未布局时为空操作 —— 安全忽略,调用方回退到保存的偏移
+        CenterOnHeading(paragraph); // 跳转目标显示在视口垂直居中位置(点击跳转行为)
         // 跳转产生的滚动事件被抑制;落定后直接写回目标标题,避免重复同步回路。
         Dispatcher.BeginInvoke(new Action(() =>
         {
             _suppressHeadingSync = false;
             SetCurrentHeading(heading);
         }), DispatcherPriority.Background);
+    }
+
+    /// <summary>把目标标题段落滚动到视口垂直居中:BringIntoView 只保证贴边可见,
+    /// 这里在布局后按标题位置标记的内容坐标补一次居中滚动(点击跳转目标显示在屏幕中间)。
+    /// 段落是 ContentElement 没有几何 API,沿用"当前标题"同步所用的零尺寸标记(M7)。</summary>
+    private void CenterOnHeading(Paragraph paragraph)
+    {
+        if (_scrollHost is not { } host || host.ViewportHeight <= 0)
+        {
+            return;
+        }
+
+        if (paragraph.Tag is not FrameworkElement marker)
+        {
+            return; // 标记尚未物化:文档未布局,保持保存偏移
+        }
+
+        try
+        {
+            var yInViewport = marker.TransformToVisual(host).Transform(new Point(0, 0)).Y;
+            var offset = CenterVerticalOffset(host.VerticalOffset + yInViewport, host.ViewportHeight, host.ExtentHeight);
+            _pendingVerticalOffset = offset;
+            host.ScrollToVerticalOffset(offset);
+        }
+        catch (InvalidOperationException)
+        {
+            // 标记尚未进入视觉树(文档未布局):BringIntoView 同为空操作,保持保存偏移。
+        }
     }
 
     private static void OnRenderResultChanged(DependencyObject d, DependencyPropertyChangedEventArgs e) =>
@@ -285,7 +319,7 @@ public sealed class MarkdownPreviewView : FlowDocumentScrollViewer
     /// <summary>按结果重建 FlowDocument。规则:结果 null → 清空文档并释放图片引用(标签切到
     /// 源码模式/关闭);当前文档即该结果的渲染 → 幂等不变;该结果 AST 已分离(无法重渲染,
     /// 如共享视图切回一个已分离标签)→ 清空旧文档,由标签重新解析;AST 就绪 → 渲染新文档,
-    /// 先释放上一份文档的图片引用再取新引用,渲染失败时回滚本次部分取得的引用。</summary>
+    /// 先释放上一份文档的图片引用再取新引用,渲染会话自行回收未消费的预热引用。</summary>
     private void Rebuild()
     {
         var result = RenderResult;
@@ -295,7 +329,6 @@ public sealed class MarkdownPreviewView : FlowDocumentScrollViewer
             if (Document is not null || _acquiredImagePaths is not null)
             {
                 ReleaseImagePaths(ref _acquiredImagePaths);
-                ReleaseImagePaths(ref _acquiredPreheatPaths);
                 Document = null;
                 _headingParagraphs = null;
                 _renderedResult = null;
@@ -316,7 +349,6 @@ public sealed class MarkdownPreviewView : FlowDocumentScrollViewer
             // 内容残留在本标签下;标签侧(OnDataContextChanged)会重新解析产生新结果。
             CancelIncrementalRender();
             ReleaseImagePaths(ref _acquiredImagePaths);
-            ReleaseImagePaths(ref _acquiredPreheatPaths);
             Document = null;
             _headingParagraphs = null;
             _pendingRestoreStored = null;
@@ -348,22 +380,28 @@ public sealed class MarkdownPreviewView : FlowDocumentScrollViewer
         catch
         {
             // 渲染中途失败:回滚渲染器已按 ImagePaths 部分取得的引用,保留旧文档。
-            session?.Dispose();
+            if (session is not null)
+            {
+                session.Dispose();
+            }
+            else
+            {
+                // BeginRender failed before a session took ownership of the preheat set.
+                MarkdownPreviewService.ReleasePreheatedPaths(result.PreheatedPaths);
+            }
+
             ReleaseImagePaths(result.ImagePaths);
-            ReleaseImagePaths(result.PreheatedPaths); // M6: 预热引用随渲染失败整体释放
             throw;
         }
 
         CancelIncrementalRender();
         ReleaseImagePaths(ref _acquiredImagePaths);
-        ReleaseImagePaths(ref _acquiredPreheatPaths);
         Document = session.Document;
-        // M4: 标题查找表从首批新增块增量构建(渲染器保证标题段落位于文档顶层),
+        // M4: 标题查找表从首批新增块增量构建(包含列表/容器内部的嵌套块),
         // 后续批次只合并各自新增块,不再全文档扫描。
         _headingParagraphs = null;
         UpdateHeadingParagraphs(session.LastAddedBlocks);
         _acquiredImagePaths = result.ImagePaths;
-        _acquiredPreheatPaths = result.PreheatedPaths;
         _renderedResult = result;
         _renderSession = session;
         var generation = ++_renderGeneration;
@@ -387,18 +425,15 @@ public sealed class MarkdownPreviewView : FlowDocumentScrollViewer
         catch
         {
             ReleaseImagePaths(result.ImagePaths);
-            ReleaseImagePaths(result.PreheatedPaths); // M6: 预热引用随渲染失败整体释放
             throw;
         }
 
         CancelIncrementalRender();
         ReleaseImagePaths(ref _acquiredImagePaths);
-        ReleaseImagePaths(ref _acquiredPreheatPaths);
         Document = rendered;
         // 短文档一次性渲染:单次全量构建查找表(≤32 块,开销可忽略),计入全量重建计数。
         _headingParagraphs = BuildHeadingParagraphMap(rendered);
         _acquiredImagePaths = result.ImagePaths;
-        _acquiredPreheatPaths = result.PreheatedPaths;
         _renderedResult = result;
         FinishRenderLifecycle();
     }
@@ -436,7 +471,6 @@ public sealed class MarkdownPreviewView : FlowDocumentScrollViewer
             _renderSession = null;
             session.Dispose();
             ReleaseImagePaths(ref _acquiredImagePaths);
-            ReleaseImagePaths(ref _acquiredPreheatPaths); // M6: 未消费的预热引用随渲染失败释放
             return;
         }
 
@@ -649,11 +683,11 @@ public sealed class MarkdownPreviewView : FlowDocumentScrollViewer
             return cached;
         }
 
-        // 兜底:缓存缺失(理论上不应发生)时退回顶层遍历。
+        // 兜底:缓存缺失(理论上不应发生)时退回完整块树遍历。
         return FindNamedBlock(Document, documentName) as Paragraph;
     }
 
-    /// <summary>一次顶层遍历建立 名称→标题段落 查找表(渲染器保证标题段落均在文档顶层)。
+    /// <summary>一次块树遍历建立 名称→标题段落 查找表。
     /// 仅用于短文档一次性渲染路径;增量渲染路径改用 <see cref="UpdateHeadingParagraphs"/>
     /// 逐批增量合并,全程不触发全文档重建。</summary>
     private Dictionary<string, Paragraph>? BuildHeadingParagraphMap(FlowDocument document)
@@ -662,24 +696,30 @@ public sealed class MarkdownPreviewView : FlowDocumentScrollViewer
         Dictionary<string, Paragraph>? map = null;
         foreach (var block in document.Blocks)
         {
-            if (block is Paragraph { Name: { } name } paragraph)
+            foreach (var candidate in EnumerateBlockTree(block))
             {
-                (map ??= new Dictionary<string, Paragraph>())[name] = paragraph;
+                if (candidate is Paragraph { Name: { } name } paragraph)
+                {
+                    (map ??= new Dictionary<string, Paragraph>())[name] = paragraph;
+                }
             }
         }
 
         return map;
     }
 
-    /// <summary>M4: 把本批新增块中的标题段落增量合并进查找表(渲染器保证标题段落均位于
-    /// 文档顶层,语义与全量构建逐键一致)。</summary>
+    /// <summary>M4: 把本批新增块中的标题段落(含嵌套块)增量合并进查找表,语义与
+    /// 全量构建逐键一致。</summary>
     private void UpdateHeadingParagraphs(IEnumerable<Block> addedBlocks)
     {
         foreach (var block in addedBlocks)
         {
-            if (block is Paragraph { Name: { } name } paragraph)
+            foreach (var candidate in EnumerateBlockTree(block))
             {
-                (_headingParagraphs ??= new Dictionary<string, Paragraph>())[name] = paragraph;
+                if (candidate is Paragraph { Name: { } name } paragraph)
+                {
+                    (_headingParagraphs ??= new Dictionary<string, Paragraph>())[name] = paragraph;
+                }
             }
         }
     }
@@ -724,19 +764,75 @@ public sealed class MarkdownPreviewView : FlowDocumentScrollViewer
     /// <summary>标题段落查找表(测试断言增量合并结果用)。</summary>
     internal IReadOnlyDictionary<string, Paragraph>? HeadingParagraphsForTest => _headingParagraphs;
 
-    /// <summary>渲染器把引文/列表扁平化为顶层段落,标题段落一律位于文档顶层 —— 直接顶层查找。
-    /// (代码方式命名的段落不保证注册进文档名称作用域,FindName 不可靠,故按 Name 遍历匹配。)</summary>
+    /// <summary>按 WPF 块树递归查找命名标题。列表、脚注、图形和自定义容器中的标题
+    /// 不一定是 FlowDocument 顶层块,但仍属于 Markdown 标题模型,不能因容器化渲染而失去导航。</summary>
     internal static Block? FindNamedBlock(FlowDocument document, string name)
     {
         foreach (var block in document.Blocks)
         {
-            if (block is Paragraph { Name: var n } && n == name)
+            foreach (var candidate in EnumerateBlockTree(block))
             {
-                return block;
+                if (candidate is Paragraph { Name: var n } && n == name)
+                {
+                    return candidate;
+                }
             }
         }
 
         return null;
+    }
+
+    /// <summary>遍历 FlowDocument 中所有 Block 子树。WPF 的 ListItem/TableCell 本身不继承
+    /// Block,所以显式穿过它们的 Blocks 集合,使标题缓存和跳转使用同一棵完整树。</summary>
+    private static IEnumerable<Block> EnumerateBlockTree(Block block)
+    {
+        yield return block;
+
+        switch (block)
+        {
+            case System.Windows.Documents.List list:
+                foreach (ListItem item in list.ListItems)
+                {
+                    foreach (var child in item.Blocks)
+                    {
+                        foreach (var descendant in EnumerateBlockTree(child))
+                        {
+                            yield return descendant;
+                        }
+                    }
+                }
+
+                break;
+            case Section section:
+                foreach (var child in section.Blocks)
+                {
+                    foreach (var descendant in EnumerateBlockTree(child))
+                    {
+                        yield return descendant;
+                    }
+                }
+
+                break;
+            case Table table:
+                foreach (TableRowGroup group in table.RowGroups)
+                {
+                    foreach (TableRow row in group.Rows)
+                    {
+                        foreach (TableCell cell in row.Cells)
+                        {
+                            foreach (var child in cell.Blocks)
+                            {
+                                foreach (var descendant in EnumerateBlockTree(child))
+                                {
+                                    yield return descendant;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                break;
+        }
     }
 
     private static T? FindVisualChild<T>(DependencyObject parent) where T : DependencyObject

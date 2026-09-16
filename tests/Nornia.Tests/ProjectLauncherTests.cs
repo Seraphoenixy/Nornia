@@ -17,9 +17,26 @@ public sealed class ProjectLauncherTests : IDisposable
 
         await launcher.OpenAsync(_directory, "custom-editor.exe");
 
-        var call = Assert.Single(runner.Calls);
+        var call = Assert.Single(runner.ShellCalls);
         Assert.Equal("custom-editor.exe", call.FileName);
         Assert.Equal([Path.GetFullPath(_directory)], call.Arguments);
+    }
+
+    [Fact]
+    public async Task OpenAsync_UsesShellExecuteSoPathShimsLikeCodeResolve()
+    {
+        // VS Code's "code" on PATH is a code.cmd batch shim: a redirected CreateProcess cannot
+        // start it, but shell execution resolves it like the terminal does. The launch must go
+        // through the shell path, not the redirected runner.
+        Directory.CreateDirectory(_directory);
+        var runner = new FakeProcessRunner((_, _) => new ProcessResult(0, string.Empty, string.Empty));
+        var launcher = new ProjectLauncher(runner);
+
+        await launcher.OpenAsync(_directory, "code");
+
+        var call = Assert.Single(runner.ShellCalls);
+        Assert.Equal("code", call.FileName);
+        Assert.Empty(runner.Calls);
     }
 
     [Fact]
@@ -46,7 +63,7 @@ public sealed class ProjectLauncherTests : IDisposable
 
         await launcher.OpenAsync(file, "custom-editor.exe");
 
-        var call = Assert.Single(runner.Calls);
+        var call = Assert.Single(runner.ShellCalls);
         Assert.Equal([Path.GetFullPath(file)], call.Arguments);
     }
 

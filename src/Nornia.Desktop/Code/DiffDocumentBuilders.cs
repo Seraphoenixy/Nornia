@@ -12,9 +12,16 @@ public sealed record DiffRenderLine(
     int? NewLineNumber,
     IReadOnlyList<DiffIntralineChange>? IntralineChanges = null,
     bool IsModified = false,
-    int HunkIndex = -1)
+    int HunkIndex = -1,
+    int HiddenLineCount = 0,
+    bool IsSideBySidePlaceholder = false)
 {
     public bool IsChange => Kind is GitDiffLineKind.Added or GitDiffLineKind.Removed;
+
+    /// <summary>True when this is the synthetic row that represents folded unchanged context.
+    /// The count is kept as structured data so both diff layouts can render and hit-test the
+    /// prompt without parsing its localized display text.</summary>
+    public bool IsCollapsedContext => HiddenLineCount > 0;
 }
 
 /// <summary>Options for the refined build path (D2/D3/D6/D7).</summary>
@@ -121,6 +128,12 @@ public sealed class DiffBuildCache
 /// </summary>
 public static class DiffDocumentBuilders
 {
+    /// <summary>True for a side-by-side placeholder row where a side has no content and should look
+    /// like VS Code's shadowed empty space instead of a transparent hole.</summary>
+    public static bool IsPlaceholderLine(DiffRenderLine line) =>
+        line.Kind == GitDiffLineKind.None &&
+        (line.IsCollapsedContext || string.IsNullOrWhiteSpace(line.Text) || line.Text.Contains('…'));
+
     /// <summary>Resolves a file path to its AvalonEdit highlighting definition name (empty string
     /// for plain text / unknown extensions). Shared by the code source view and the diff view so
     /// both render the same file with the same highlighting.</summary>
@@ -242,18 +255,27 @@ public static class DiffDocumentBuilders
             var row = source[index];
             var hasOld = row.HasOldContent;
             var hasNew = row.HasNewContent;
+            // A pure insertion/deletion has a real line on only one side. Preserve that semantic
+            // distinction so the empty counterpart can receive VS Code's diagonal shadow fill;
+            // hunk headers and the spacer before a hunk leave both sides empty and are not shadows.
+            var oldIsPlaceholder = !hasOld
+                && row.NewKind is (GitDiffLineKind.Context or GitDiffLineKind.Added);
+            var newIsPlaceholder = !hasNew
+                && row.OldKind is (GitDiffLineKind.Context or GitDiffLineKind.Removed);
             old.Add(new DiffRenderLine(
                 hasOld ? row.OldText : string.Empty,
                 hasOld ? row.OldKind : GitDiffLineKind.None,
                 hasOld ? row.OldLineNumber : null,
                 null,
-                HunkIndex: row.HunkIndex));
+                HunkIndex: row.HunkIndex,
+                IsSideBySidePlaceholder: oldIsPlaceholder));
             next.Add(new DiffRenderLine(
                 hasNew ? row.NewText : string.Empty,
                 hasNew ? row.NewKind : GitDiffLineKind.None,
                 null,
                 hasNew ? row.NewLineNumber : null,
-                HunkIndex: row.HunkIndex));
+                HunkIndex: row.HunkIndex,
+                IsSideBySidePlaceholder: newIsPlaceholder));
             if (index > 0)
             {
                 oldText.Append('\n');
@@ -275,8 +297,8 @@ public static class DiffDocumentBuilders
         var intralineOmitted = false;
         ApplyIntralineChanges(old, next, options, ref intralineOmitted);
 
-        // 改行着色(VS Code modified):同一显示行对 old=Removed / new=Added 视为"修改"而非纯增删,
-        // 双端标记后用 DiffModified* 令牌渲染。
+        // 改行配对(VS Code modified):同一显示行对 old=Removed / new=Added 标记为同一处替换。
+        // IsModified 只保存配对语义;渲染时两侧仍分别使用 Removed/Added 的红/绿色背景。
         var pairs = Math.Min(old.Count, next.Count);
         for (var i = 0; i < pairs; i++)
         {
@@ -311,7 +333,8 @@ public static class DiffDocumentBuilders
             var oldLine = index < old.Count ? old[index] : null;
             var newLine = index < next.Count ? next[index] : null;
             // ToSideBySideRows adds a both-empty spacer before every hunk. Keep it as a
-            // display-only boundary so it cannot merge the previous hunk's context run.
+            // display-only metadata row: it must not count as source context, and the side
+            // projection can omit it because both materialized cells are empty.
             var isHunkSpacer = oldLine?.Kind == GitDiffLineKind.None
                 && newLine?.Kind == GitDiffLineKind.None;
             var kind = isHunkSpacer

@@ -4,7 +4,15 @@
              xmlns:views="clr-namespace:Nornia.Desktop.Views"
              xmlns:b="clr-namespace:Nornia.Desktop.Behaviors">
   <Grid Style="{StaticResource PageRootStyle}">
-    <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="*" /><RowDefinition Height="2*" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto" />
+      <RowDefinition Height="Auto" />
+      <RowDefinition Height="Auto" />
+      <RowDefinition Height="2*" MinHeight="120" />
+      <RowDefinition Height="Auto" />
+      <RowDefinition Height="3*" MinHeight="160" />
+      <RowDefinition Height="Auto" />
+    </Grid.RowDefinitions>
     <DockPanel LastChildFill="False">
       <StackPanel>
         <TextBlock Text="缓存" Style="{StaticResource PageTitleStyle}" />
@@ -37,7 +45,8 @@
       <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
         <Button Content="清理所选" Command="{Binding CleanCommand}" Style="{StaticResource DangerButton}" ToolTip="仅删除选中缓存目录的内容；执行前会确认。高置信候选默认选中，“需审查”项默认不选；Cookies、历史记录、Local Storage、数据库与配置目录不会列入候选。" />
         <Button Content="打开目录" Command="{Binding OpenSelectedCommand}" ToolTip="在资源管理器中打开所选目录" />
-        <Button Content="清空选择" Command="{Binding ClearSelectionCommand}" />
+        <Button Content="全选" Command="{Binding SelectAllInCategoryCommand}" ToolTip="勾选当前分类的全部缓存项（包括被筛选隐藏的项）" />
+        <Button Content="全不选" Command="{Binding ClearCategorySelectionCommand}" ToolTip="取消勾选当前分类的全部缓存项（包括被筛选隐藏的项）" />
         <Button Content="选择高置信" Command="{Binding SelectHighConfidenceCommand}" />
       </StackPanel>
       <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
@@ -45,22 +54,21 @@
         <TextBlock Text="{Binding SelectedSummary}" Foreground="{DynamicResource MutedTextBrush}" Margin="{StaticResource GapLeftSm}" />
       </StackPanel>
     </DockPanel>
-    <DataGrid Grid.Row="3" ItemsSource="{Binding PackageSummaries}" SelectedItem="{Binding SelectedPackageSummary}" AlternationCount="2" CanUserSortColumns="True"
+    <DataGrid Grid.Row="3" ItemsSource="{Binding CategorySummaries}" SelectedItem="{Binding SelectedCategorySummary, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" AlternationCount="2" CanUserSortColumns="True"
               CellStyle="{StaticResource EnvironmentDataGridCellStyle}"
-              SelectionMode="Extended" KeyboardNavigation.TabNavigation="None"
-              b:MultiSelectorBinding.SelectedItems="{Binding SelectedPackageSummaries}"
+              SelectionMode="Single" KeyboardNavigation.TabNavigation="None"
               b:ListSelectionBehavior.SelectOnRightClick="True">
       <DataGrid.ContextMenu>
         <ContextMenu>
-          <MenuItem Header="复制选中" Command="{Binding CopySelectedPackageSummariesCommand}" InputGestureText="Ctrl+C" />
-          <MenuItem Header="复制全部" Command="{Binding CopyAllPackageSummariesCommand}" />
+          <MenuItem Header="复制选中" Command="{Binding CopySelectedCategorySummariesCommand}" InputGestureText="Ctrl+C" />
+          <MenuItem Header="复制全部" Command="{Binding CopyAllCategorySummariesCommand}" />
         </ContextMenu>
       </DataGrid.ContextMenu>
       <DataGrid.Style>
         <Style TargetType="DataGrid" BasedOn="{StaticResource {x:Type DataGrid}}">
           <Setter Property="Visibility" Value="Visible" />
           <Style.Triggers>
-            <DataTrigger Binding="{Binding PackageSummaries.Count}" Value="0">
+            <DataTrigger Binding="{Binding CategorySummaries.Count}" Value="0">
               <Setter Property="Visibility" Value="Collapsed" />
             </DataTrigger>
               </Style.Triggers>
@@ -70,21 +78,21 @@
         <Style TargetType="TextBlock" BasedOn="{StaticResource EnvironmentDataGridTextStyle}" />
       </DataGrid.Resources>
       <DataGrid.Columns>
-        <DataGridTextColumn Header="软件包" Binding="{Binding PackageName}" ElementStyle="{StaticResource EnvironmentDataGridTextStyle}" Width="2.5*" />
-        <DataGridTextColumn Header="Package ID" Binding="{Binding PackageId}" ElementStyle="{StaticResource EnvironmentDataGridTextStyle}" Width="1.5*" />
-        <DataGridTextColumn Header="来源" Binding="{Binding Provider}" ElementStyle="{StaticResource EnvironmentDataGridTextStyle}" Width="90" />
-        <DataGridTextColumn Header="缓存项" Binding="{Binding CandidateCount}" ElementStyle="{StaticResource EnvironmentDataGridTextStyle}" Width="70" />
-        <DataGridTextColumn Header="可释放空间" Binding="{Binding SizeDisplay}" ElementStyle="{StaticResource EnvironmentDataGridTextStyle}" SortMemberPath="SizeBytes" Width="100" />
-        <DataGridTemplateColumn Header="操作" Width="80">
+        <DataGridTextColumn Header="推测分类" Binding="{Binding CategoryName}" ElementStyle="{StaticResource EnvironmentDataGridTextStyle}" Width="2*" />
+        <DataGridTextColumn Header="缓存类型" Binding="{Binding TypeDisplay}" ElementStyle="{StaticResource EnvironmentDataGridTextStyle}" Width="2*" />
+        <DataGridTextColumn Header="已选/总计" Binding="{Binding SelectionCountDisplay}" ElementStyle="{StaticResource EnvironmentDataGridTextStyle}" SortMemberPath="SelectedCandidateCount" Width="90" />
+        <DataGridTextColumn Header="清理空间/总空间" Binding="{Binding SelectionSizeDisplay}" ElementStyle="{StaticResource EnvironmentDataGridTextStyle}" SortMemberPath="SelectedSizeBytes" Width="150" />
+        <DataGridTemplateColumn Header="操作" Width="90">
           <DataGridTemplateColumn.CellTemplate>
             <DataTemplate>
-              <Button Content="清理" Command="{Binding DataContext.CleanPackageCommand, RelativeSource={RelativeSource AncestorType=DataGrid}}" CommandParameter="{Binding}" ToolTip="清理该软件包关联的全部缓存目录内容" />
+              <Button Content="清理已选" Command="{Binding DataContext.CleanCategoryCommand, RelativeSource={RelativeSource AncestorType=DataGrid}}" CommandParameter="{Binding}" ToolTip="仅清理该分类中已勾选的缓存目录；执行前会列出路径并确认" />
             </DataTemplate>
           </DataGridTemplateColumn.CellTemplate>
         </DataGridTemplateColumn>
       </DataGrid.Columns>
     </DataGrid>
-    <DataGrid Grid.Row="4" ItemsSource="{Binding FilteredCandidates}" SelectedItem="{Binding SelectedCandidate}" AlternationCount="2" IsReadOnly="False"
+    <GridSplitter Grid.Row="4" Style="{StaticResource HorizontalSashStyle}" ResizeDirection="Rows" ResizeBehavior="PreviousAndNext" />
+    <DataGrid Grid.Row="5" ItemsSource="{Binding FilteredCandidates}" SelectedItem="{Binding SelectedCandidate}" AlternationCount="2" IsReadOnly="False"
               CellStyle="{StaticResource EnvironmentDataGridCellStyle}"
               SelectionMode="Extended" KeyboardNavigation.TabNavigation="None"
               b:MultiSelectorBinding.SelectedItems="{Binding SelectedCandidates}"
@@ -92,6 +100,11 @@
               Visibility="{Binding IsCandidateListEmpty, Converter={StaticResource InverseBooleanToVisibilityConverter}}">
       <DataGrid.Resources>
         <Style TargetType="TextBlock" BasedOn="{StaticResource EnvironmentDataGridTextStyle}" />
+        <Style x:Key="CacheSelectionCellStyle" TargetType="DataGridCell" BasedOn="{StaticResource EnvironmentDataGridCellStyle}">
+          <Setter Property="Padding" Value="0" />
+          <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+          <Setter Property="VerticalContentAlignment" Value="Stretch" />
+        </Style>
       </DataGrid.Resources>
       <DataGrid.ContextMenu>
         <ContextMenu>
@@ -100,28 +113,28 @@
         </ContextMenu>
       </DataGrid.ContextMenu>
       <DataGrid.Columns>
-        <DataGridCheckBoxColumn Header="清理" Binding="{Binding IsSelected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" Width="55" IsReadOnly="False" />
+        <DataGridTemplateColumn Header="清理" Width="64" IsReadOnly="False" CellStyle="{StaticResource CacheSelectionCellStyle}">
+          <DataGridTemplateColumn.CellTemplate>
+            <DataTemplate>
+              <CheckBox IsChecked="{Binding IsSelected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                        HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+                        HorizontalContentAlignment="Center" VerticalContentAlignment="Center"
+                        Background="Transparent" ToolTip="勾选后纳入当前分类的清理范围" />
+            </DataTemplate>
+          </DataGridTemplateColumn.CellTemplate>
+        </DataGridTemplateColumn>
+        <DataGridTextColumn Header="类型" Binding="{Binding CacheType}" ElementStyle="{StaticResource EnvironmentDataGridTextStyle}" Width="120" IsReadOnly="True" />
         <DataGridTextColumn Header="置信度" Binding="{Binding Confidence}" ElementStyle="{StaticResource EnvironmentDataGridTextStyle}" Width="85" IsReadOnly="True" />
-        <DataGridTextColumn Header="来源" Binding="{Binding Source}" ElementStyle="{StaticResource EnvironmentDataGridTextStyle}" Width="120" IsReadOnly="True" />
-        <DataGridTextColumn Header="软件包" Binding="{Binding PackageName}" ElementStyle="{StaticResource EnvironmentDataGridTextStyle}" Width="150" IsReadOnly="True" />
-        <DataGridTextColumn Header="大小" Binding="{Binding SizeDisplay}" ElementStyle="{StaticResource EnvironmentDataGridTextStyle}" SortMemberPath="SizeBytes" Width="95" IsReadOnly="True" />
-        <DataGridTextColumn Header="用户目录" Binding="{Binding UserDirectoryLabel}" Width="120" IsReadOnly="True">
-          <DataGridTextColumn.ElementStyle>
-            <Style TargetType="TextBlock" BasedOn="{StaticResource EnvironmentDataGridTextStyle}">
-              <Setter Property="ToolTip" Value="{Binding UserDirectory}" />
-            </Style>
-          </DataGridTextColumn.ElementStyle>
-        </DataGridTextColumn>
         <DataGridTextColumn Header="路径" Binding="{Binding Path}" ElementStyle="{StaticResource EnvironmentDataGridTextStyle}" Width="*" IsReadOnly="True" />
-        <DataGridTextColumn Header="识别说明" Binding="{Binding Reason}" ElementStyle="{StaticResource EnvironmentDataGridTextStyle}" Width="*" IsReadOnly="True" />
+        <DataGridTextColumn Header="占用空间" Binding="{Binding SizeDisplay}" ElementStyle="{StaticResource EnvironmentDataGridTextStyle}" SortMemberPath="SizeBytes" Width="110" IsReadOnly="True" />
       </DataGrid.Columns>
     </DataGrid>
-    <Border Background="{DynamicResource EditorBrush}" Grid.Row="4" IsHitTestVisible="False"
+    <Border Background="{DynamicResource EditorBrush}" Grid.Row="5" IsHitTestVisible="False"
             Visibility="{Binding IsCandidateListEmpty, Converter={StaticResource BooleanToVisibilityConverter}}">
       <views:EmptyStateControl Icon="{StaticResource CodiconSearch}" Title="未发现可管理的缓存目录。" Description="点击“扫描缓存”开始。"
                                  ActionText="扫描缓存" ActionCommand="{Binding ScanCommand}" />
     </Border>
-    <TextBlock Grid.Row="5" Margin="0,8,0,0" Text="{Binding CleanupResultSummary}" Foreground="{DynamicResource SuccessBrush}"
+    <TextBlock Grid.Row="6" Margin="0,8,0,0" Text="{Binding CleanupResultSummary}" Foreground="{DynamicResource SuccessBrush}"
                Visibility="{Binding CleanupResultSummary, Converter={StaticResource StringEmptyToCollapsedConverter}}" />
   </Grid>
 </UserControl>

@@ -10,6 +10,11 @@ namespace Nornia.Core.Services;
 
 public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
 {
+    // Text fallback must inspect the retained byte stream to decide UTF-8 vs GB18030. Keep the
+    // retained prefix explicitly bounded; an unterminated generated line must not turn a read-only
+    // diff into an unbounded allocation. The prefix is spooled to disk instead of a large byte[] so
+    // a large diff does not create a transient 64 MB managed allocation.
+    private const int MaximumTextFallbackCaptureBytes = 64 * 1024 * 1024;
     private readonly ConcurrentDictionary<int, Process> _activeProcesses = new();
 
     public async Task<ProcessResult> RunAsync(
@@ -151,6 +156,43 @@ public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
         }
     }
 
+    public Task<ProcessResult> RunShellAsync(
+        string fileName,
+        IReadOnlyList<string> arguments,
+        CancellationToken cancellationToken = default)
+    {
+        // Shell-execute semantics (UseShellExecute=true) resolve PATH entries like VS Code's
+        // "code" — a code.cmd batch shim that CreateProcess cannot start directly. Output is not
+        // redirected because shell execution cannot pair with redirection, and the launched editor
+        // is deliberately detached: we only confirm the launch succeeded, not that the editor ran
+        // to completion. Arguments are quoted individually so paths with spaces survive the shell.
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = fileName,
+            UseShellExecute = true,
+            Arguments = string.Join(' ', arguments.Select(QuoteForShell)),
+        };
+
+        using var process = new Process { StartInfo = startInfo };
+        try
+        {
+            if (!process.Start())
+            {
+                return Task.FromResult(new ProcessResult(-1, string.Empty, $"Unable to start '{fileName}'."));
+            }
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException or ArgumentException or NotSupportedException)
+        {
+            return Task.FromResult(new ProcessResult(-1, string.Empty, ex.Message));
+        }
+
+        // Detached: the external editor owns its lifetime; do not register it for shutdown kills.
+        return Task.FromResult(new ProcessResult(0, string.Empty, string.Empty));
+    }
+
+    private static string QuoteForShell(string argument) =>
+        argument.Contains(' ') ? $"\"{argument}\"" : argument;
+
     public void StopActiveProcesses()
     {
         // Process.Kill(entireProcessTree: true) can block for several seconds per process tree
@@ -252,8 +294,7 @@ public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
     /// Like <see cref="IProcessRunner.StreamLinesAsync"/> but for text output that may carry a
     /// legacy Chinese encoding — git diff content lines pass the file's raw bytes through, so a
     /// GBK/ANSI file garbles under the fixed UTF-8 decode of <see cref="StreamLinesAsync"/>.
-    /// Stdout is captured as raw bytes (bounded by the line cap: the decoded lines can never
-    /// outnumber the newlines already emitted plus one), validated as strict UTF-8 over the whole
+    /// Stdout is captured as a bounded raw-byte prefix, validated as strict UTF-8 over the whole
     /// payload, and decoded as GB18030 when it is not clean — the same BOM/strict-UTF-8/GB18030
     /// strategy as the read-only preview decoder. Clean UTF-8 output costs one validation pass
     /// (a byte scan at memory-bandwidth speed) and otherwise streams lines exactly like
@@ -285,12 +326,18 @@ public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
         var emitted = 0;
         var limitReached = false;
 
-        // Raw stdout capture: stop retaining bytes once the newline count passes the line cap
-        // (decoded lines <= newlines + 1) but keep draining so the child never blocks on a full
-        // pipe; excess output is discarded and reported through the limit flag.
-        async Task<byte[]> CaptureStdoutAsync()
+        // Retain exactly the first maximumLines complete stdout lines, capped in bytes as well.
+        // Continue draining after either cap so the child never blocks on a full pipe.
+        async Task<string> CaptureStdoutAsync()
         {
-            var captured = new MemoryStream(64 * 1024);
+            var path = Path.Combine(Path.GetTempPath(), $"nornia-diff-{Guid.NewGuid():N}.tmp");
+            await using var captured = new FileStream(
+                path,
+                FileMode.CreateNew,
+                FileAccess.Write,
+                FileShare.Read,
+                bufferSize: 64 * 1024,
+                options: FileOptions.Asynchronous | FileOptions.SequentialScan);
             var chunk = new byte[64 * 1024];
             var newlines = 0;
             var capturing = true;
@@ -308,22 +355,31 @@ public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
                     continue;
                 }
 
-                for (var i = 0; i < read; i++)
+                var retained = 0;
+                while (retained < read && newlines < maximumLines && captured.Length + retained < MaximumTextFallbackCaptureBytes)
                 {
-                    if (chunk[i] == (byte)'\n') newlines++;
+                    if (chunk[retained] == (byte)'\n')
+                    {
+                        newlines++;
+                    }
+
+                    retained++;
                 }
 
-                if (newlines > maximumLines)
+                if (retained > 0)
+                {
+                    await captured.WriteAsync(chunk.AsMemory(0, retained), cancellationToken).ConfigureAwait(false);
+                }
+
+                if (retained < read)
                 {
                     capturing = false;
                     limitReached = true;
-                    continue;
                 }
-
-                captured.Write(chunk, 0, read);
             }
 
-            return captured.ToArray();
+            await captured.FlushAsync(cancellationToken).ConfigureAwait(false);
+            return path;
         }
 
         async Task PumpAsync(StreamReader reader, bool isError)
@@ -342,16 +398,31 @@ public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
         }
 
         var error = PumpAsync(process.StandardError, true);
+        string? stdoutPath = null;
         var completion = Task.Run(async () =>
         {
             try
             {
+                // 顺序关键:必须先抽干 stdout 再等退出。整段捕获要求"进程结束前"持续读取——
+                // 若先等退出,子进程输出超过管道缓冲(Windows 默认数 KB)时会阻塞在写端,
+                // 永远退不出,等待方也随之永久挂起(大 diff 视图空白即源于此)。
+                // CaptureStdoutAsync 在管道写端关闭(进程退出)时返回,其后 WaitForExitAsync
+                // 立即完成;取消经 ReadAsync 触发 catch 分支杀进程,语义与原先一致。
+                stdoutPath = await CaptureStdoutAsync().ConfigureAwait(false);
                 await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
-                var stdoutBytes = await CaptureStdoutAsync().ConfigureAwait(false);
                 await error.ConfigureAwait(false);
-                var (encoding, bomLength) = DecodeEncodingForCapturedText(stdoutBytes);
-                var stdout = new MemoryStream(stdoutBytes, bomLength, stdoutBytes.Length - bomLength, writable: false);
-                await PumpAsync(new StreamReader(stdout, encoding, detectEncodingFromByteOrderMarks: false, leaveOpen: false), false).ConfigureAwait(false);
+                await using (var stdout = new FileStream(
+                    stdoutPath,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.Read,
+                    bufferSize: 64 * 1024,
+                    options: FileOptions.Asynchronous | FileOptions.SequentialScan))
+                {
+                    var (encoding, bomLength) = await DetectEncodingForCapturedTextAsync(stdout, cancellationToken).ConfigureAwait(false);
+                    stdout.Position = bomLength;
+                    await PumpAsync(new StreamReader(stdout, encoding, detectEncodingFromByteOrderMarks: false, leaveOpen: true), false).ConfigureAwait(false);
+                }
                 await channel.Writer.WriteAsync(new ProcessStreamEvent(null, false, process.ExitCode, limitReached), CancellationToken.None).ConfigureAwait(false);
                 channel.Writer.TryComplete();
             }
@@ -359,6 +430,14 @@ public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
             {
                 StopProcess(process);
                 channel.Writer.TryComplete(exception);
+            }
+            finally
+            {
+                if (stdoutPath is not null)
+                {
+                    try { File.Delete(stdoutPath); } catch (IOException) { }
+                    catch (UnauthorizedAccessException) { }
+                }
             }
         }, CancellationToken.None);
 
@@ -374,19 +453,46 @@ public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
         }
     }
 
-    /// <summary>Chooses the decode encoding for a fully captured stdout payload: a UTF-8 BOM at
-    /// the start is authoritative and skipped (matching the previous StreamReader behavior);
-    /// clean strict UTF-8 decodes as-is; anything else — a legacy GBK/ANSI file — decodes as
-    /// GB18030. Returns the encoding and the number of leading BOM bytes to skip.</summary>
-    private static (Encoding Encoding, int BomLength) DecodeEncodingForCapturedText(byte[] bytes)
+    /// <summary>Chooses the decode encoding for the retained stdout spool. UTF-8 validation is
+    /// incremental so the complete retained payload never has to be copied into a managed array.</summary>
+    private static async Task<(Encoding Encoding, int BomLength)> DetectEncodingForCapturedTextAsync(
+        FileStream stream,
+        CancellationToken cancellationToken)
     {
-        var bomLength = TextEncodingDetector.Utf8BomLength(bytes);
+        var head = new byte[3];
+        var headLength = 0;
+        while (headLength < head.Length)
+        {
+            var read = await stream.ReadAsync(head.AsMemory(headLength), cancellationToken).ConfigureAwait(false);
+            if (read == 0) break;
+            headLength += read;
+        }
+
+        var bomLength = TextEncodingDetector.Utf8BomLength(head.AsSpan(0, headLength));
         if (bomLength > 0)
         {
+            stream.Position = 0;
             return (TextEncodingDetector.Utf8Replacement, bomLength);
         }
 
-        return (TextEncodingDetector.IsStrictUtf8(bytes) ? TextEncodingDetector.Utf8Strict : TextEncodingDetector.Gb18030, 0);
+        stream.Position = 0;
+        var strict = true;
+        var pending = Array.Empty<byte>();
+        var buffer = new byte[64 * 1024];
+        while (strict)
+        {
+            var read = await stream.ReadAsync(buffer.AsMemory(), cancellationToken).ConfigureAwait(false);
+            if (read == 0) break;
+            strict = TextEncodingDetector.IsStrictUtf8Chunk(buffer.AsSpan(0, read), pending, out pending);
+        }
+
+        if (strict && pending.Length > 0)
+        {
+            strict = false;
+        }
+
+        stream.Position = 0;
+        return (strict ? TextEncodingDetector.Utf8Strict : TextEncodingDetector.Gb18030, 0);
     }
 
     private static void StopProcess(Process process)
@@ -459,28 +565,91 @@ public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
             return truncated;
         }
 
-        // With a progress sink we keep streaming line by line so callers observe output in real time.
-        while (await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
+        // A package manager may redraw a progress bar with `\r`, or write the percentage without
+        // any line terminator until the download is over. ReadLineAsync would therefore hold the
+        // only useful progress frame in its buffer until process exit. Read chunks instead and
+        // report at control-character boundaries and as soon as a percentage marker arrives.
+        void AppendCaptured(ReadOnlySpan<char> chars)
         {
-            if (buffer.Length < limit)
+            if (chars.Length == 0)
             {
-                var room = (int)Math.Min(limit - buffer.Length, int.MaxValue);
-                if (line.Length + 1 <= room)
-                {
-                    buffer.AppendLine(line);
-                }
-                else
-                {
-                    buffer.Append(line.AsSpan(0, Math.Max(0, room - 1)));
-                    truncated = true;
-                }
+                return;
             }
-            else
+
+            if (buffer.Length >= limit)
+            {
+                truncated = true;
+                return;
+            }
+
+            var room = Math.Min(limit - buffer.Length, int.MaxValue);
+            var take = (int)Math.Min(chars.Length, room);
+            buffer.Append(chars[..take]);
+            if (take < chars.Length)
             {
                 truncated = true;
             }
+        }
 
-            progress.Report(new ProcessOutput(line, isError));
+        var progressBlock = new char[4096];
+        var pending = new StringBuilder();
+        var previousWasCarriageReturn = false;
+        while (true)
+        {
+            var read = await reader.ReadAsync(progressBlock.AsMemory(), cancellationToken).ConfigureAwait(false);
+            if (read == 0)
+            {
+                break;
+            }
+
+            AppendCaptured(progressBlock.AsSpan(0, read));
+            for (var index = 0; index < read; index++)
+            {
+                var character = progressBlock[index];
+                if (character is '\r' or '\n')
+                {
+                    // CRLF is one logical frame. The preceding CR already flushed it.
+                    if (character == '\n' && previousWasCarriageReturn)
+                    {
+                        previousWasCarriageReturn = false;
+                        continue;
+                    }
+
+                    progress.Report(new ProcessOutput(pending.ToString(), isError));
+                    pending.Clear();
+                    previousWasCarriageReturn = character == '\r';
+                    continue;
+                }
+
+                pending.Append(character);
+                previousWasCarriageReturn = false;
+
+                // Winget emits its download progress as an OSC 9;4 virtual-terminal sequence.
+                // Such a frame is terminated by BEL (or by ST: ESC followed by `\\`), not by a
+                // newline. Flush it immediately so the UI does not wait for winget to exit.
+                var isVirtualTerminalTerminator = character == '\a'
+                    || (character == '\\'
+                        && pending.Length >= 2
+                        && pending[pending.Length - 2] == '\x1b');
+                if (isVirtualTerminalTerminator)
+                {
+                    progress.Report(new ProcessOutput(pending.ToString(), isError));
+                    pending.Clear();
+                    continue;
+                }
+
+                // `%` and its full-width form are the stable part of the output contract. This
+                // makes a frame visible even when the producer keeps the cursor on one line.
+                if (character is '%' or '％')
+                {
+                    progress.Report(new ProcessOutput(pending.ToString(), isError));
+                }
+            }
+        }
+
+        if (pending.Length > 0)
+        {
+            progress.Report(new ProcessOutput(pending.ToString(), isError));
         }
         return truncated;
     }

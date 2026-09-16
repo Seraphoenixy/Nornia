@@ -401,12 +401,14 @@ public partial class SettingsEditorViewModel : ObservableObject, IDisposable, IA
             _session.Changed += OnSessionChanged;
         }
         _snapshot = _session.Current ?? await _session.RefreshAsync(cancellationToken);
+        if (!Equals(CurrentContext(), context)) return;
         // 激活链(SettingsViewModel → PageViewModel.ActivateAsync)可能在没有同步上下文的
         // 线程上启动:await 之后续体会落到线程池,而绑定集合(Items/View 及其
         // CollectionView)只能在调度程序线程上变更。与 OnSessionChanged/OnBindingsChanged
         // 回调同一约定。
         RunOnDispatcher(() =>
         {
+            if (!Equals(CurrentContext(), context)) return;
             ApplySnapshot();
             SaveStatus = _snapshot.Diagnostics.Count == 0 ? "已保存" : _snapshot.Diagnostics[0].Message;
             OnPropertyChanged(nameof(HasWorkspace));
@@ -417,9 +419,12 @@ public partial class SettingsEditorViewModel : ObservableObject, IDisposable, IA
 
     private void OnSessionChanged(object? sender, SettingsChangeSet change)
     {
-        if (_session?.Current is not { } current) return;
+        if (sender is not ISettingsSession session || !ReferenceEquals(_session, session)
+            || session.Current is not { } current) return;
+        var sessionContext = current.Context;
         void Update()
         {
+            if (!Equals(CurrentContext(), sessionContext)) return;
             _snapshot = current;
             ApplySnapshot();
             SaveStatus = current.Diagnostics.Count == 0 ? "已保存" : current.Diagnostics[0].Message;

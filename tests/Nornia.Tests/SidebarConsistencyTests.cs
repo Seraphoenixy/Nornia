@@ -1,9 +1,13 @@
 using Nornia.Desktop.Views.Controls;
 using Nornia.Desktop.Converters;
 using Nornia.Desktop.Views;
+using Nornia.Desktop.ViewModels;
+using Nornia.Desktop.Behaviors;
+using Nornia.Core.Models;
 using System.Globalization;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Documents;
 using System.Windows.Media;
 
 namespace Nornia.Tests;
@@ -49,6 +53,117 @@ public sealed class SidebarConsistencyTests
     }
 
     [Fact]
+    public void GitFlatChangeRowTemplate_LoadsConverterBindingsAtRuntime()
+    {
+        WpfStaContext.Run(() =>
+        {
+            var view = new GitView();
+            var template = Assert.IsType<DataTemplate>(view.Resources["ScmFileRowTemplate"]);
+            var row = Assert.IsAssignableFrom<FrameworkElement>(template.LoadContent());
+            row.DataContext = new GitChangeItem(new GitFileChange(
+                "src/features/Example.cs", GitChangeStatus.Unmodified, GitChangeStatus.Modified));
+
+            row.Measure(new Size(420, 40));
+
+            Assert.True(row.DesiredSize.Width > 0);
+        });
+    }
+
+    [Fact]
+    public void GitCommitRowTemplate_BindsReadOnlySyncTargetOneWayAtRuntime()
+    {
+        WpfStaContext.Run(() =>
+        {
+            var view = new GitView();
+            var template = Assert.IsType<DataTemplate>(view.Resources["ScmCommitBarTemplate"]);
+            var row = Assert.IsAssignableFrom<FrameworkElement>(template.LoadContent());
+            row.DataContext = new GitLogRow(
+                new GitCommitInfo("HEAD...origin/main", "", "传入的更改", null, "origin/main", "-", DateTimeOffset.UtcNow),
+                new GitGraphRow(0, [], [], 1, DotHollow: true, DotDashed: true),
+                syncTarget: "origin/main");
+
+            row.Measure(new Size(420, 40));
+
+            Assert.True(row.DesiredSize.Width > 0);
+        });
+    }
+
+    [Fact]
+    public void GitCommitList_ExpandedRowUpdatesPixelScrollExtent()
+    {
+        WpfStaContext.Run(() =>
+        {
+            var view = new GitView();
+            var rows = Enumerable.Range(0, 20).Select(index => new GitLogRow(
+                new GitCommitInfo($"c{index}", $"c{index}", $"commit {index}", null, "A", "a@x", DateTimeOffset.UtcNow),
+                new GitGraphRow(0, [], [], 1))).ToArray();
+            var list = new ListBox
+            {
+                Width = 420,
+                Height = 120,
+                ItemsSource = rows,
+                ItemTemplate = Assert.IsType<DataTemplate>(view.Resources["ScmCommitBarTemplate"]),
+                ItemContainerStyle = Assert.IsType<Style>(view.Resources["ScmGraphRowStyle"]),
+            };
+            ScrollViewer.SetCanContentScroll(list, true);
+            VirtualizingPanel.SetIsVirtualizing(list, true);
+            VirtualizingPanel.SetVirtualizationMode(list, VirtualizationMode.Recycling);
+            VirtualizingPanel.SetScrollUnit(list, ScrollUnit.Pixel);
+            var host = new Window { Content = list, Width = 440, Height = 160, ShowInTaskbar = false };
+            host.Show();
+            try
+            {
+                host.UpdateLayout();
+                var scrollViewer = FindVisualChild<ScrollViewer>(list);
+                var collapsedExtent = scrollViewer.ExtentHeight;
+
+                rows[0].IsExpanded = true;
+                foreach (var index in Enumerable.Range(0, 12))
+                {
+                    rows[0].Files.Add(new LogFileRow(rows[0], new GitFileChange(
+                        $"src/File{index}.cs", GitChangeStatus.Modified, GitChangeStatus.Unmodified)));
+                }
+                rows[0].IsLoaded = true;
+                list.UpdateLayout();
+                host.UpdateLayout();
+
+                Assert.True(scrollViewer.ExtentHeight > collapsedExtent,
+                    $"展开前 extent={collapsedExtent}，展开后 extent={scrollViewer.ExtentHeight}");
+            }
+            finally
+            {
+                host.Close();
+            }
+        });
+    }
+
+    [Fact]
+    public void GitRowAncestorLookup_AcceptsInlineRunEventSources()
+    {
+        WpfStaContext.Run(() =>
+        {
+            var text = new TextBlock();
+            var run = new Run("Example.cs");
+            text.Inlines.Add(run);
+
+            Assert.Same(text, GitView.FindAncestor<TextBlock>(run));
+        });
+    }
+
+    [Fact]
+    public void RightClickSelectionAncestorLookup_AcceptsInlineRunEventSources()
+    {
+        WpfStaContext.Run(() =>
+        {
+            var text = new TextBlock();
+            var run = new Run("Example.cs");
+            text.Inlines.Add(run);
+
+            Assert.Same(text, ListSelectionBehavior.FindAncestor<TextBlock>(run));
+        });
+    }
+
+    [Fact]
     public void EnvironmentDataGrid_GeneratedTextCellsAreVerticallyCentered()
     {
         WpfStaContext.Run(() =>
@@ -74,15 +189,21 @@ public sealed class SidebarConsistencyTests
 
             var host = new Window { Content = grid, Width = 420, Height = 140, ShowInTaskbar = false };
             host.Show();
-            host.UpdateLayout();
+            try
+            {
+                host.UpdateLayout();
 
-            var cell = FindVisualChild<DataGridCell>(grid);
-            var text = FindVisualChild<TextBlock>(cell);
+                var cell = FindVisualChild<DataGridCell>(grid);
+                var text = FindVisualChild<TextBlock>(cell);
 
-            Assert.Equal(VerticalAlignment.Center, cell.VerticalContentAlignment);
-            Assert.Equal(VerticalAlignment.Center, text.VerticalAlignment);
-
-            host.Close();
+                Assert.Equal(VerticalAlignment.Center, cell.VerticalContentAlignment);
+                Assert.Equal(VerticalAlignment.Center, text.VerticalAlignment);
+            }
+            finally
+            {
+                // 已加载视图持有 ThemeEvents 强订阅;断言失败也必须卸载,避免跨测试类泄漏。
+                host.Close();
+            }
         });
     }
 

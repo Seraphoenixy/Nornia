@@ -13,8 +13,11 @@ namespace Nornia.Tests;
 /// Guards the configurable mono fonts: the Settings page exposes both the code reader and the
 /// terminal font as dropdown (enumeration-style) editors backed by the curated supported-font
 /// catalog, the persisted values flow into the code/diff readers and the terminal surface, and
-/// the views are actually wired to those properties.
+/// the views are actually wired to those properties. TerminalViewModel 的设置应用会 marshal
+/// 到共享 STA Dispatcher,测试需要泵队列——因此整个类放入非并行集合,独占阶段内泵不会
+/// 干扰其它 STA 测试。
 /// </summary>
+[Collection("WpfStaSequential")]
 public sealed class FontConfigurationTests
 {
     private static readonly string RepoRoot = ResolveRepoRoot();
@@ -132,11 +135,13 @@ public sealed class FontConfigurationTests
         Assert.Equal(FontCatalog.DefaultTerminalFamily, terminal.FontFamily);
 
         await terminal.ActivateAsync();
-        // 共享测试宿主中可能已存在 Application( STA 测试),ApplyTerminalSettings 会把
-        // 应用派发到 UI Dispatcher 异步执行——轮询等待,避免与默认值断言竞态。15s 预算:
-        // 全量套件并行下共享 STA 泵可能正被其他 WPF 测试占用,2s 偶发误报。
+        // 共享测试宿主中可能已存在 Application( STA 测试):ApplyTerminalSettings 会把应用
+        // BeginInvoke 到共享 STA 线程的 Dispatcher——该队列只在有人调用 WpfStaContext.PumpQueue
+        // 时才被泵,本测试必须自己泵,否则应用永远落地不了(并行下靠其它 STA 测试泵过属
+        // 侥幸)。60s 预算覆盖 2 核 CI 全量套件满负载。
         var applied = false;
-        for (var i = 0; i < 1500; i++)
+        var deadline = DateTime.UtcNow.AddSeconds(60);
+        while (DateTime.UtcNow < deadline)
         {
             if (terminal.FontFamily == "Consolas")
             {
@@ -144,6 +149,7 @@ public sealed class FontConfigurationTests
                 break;
             }
 
+            WpfStaContext.Run(WpfStaContext.PumpQueue);
             await Task.Delay(10);
         }
 

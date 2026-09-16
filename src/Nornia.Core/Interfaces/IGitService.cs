@@ -12,7 +12,10 @@ public interface IGitService
 {
     /// <summary>Reads branch/upstream info and staged/unstaged changes. Returns
     /// <see cref="GitRepositoryStatus.NotARepository"/> when the path is not inside a git worktree.</summary>
-    Task<GitRepositoryStatus> GetStatusAsync(string repositoryPath, CancellationToken cancellationToken = default);
+    Task<GitRepositoryStatus> GetStatusAsync(
+        string repositoryPath,
+        CancellationToken cancellationToken = default,
+        bool includeAllUntracked = true);
 
     /// <summary>Initializes a new local Git repository in an existing directory. This creates only
     /// Git metadata; it does not stage files, create a commit, or configure a remote.</summary>
@@ -71,7 +74,13 @@ public interface IGitService
             yield break;
         }
 
-        yield return new GitDiffMetadataEvent(diff.Path, diff.OldPath, diff.IsStaged, diff.IsBinary, diff.IsNewFile);
+        // Test/default implementations may represent a stale selected side as a metadata-free
+        // empty diff. Preserve that distinction so callers do not mistake binary/rename metadata
+        // for an empty result eligible for a side fallback.
+        if (diff.HasMetadata || diff.IsBinary || diff.IsNewFile || diff.OldPath is not null)
+        {
+            yield return new GitDiffMetadataEvent(diff.Path, diff.OldPath, diff.IsStaged, diff.IsBinary, diff.IsNewFile);
+        }
         var emitted = 0;
         foreach (var hunk in diff.Hunks)
         {
@@ -125,13 +134,18 @@ public interface IGitService
         CancellationToken cancellationToken = default);
 
     /// <summary>Applies exactly one currently visible hunk. The implementation must re-read and
-    /// validate the raw patch before applying it so a stale Diff tab cannot mutate another hunk.</summary>
+    /// validate the raw patch before applying it so a stale Diff tab cannot mutate another hunk.
+    /// <paramref name="blockOrdinal"/> narrows the operation to one contiguous changed block
+    /// (a maximal run of +/- lines) inside that hunk — git merges nearby edits into a single
+    /// hunk, and block-level apply is what lets the user stage one of them without the other
+    /// (0-based, <c>null</c> = the whole hunk).</summary>
     Task ApplyHunkAsync(
         string repositoryPath,
         string path,
         bool staged,
         GitDiffHunk hunk,
         GitHunkOperation operation,
+        int? blockOrdinal = null,
         CancellationToken cancellationToken = default);
 
     /// <summary>Stages the given paths (relative to the repository root); an empty collection stages
@@ -188,6 +202,28 @@ public interface IGitService
     Task CreateBranchAsync(string repositoryPath, string branchName, CancellationToken cancellationToken = default);
 
     Task SwitchBranchAsync(string repositoryPath, string branchName, CancellationToken cancellationToken = default);
+
+    /// <summary>Lists local tags (<c>git for-each-ref refs/tags</c>).</summary>
+    Task<IReadOnlyList<GitTagInfo>> GetTagsAsync(string repositoryPath, CancellationToken cancellationToken = default);
+
+    /// <summary>Creates a tag at <paramref name="targetRef"/> (defaults to HEAD). When
+    /// <paramref name="annotate"/> is true an annotated tag is created with the given message.</summary>
+    Task CreateTagAsync(string repositoryPath, string tagName, bool annotate = false, string? message = null, string? targetRef = null, CancellationToken cancellationToken = default);
+
+    /// <summary>Deletes a local tag (<c>git tag -d</c>).</summary>
+    Task DeleteTagAsync(string repositoryPath, string tagName, CancellationToken cancellationToken = default);
+
+    /// <summary>Pushes a single local tag to the remote (<c>git push origin &lt;tag&gt;</c>).</summary>
+    Task PushTagAsync(string repositoryPath, string tagName, CancellationToken cancellationToken = default);
+
+    /// <summary>Pushes all local tags to the remote (<c>git push origin --tags</c>).</summary>
+    Task PushAllTagsAsync(string repositoryPath, CancellationToken cancellationToken = default);
+
+    /// <summary>Fetches tags from the remote (<c>git fetch --tags</c>).</summary>
+    Task FetchTagsAsync(string repositoryPath, CancellationToken cancellationToken = default);
+
+    /// <summary>Checks out a tag into detached HEAD (<c>git checkout &lt;tag&gt;</c>).</summary>
+    Task CheckoutTagAsync(string repositoryPath, string tagName, CancellationToken cancellationToken = default);
 
     /// <summary>Downloads remote refs without modifying the current worktree.</summary>
     Task FetchAsync(string repositoryPath, CancellationToken cancellationToken = default);

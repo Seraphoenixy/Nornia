@@ -2,13 +2,25 @@
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:views="clr-namespace:Nornia.Desktop.Views"
+             xmlns:vm="clr-namespace:Nornia.Desktop.ViewModels"
              xmlns:b="clr-namespace:Nornia.Desktop.Behaviors">
   <Grid Style="{StaticResource PageRootStyle}">
-    <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="*" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto" />
+      <RowDefinition Height="Auto" />
+      <RowDefinition Height="*" MinHeight="120" />
+      <RowDefinition Height="Auto" />
+      <RowDefinition Height="240" MinHeight="120" />
+      <RowDefinition Height="Auto" />
+    </Grid.RowDefinitions>
 
     <!-- Page title row: title left, primary action right -->
     <DockPanel LastChildFill="False">
-      <StackPanel><TextBlock Text="开发工具" Style="{StaticResource PageTitleStyle}" /></StackPanel>
+      <StackPanel>
+        <TextBlock Text="开发工具" Style="{StaticResource PageTitleStyle}" />
+        <TextBlock Text="{Binding LastScanDisplay}" Foreground="{DynamicResource MutedTextBrush}" FontSize="{DynamicResource TypeBadge}"
+                   TextTrimming="CharacterEllipsis" Visibility="{Binding LastScanDisplay, Converter={StaticResource StringEmptyToCollapsedConverter}}" />
+      </StackPanel>
       <Button Content="重新扫描" Command="{Binding ScanCommand}" Style="{StaticResource PrimaryButton}" DockPanel.Dock="Right" VerticalAlignment="Center" />
     </DockPanel>
 
@@ -60,8 +72,178 @@
                                ActionText="重新扫描" ActionCommand="{Binding ScanCommand}" />
     </Border>
 
+    <!-- Extension dependency panel: shown when the selected tool has an extension ecosystem
+         (Python→pip, Node.js→npm, .NET SDK→dotnet tool). Initial 240px height, draggable via the
+         sash above (GridSplitter). -->
+    <GridSplitter Grid.Row="3" Style="{StaticResource HorizontalSashStyle}"
+                  ResizeDirection="Rows" ResizeBehavior="PreviousAndNext"
+                  Visibility="{Binding ExtensionPanelVisibility}" />
+    <Border Grid.Row="4" Margin="0,8,0,0" Padding="{StaticResource InsetCard}"
+            Background="{DynamicResource EditorBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1"
+            Visibility="{Binding ExtensionPanelVisibility}">
+      <Grid>
+        <Grid.RowDefinitions>
+          <RowDefinition Height="Auto" />
+          <RowDefinition Height="Auto" />
+          <RowDefinition Height="Auto" />
+          <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <!-- Panel title: ecosystem name + forced reload -->
+        <DockPanel LastChildFill="False">
+          <Button DockPanel.Dock="Right" Content="重新加载" Command="{Binding RefreshExtensionsCommand}"
+                  ToolTip="重新读取该工具的扩展依赖（强制刷新，绕过缓存）" VerticalAlignment="Center" />
+          <TextBlock Text="{Binding ExtensionPanelTitle}" Foreground="{DynamicResource BrightTextBrush}"
+                     FontSize="{DynamicResource TypeBodyLg}" FontWeight="SemiBold"
+                     TextTrimming="CharacterEllipsis" VerticalAlignment="Center" />
+        </DockPanel>
+
+        <!-- Sub toolbar: filter + install input on the left, batch actions on the right -->
+        <Grid Grid.Row="1" Margin="{StaticResource GapVerticalSm}">
+          <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+          <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+            <TextBlock Text="筛选" VerticalAlignment="Center" Margin="{StaticResource GapLeftSm}" />
+            <TextBox Width="150" Text="{Binding ExtensionFilterText, UpdateSourceTrigger=PropertyChanged}" ToolTip="按名称筛选扩展依赖列表" />
+            <TextBlock Text="名称" VerticalAlignment="Center" Margin="{StaticResource GapLeftSm}" />
+            <TextBox Width="180" Text="{Binding ExtensionSearchName, UpdateSourceTrigger=PropertyChanged}" ToolTip="要安装的扩展依赖名称" />
+            <TextBlock Text="版本" VerticalAlignment="Center" Margin="{StaticResource GapLeftSm}" />
+            <TextBox Width="110" Text="{Binding ExtensionSearchVersion, UpdateSourceTrigger=PropertyChanged}" ToolTip="版本（可选）；留空安装最新版" />
+            <Button Content="安装" Command="{Binding InstallExtensionCommand}" Style="{StaticResource PrimaryButton}"
+                    ToolTip="安装该扩展依赖" Margin="{StaticResource GapLeftSm}" />
+          </StackPanel>
+          <WrapPanel Grid.Column="1" Style="{StaticResource ToolbarActionsStyle}">
+            <Button Content="卸载所选" Command="{Binding UninstallExtensionsCommand}" Style="{StaticResource DangerButton}"
+                    ToolTip="选择已安装的扩展依赖后可卸载；执行前会确认" />
+            <Button Content="升级所选" Command="{Binding UpgradeExtensionsCommand}"
+                    ToolTip="选择存在可用更新的扩展依赖后可升级" />
+            <Button Content="全部升级" Command="{Binding UpgradeAllExtensionsCommand}"
+                    ToolTip="升级该生态所有存在可用更新的扩展依赖" />
+          </WrapPanel>
+        </Grid>
+
+        <!-- Error line (e.g. CLI 缺失): 出错时替换列表,让失败原因清晰可见 -->
+        <TextBlock Grid.Row="2" Margin="{StaticResource GapVerticalSm}" Foreground="{DynamicResource StatusBarErrorBrush}"
+                   Text="{Binding ExtensionErrorText}" TextWrapping="Wrap" TextTrimming="CharacterEllipsis"
+                   Visibility="{Binding ExtensionErrorVisibility}" />
+
+        <!-- Extension grid + empty state (left) | dependency tree (right) -->
+        <Grid Grid.Row="3" Margin="{StaticResource GapSm}">
+          <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="*" />
+            <ColumnDefinition Width="260" />
+          </Grid.ColumnDefinitions>
+          <Grid>
+            <DataGrid ItemsSource="{Binding FilteredExtensions}" SelectedItem="{Binding SelectedExtension}"
+                      AlternationCount="2" CanUserSortColumns="True"
+                      CellStyle="{StaticResource EnvironmentDataGridCellStyle}"
+                      SelectionMode="Extended" b:MultiSelectorBinding.SelectedItems="{Binding SelectedExtensions}"
+                      b:ListSelectionBehavior.SelectOnRightClick="True">
+            <DataGrid.Resources>
+              <Style TargetType="TextBlock" BasedOn="{StaticResource EnvironmentDataGridTextStyle}" />
+            </DataGrid.Resources>
+            <DataGrid.ContextMenu>
+              <ContextMenu>
+                <MenuItem Header="复制选中" Command="{Binding CopySelectedExtensionsCommand}" InputGestureText="Ctrl+C" />
+                <MenuItem Header="复制全部" Command="{Binding CopyAllExtensionsCommand}" />
+              </ContextMenu>
+            </DataGrid.ContextMenu>
+            <DataGrid.Columns>
+              <DataGridTextColumn Header="名称" Binding="{Binding Name}" ElementStyle="{StaticResource EnvironmentDataGridTextStyle}" Width="*" />
+              <DataGridTextColumn Header="版本" Binding="{Binding Version}" ElementStyle="{StaticResource EnvironmentDataGridTextStyle}" Width="130" />
+              <DataGridTextColumn Header="可用更新" Binding="{Binding AvailableVersion}" Width="130">
+                <DataGridTextColumn.ElementStyle>
+                  <Style TargetType="TextBlock" BasedOn="{StaticResource EnvironmentDataGridTextStyle}">
+                    <Setter Property="Foreground" Value="{DynamicResource InfoAccentBrush}" />
+                    <Style.Triggers>
+                      <DataTrigger Binding="{Binding AvailableVersion}" Value="{x:Null}"><Setter Property="Foreground" Value="{DynamicResource MutedTextBrush}" /></DataTrigger>
+                      <DataTrigger Binding="{Binding AvailableVersion}" Value=""><Setter Property="Foreground" Value="{DynamicResource MutedTextBrush}" /></DataTrigger>
+                    </Style.Triggers>
+                  </Style>
+                </DataGridTextColumn.ElementStyle>
+              </DataGridTextColumn>
+            </DataGrid.Columns>
+          </DataGrid>
+          <Border Background="{DynamicResource EditorBrush}">
+            <Border.Style>
+              <Style TargetType="Border">
+                <Setter Property="Visibility" Value="{Binding Extensions.Count, Converter={StaticResource CountToVisibilityConverter}}" />
+                <Style.Triggers>
+                  <DataTrigger Binding="{Binding ExtensionErrorVisibility}" Value="Visible">
+                    <Setter Property="Visibility" Value="Collapsed" />
+                  </DataTrigger>
+                </Style.Triggers>
+              </Style>
+            </Border.Style>
+            <TextBlock Text="没有已安装的扩展依赖。" Foreground="{DynamicResource MutedTextBrush}"
+                       HorizontalAlignment="Center" VerticalAlignment="Center" FontSize="{DynamicResource TypeBody}" />
+          </Border>
+          </Grid>
+
+          <!-- 依赖关系树:选中包显示其直接依赖,展开节点懒加载下一层(EventSetter 转发到 code-behind) -->
+          <Border Grid.Column="1" Margin="{StaticResource GapLeftSm}" Padding="{StaticResource InsetCard}"
+                  Background="{DynamicResource EditorBrush}" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="1">
+            <Grid>
+              <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+              </Grid.RowDefinitions>
+              <TextBlock Text="{Binding DependencyPanelTitle}" Foreground="{DynamicResource BrightTextBrush}"
+                         FontSize="{DynamicResource TypeBody}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" />
+              <TextBlock Grid.Row="1" Margin="0,4,0,0" Foreground="{DynamicResource StatusBarErrorBrush}"
+                         Text="{Binding DependencyErrorText}" TextWrapping="Wrap" TextTrimming="CharacterEllipsis"
+                         Visibility="{Binding DependencyErrorVisibility}" />
+              <TreeView Grid.Row="2" Margin="0,4,0,0" ItemsSource="{Binding DependencyRoots}"
+                        Background="Transparent" BorderThickness="0"
+                        VirtualizingStackPanel.IsVirtualizing="True">
+                <TreeView.ItemContainerStyle>
+                  <Style TargetType="TreeViewItem">
+                    <EventSetter Event="Expanded" Handler="DependencyTreeItem_Expanded" />
+                  </Style>
+                </TreeView.ItemContainerStyle>
+                <TreeView.Resources>
+                  <HierarchicalDataTemplate DataType="{x:Type vm:ToolExtensionDependencyNode}" ItemsSource="{Binding Children}">
+                    <StackPanel Orientation="Horizontal">
+                      <TextBlock Text="{Binding Name}" FontSize="{DynamicResource TypeBody}" TextTrimming="CharacterEllipsis" />
+                      <TextBlock Text="{Binding Version}" Margin="6,0,0,0" FontSize="{DynamicResource TypeBody}"
+                                 Foreground="{DynamicResource MutedTextBrush}" TextTrimming="CharacterEllipsis" />
+                      <TextBlock Text="{Binding Constraint}" Margin="6,0,0,0" FontSize="{DynamicResource TypeBadge}"
+                                 Foreground="{DynamicResource MutedTextBrush}" TextTrimming="CharacterEllipsis" />
+                    </StackPanel>
+                  </HierarchicalDataTemplate>
+                </TreeView.Resources>
+                <TreeView.Style>
+                  <Style TargetType="TreeView">
+                    <Setter Property="Visibility" Value="Visible" />
+                    <Style.Triggers>
+                      <DataTrigger Binding="{Binding DependencyRoots.Count}" Value="0">
+                        <Setter Property="Visibility" Value="Collapsed" />
+                      </DataTrigger>
+                    </Style.Triggers>
+                  </Style>
+                </TreeView.Style>
+              </TreeView>
+              <TextBlock Grid.Row="2" Margin="0,8,0,0" Text="选择包查看其依赖关系。" TextWrapping="Wrap"
+                         Foreground="{DynamicResource MutedTextBrush}" FontSize="{DynamicResource TypeBody}">
+                <TextBlock.Style>
+                  <Style TargetType="TextBlock">
+                    <Setter Property="Visibility" Value="Collapsed" />
+                    <Style.Triggers>
+                      <DataTrigger Binding="{Binding DependencyRoots.Count}" Value="0">
+                        <Setter Property="Visibility" Value="Visible" />
+                      </DataTrigger>
+                    </Style.Triggers>
+                  </Style>
+                </TextBlock.Style>
+              </TextBlock>
+            </Grid>
+          </Border>
+        </Grid>
+      </Grid>
+    </Border>
+
     <!-- Bottom selection summary (single line, same strip as the other data pages) -->
-    <TextBlock Grid.Row="3" Margin="0,8,0,0" Text="{Binding SelectedToolSummary}" ToolTip="{Binding SelectedToolSummary}">
+    <TextBlock Grid.Row="5" Margin="0,8,0,0" Text="{Binding SelectedToolSummary}" ToolTip="{Binding SelectedToolSummary}">
       <TextBlock.Style>
         <Style TargetType="TextBlock" BasedOn="{StaticResource SelectionSummaryStyle}" />
       </TextBlock.Style>

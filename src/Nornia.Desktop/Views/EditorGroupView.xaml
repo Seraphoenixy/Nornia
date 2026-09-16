@@ -38,7 +38,11 @@
           <ControlTemplate TargetType="ListBoxItem">
             <Grid Height="{DynamicResource SizeTabBar}">
               <Grid.RowDefinitions><RowDefinition Height="2" /><RowDefinition Height="*" /></Grid.RowDefinitions>
-              <Border x:Name="ActiveTop" Grid.Row="0" Background="Transparent" />
+              <!-- 激活指示线:选中时自左侧展开(ScaleX 0→1,DurationFast+EaseOutStandard);
+                   初始即选中的标签不触发 EnterActions,默认 ScaleX=1 保持整线。 -->
+              <Border x:Name="ActiveTop" Grid.Row="0" Background="Transparent" RenderTransformOrigin="0,0.5">
+                <Border.RenderTransform><ScaleTransform x:Name="ActiveTopScale" /></Border.RenderTransform>
+              </Border>
               <Border x:Name="TabBorder" Grid.Row="1" Background="{TemplateBinding Background}"
                       BorderBrush="{DynamicResource TabBorderBrush}" BorderThickness="0,0,1,0"
                       Padding="12,0,10,0">
@@ -98,6 +102,16 @@
                 <Setter TargetName="TabBorder" Property="Background" Value="{DynamicResource TabActiveBackgroundBrush}" />
                 <Setter TargetName="TitleText" Property="Foreground" Value="{DynamicResource TabActiveForegroundBrush}" />
                 <Setter TargetName="CloseButton" Property="Visibility" Value="Visible" />
+                <Trigger.EnterActions>
+                  <BeginStoryboard>
+                    <Storyboard>
+                      <DoubleAnimation Storyboard.TargetName="ActiveTopScale" Storyboard.TargetProperty="ScaleX"
+                                       From="0" To="1" Duration="{StaticResource DurationFast}">
+                        <DoubleAnimation.EasingFunction><StaticResource ResourceKey="EaseOutStandard" /></DoubleAnimation.EasingFunction>
+                      </DoubleAnimation>
+                    </Storyboard>
+                  </BeginStoryboard>
+                </Trigger.EnterActions>
               </Trigger>
               <Trigger Property="IsMouseCaptured" Value="True">
                 <Setter TargetName="TabBorder" Property="Background" Value="{DynamicResource PressedBrush}" />

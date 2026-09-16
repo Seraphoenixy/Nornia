@@ -18,6 +18,20 @@ public interface IProcessRunner
         IReadOnlyDictionary<string, string>? environmentVariables = null,
         int? maximumOutputBytes = null);
 
+    /// <summary>Launches a process with shell-execute semantics (<c>UseShellExecute=true</c>) so
+    /// PATH entries that are batch shims — VS Code's <c>code</c>, for example — resolve exactly as
+    /// they do from a terminal. Unlike <see cref="RunAsync"/> the launched process is not awaited:
+    /// an external editor keeps running past this call by design. Compatibility body delegates to
+    /// <see cref="RunAsync"/> to keep existing test doubles source-safe; the production
+    /// <see cref="Nornia.Core.Services.ProcessRunner"/> implements shell semantics.</summary>
+    Task<ProcessResult> RunShellAsync(
+        string fileName,
+        IReadOnlyList<string> arguments,
+        CancellationToken cancellationToken = default)
+    {
+        return RunAsync(fileName, arguments, cancellationToken: cancellationToken);
+    }
+
     /// <summary>Runs the process to completion and returns stdout as <em>raw bytes</em> (no
     /// decoding). This compatibility body re-encodes the decoded output — lossless for the
     /// UTF-8/ASCII payloads the test doubles produce; the production
@@ -78,6 +92,17 @@ public interface IProcessRunner
             yield return item;
         }
     }
+}
+
+/// <summary>Runs a process with a real virtual terminal attached. This is required for tools such
+/// as winget that suppress progress output when stdout/stderr are redirected.</summary>
+public interface IInteractiveProcessRunner
+{
+    Task<ProcessResult> RunInteractiveAsync(
+        string fileName,
+        IReadOnlyList<string> arguments,
+        IProgress<ProcessOutput>? progress = null,
+        CancellationToken cancellationToken = default);
 }
 
 /// <summary>Allows a host to stop processes it started during application shutdown.</summary>

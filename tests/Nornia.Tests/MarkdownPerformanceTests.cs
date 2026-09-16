@@ -247,6 +247,31 @@ public sealed class MarkdownParseCacheTests
         Assert.False(cache.TryGet(s2, p1, out _)); // 同路径不同内容
         Assert.False(MarkdownParseCache.ComputeKey(s1, p1) == MarkdownParseCache.ComputeKey(s2, p1));
     }
+
+    [Fact]
+    public void ParseCache_ByteBudgetEvictsOldEntries_AndSkipsOversizedEntry()
+    {
+        const long maxBytes = 200_000;
+        var cache = new MarkdownParseCache(maxEntries: 10, maxBytes: maxBytes);
+        var source1 = $"# first\n\n{new string('a', 10_000)}";
+        var source2 = $"# second\n\n{new string('b', 10_000)}";
+        var source3 = $"# oversized\n\n{new string('c', 30_000)}";
+        var path1 = "C:\\docs\\bytes1.md";
+        var path2 = "C:\\docs\\bytes2.md";
+        var path3 = "C:\\docs\\bytes3.md";
+
+        cache.Put(source1, path1, Markdig.Markdown.Parse(source1, MarkdownPreviewService.Pipeline), [], [], Budget);
+        cache.Put(source2, path2, Markdig.Markdown.Parse(source2, MarkdownPreviewService.Pipeline), [], [], Budget);
+
+        Assert.True(cache.RetainedBytes <= maxBytes);
+        Assert.True(cache.TryGet(source2, path2, out _));
+        Assert.False(cache.TryGet(source1, path1, out _)); // byte budget, not only entry count
+
+        cache.Put(source3, path3, Markdig.Markdown.Parse(source3, MarkdownPreviewService.Pipeline), [], [], Budget);
+
+        Assert.False(cache.TryGet(source3, path3, out _)); // a single oversized AST is not cached
+        Assert.True(cache.RetainedBytes <= maxBytes);
+    }
 }
 
 /// <summary>M2 集成:主题变化/切回预览的重新解析请求(内容未变)跳过 Markdig 解析,

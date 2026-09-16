@@ -128,6 +128,16 @@ public sealed class GitRepositoryWatcherTests : IDisposable
     }
 
     [Fact]
+    public void GeneratedAndTransientWorkingTreePaths_AreFiltered()
+    {
+        var root = _repoPath;
+        Assert.False(GitRepositoryWatcher.IsRelevantPath(Path.Combine(root, "bin", "Debug", "app.dll"), root));
+        Assert.False(GitRepositoryWatcher.IsRelevantPath(Path.Combine(root, "node_modules", "pkg", "index.js"), root));
+        Assert.False(GitRepositoryWatcher.IsRelevantPath(Path.Combine(root, "src", "file.cs.tmp"), root));
+        Assert.True(GitRepositoryWatcher.IsRelevantPath(Path.Combine(root, "src", "file.cs"), root));
+    }
+
+    [Fact]
     public void SuppressionWindow_IgnoresIndexEventsButNotWorkingTree()
     {
         using var watcher = CreateWatcher(suppression: TimeSpan.FromMilliseconds(300));

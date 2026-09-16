@@ -21,7 +21,10 @@ public sealed class ProjectLauncher(IProcessRunner processRunner) : IProjectLaun
         }
 
         ArgumentException.ThrowIfNullOrWhiteSpace(editorCommand);
-        var result = await processRunner.RunAsync(editorCommand, [fullPath], cancellationToken: cancellationToken);
+        // Shell-execute so PATH batch shims ("code" → code.cmd) resolve like they do in a
+        // terminal; a redirected CreateProcess cannot start those (Nornia's ProcessRunner is
+        // redirect-oriented, so launching editors goes through the shell path).
+        var result = await processRunner.RunShellAsync(editorCommand, [fullPath], cancellationToken: cancellationToken);
         if (!result.IsSuccess)
         {
             var detail = string.IsNullOrWhiteSpace(result.StandardError) ? result.StandardOutput.Trim() : result.StandardError.Trim();

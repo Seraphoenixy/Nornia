@@ -151,25 +151,23 @@ public sealed record CacheCandidate(
     long SizeBytes,
     CacheConfidence Confidence,
     string Reason,
-    string? PackageId = null,
-    string? PackageName = null,
-    string? PackageProvider = null,
+    string? CategoryKey = null,
+    string? CategoryName = null,
+    string? ClassificationReason = null,
     string? CacheType = null,
     string? UserDirectory = null)
 {
     public bool IsRecommended => Confidence == CacheConfidence.High;
-    public string PackageDisplayName => PackageName ?? "未关联的软件缓存";
+    public string CategoryDisplayName => CategoryName ?? "其他缓存";
     public string CacheTypeDisplay => CacheType ?? "其他";
 }
 
-/// <summary>Cache-type dimension within a package summary: how many candidates and how much space a
-/// single tool ecosystem (npm, nuget, gradle, …) contributes to the package.</summary>
+/// <summary>Cache-type dimension within a category summary.</summary>
 public sealed record CacheTypeCount(string Type, int Count, long SizeBytes);
 
-public sealed record CachePackageSummary(
-    string PackageName,
-    string? PackageId,
-    string? Provider,
+public sealed record CacheCategorySummary(
+    string CategoryKey,
+    string CategoryName,
     long SizeBytes,
     int CandidateCount,
     CacheConfidence Confidence,
@@ -188,3 +186,12 @@ public sealed record CacheCleanupResult(
     CacheCleanupStatus Status,
     long ReclaimedBytes,
     string Message);
+
+/// <summary>Snapshot-level metadata for one persisted inventory scan (kind "runtimes" / "packages").
+/// The timestamp plus the cheap environment fingerprint let inventory services serve a fresh snapshot
+/// from the database without re-running any provider process or winget.</summary>
+public sealed record InventoryScanState(
+    string Kind,
+    long ScannedAt,
+    long DurationMs,
+    string Fingerprint);

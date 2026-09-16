@@ -40,7 +40,7 @@ public partial class QuickInputViewModel : ObservableObject
     [ObservableProperty]
     private QuickPickItem? selectedItem;
 
-    public ObservableCollection<QuickPickItem> Items { get; } = [];
+    public BulkObservableCollection<QuickPickItem> Items { get; } = [];
 
     /// <summary>Filtered view consumed by the overlay list:打分排序后的可见行集合(过滤结果
     /// 驻留,不再按谓词逐次重过滤)。XAML 直接绑定该集合。</summary>
@@ -54,11 +54,7 @@ public partial class QuickInputViewModel : ObservableObject
     /// first item is pre-selected so Enter confirms immediately.</summary>
     public void Open(string title, IEnumerable<QuickPickItem> items)
     {
-        Items.Clear();
-        foreach (var item in items)
-        {
-            Items.Add(item);
-        }
+        Items.ReplaceRange(items);
 
         Title = title;
         // FilterText 可能恰好已是空串(不触发 setter):显式重算过滤。
@@ -68,6 +64,11 @@ public partial class QuickInputViewModel : ObservableObject
         SelectedItem = _filtered.FirstOrDefault();
         IsOpen = true;
     }
+
+    /// <summary>Replaces the source rows without closing the overlay or resetting its query. Used
+    /// by quick open after its background workspace index completes.</summary>
+    public void ReplaceItems(IEnumerable<QuickPickItem> items) =>
+        Items.ReplaceRange(items);
 
     public void Close() => IsOpen = false;
 

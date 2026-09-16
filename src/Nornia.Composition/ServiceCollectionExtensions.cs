@@ -6,6 +6,7 @@ using Nornia.Package.Providers;
 using Nornia.Package.Services;
 using Nornia.Project.Services;
 using Nornia.Runtime.Providers;
+using Nornia.Runtime.Extensions;
 using Nornia.Runtime.Services;
 using Nornia.Storage;
 using Nornia.Storage.Database;
@@ -36,6 +37,7 @@ public static class ServiceCollectionExtensions
             .AddSingleton<IPackageRepository, PackageRepository>()
             .AddSingleton<IProjectRepository, ProjectRepository>()
             .AddSingleton<IEnvironmentProfileRepository, EnvironmentProfileRepository>()
+            .AddSingleton<IInventoryScanStateRepository, InventoryScanStateRepository>()
             // 环境修复明细存数据目录下的 JSON Lines 文件,不进数据库。
             .AddSingleton<IEnvironmentRepairLogRepository, EnvironmentRepairLogStore>()
             .AddSingleton<IDashboardSummaryReader, SummaryRepository>()
@@ -50,8 +52,18 @@ public static class ServiceCollectionExtensions
             .AddSingleton<IRuntimeProvider, VisualCppRedistributableProvider>()
             .AddSingleton<IRuntimeProvider, WindowsAppRuntimeProvider>()
             .AddSingleton<IRuntimeDiscoveryService, RuntimeDiscoveryService>()
+            // Cheap (no process spawn) environment probe backing the persisted-snapshot TTL gate.
+            .AddSingleton<IEnvironmentFingerprintProvider, EnvironmentFingerprintProvider>()
             .AddSingleton<EnvironmentInventoryService>()
             .AddSingleton<IRuntimeInventoryService>(provider => provider.GetRequiredService<EnvironmentInventoryService>())
+
+            // Tool extension dependencies (pip / npm / dotnet tool) — 独立于软件包管理,
+            // 只服务于「开发工具」页的扩展依赖子面板。
+            .AddSingleton<IToolExtensionProvider, PipExtensionProvider>()
+            .AddSingleton<IToolExtensionProvider, NpmExtensionProvider>()
+            .AddSingleton<IToolExtensionProvider, DotnetToolExtensionProvider>()
+            .AddSingleton<IToolExtensionInventoryService>(provider =>
+                new ToolExtensionInventoryService(provider.GetServices<IToolExtensionProvider>()))
 
             // Package management
             .AddSingleton<WingetProvider>()
@@ -69,7 +81,7 @@ public static class ServiceCollectionExtensions
             .AddSingleton<IRuntimePackageResolver>(provider => provider.GetRequiredService<RuntimePackageResolver>())
             .AddSingleton<PackageInventoryService>()
             .AddSingleton<IPackageInventoryService>(provider => provider.GetRequiredService<PackageInventoryService>())
-            .AddSingleton<CachePackageAssociationService>()
+            .AddSingleton<CacheClassificationService>()
             // Resolve AppDataCacheService through an explicit factory: its parameterized constructor
             // (IEnumerable<string> roots) would otherwise be chosen by the DI container's
             // "most parameters" rule, which injects an EMPTY list for IEnumerable<string>, leaving the

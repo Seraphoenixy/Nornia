@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using System.Windows.Input;
+using Serilog;
 
 namespace Nornia.Desktop.Commands;
 
@@ -49,7 +50,16 @@ public sealed class CommandAccessor
             descriptor.CanExecute?.Invoke() != false;
         public async void Execute(object? parameter)
         {
-            if (registry() is { } target) await target.ExecuteAsync(id, parameter);
+            try
+            {
+                if (registry() is { } target) await target.ExecuteAsync(id, parameter);
+            }
+            catch (Exception ex)
+            {
+                // ICommand.Execute is necessarily void. Observe failures from command bindings
+                // so a rejected async command cannot escape as an unhandled WPF dispatcher error.
+                Log.Error(ex, "命令执行失败：{CommandId}", id);
+            }
         }
         public event EventHandler? CanExecuteChanged { add { CommandManager.RequerySuggested += value; } remove { CommandManager.RequerySuggested -= value; } }
     }

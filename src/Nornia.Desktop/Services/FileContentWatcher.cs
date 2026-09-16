@@ -85,6 +85,7 @@ public sealed class FileContentWatcher : IFileContentWatcher
     /// <summary>Shared directory watchers: watch root (nearest existing ancestor) → watcher +
     /// the registered files under it.</summary>
     private readonly Dictionary<string, DirectoryWatch> _directories = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _recoveringDirectories = new(StringComparer.OrdinalIgnoreCase);
 
     public FileContentWatcher() : this(new WpfUiDispatcher(), DefaultDebounceInterval)
     {
@@ -134,13 +135,26 @@ public sealed class FileContentWatcher : IFileContentWatcher
             }
 
             var file = new WatchedFile(fullPath, directory, _debounceInterval, OnDebounceElapsed);
-            _files[fullPath] = file;
             if (!_directories.TryGetValue(directory, out var directoryWatch))
             {
-                directoryWatch = new DirectoryWatch(EnsureWatcher(directory));
+                try
+                {
+                    directoryWatch = new DirectoryWatch(EnsureWatcher(directory));
+                }
+                catch (Exception ex) when (ex is ArgumentException
+                    or IOException
+                    or UnauthorizedAccessException
+                    or NotSupportedException
+                    or System.Security.SecurityException)
+                {
+                    file.Dispose();
+                    return;
+                }
+
                 _directories[directory] = directoryWatch;
             }
 
+            _files[fullPath] = file;
             directoryWatch.Files.Add(fullPath);
         }
     }
@@ -173,8 +187,8 @@ public sealed class FileContentWatcher : IFileContentWatcher
             directoryWatch.Files.Remove(fullPath);
             if (directoryWatch.Files.Count == 0)
             {
-                directoryWatch.Dispose();
                 _directories.Remove(file.WatchRoot);
+                DisposeDirectoryWatchNoLock(directoryWatch);
             }
         }
     }
@@ -192,6 +206,7 @@ public sealed class FileContentWatcher : IFileContentWatcher
             directories = [.. _directories.Values];
             _files.Clear();
             _directories.Clear();
+            _recoveringDirectories.Clear();
         }
 
         // FileSystemWatcher teardown can block for seconds while the OS drains a flooded event
@@ -200,17 +215,7 @@ public sealed class FileContentWatcher : IFileContentWatcher
         // exit either way.
         foreach (var directory in directories)
         {
-            var watcher = directory.Watcher;
-            try
-            {
-                watcher.EnableRaisingEvents = false;
-            }
-            catch (Exception) { /* already torn down */ }
-            Task.Run(() =>
-            {
-                try { watcher.Dispose(); }
-                catch (Exception) { /* best-effort; the process owns the handle until exit */ }
-            });
+            DisposeDirectoryWatchNoLock(directory);
         }
     }
 
@@ -238,19 +243,186 @@ public sealed class FileContentWatcher : IFileContentWatcher
             NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.CreationTime,
             IncludeSubdirectories = true,
             InternalBufferSize = InternalBufferSize,
-            EnableRaisingEvents = true,
+            EnableRaisingEvents = false,
         };
-        watcher.Changed += (_, args) => HandleFileSystemEvent(args.FullPath);
-        watcher.Created += (_, args) => HandleFileSystemEvent(args.FullPath);
-        watcher.Deleted += (_, args) => HandleFileSystemEvent(args.FullPath);
-        // An atomic save (File.Move temp→target / File.Replace) renames the temp onto the target:
-        // report both the old and the new name so a moved-away target is still reloaded.
-        watcher.Renamed += (_, args) =>
+        try
         {
-            HandleFileSystemEvent(args.OldFullPath);
-            HandleFileSystemEvent(args.FullPath);
-        };
-        return watcher;
+            watcher.Changed += OnFileSystemEvent;
+            watcher.Created += OnFileSystemEvent;
+            watcher.Deleted += OnFileSystemEvent;
+            // An atomic save (File.Move temp→target / File.Replace) renames the temp onto the target:
+            // report both the old and the new name so a moved-away target is still reloaded.
+            watcher.Renamed += OnRenamedEvent;
+            watcher.Error += OnWatcherError;
+            watcher.EnableRaisingEvents = true;
+            return watcher;
+        }
+        catch
+        {
+            watcher.Changed -= OnFileSystemEvent;
+            watcher.Created -= OnFileSystemEvent;
+            watcher.Deleted -= OnFileSystemEvent;
+            watcher.Renamed -= OnRenamedEvent;
+            watcher.Error -= OnWatcherError;
+            watcher.Dispose();
+            throw;
+        }
+    }
+
+    private void OnFileSystemEvent(object? sender, FileSystemEventArgs args) =>
+        HandleFileSystemEvent(args.FullPath);
+
+    private void OnRenamedEvent(object? sender, RenamedEventArgs args)
+    {
+        HandleFileSystemEvent(args.OldFullPath);
+        HandleFileSystemEvent(args.FullPath);
+    }
+
+    private void OnWatcherError(object? sender, ErrorEventArgs args)
+    {
+        if (sender is not FileSystemWatcher failedWatcher)
+        {
+            return;
+        }
+
+        lock (_gate)
+        {
+            var failed = _directories.FirstOrDefault(pair => ReferenceEquals(pair.Value.Watcher, failedWatcher));
+            if (failed.Key is null || !_directories.Remove(failed.Key, out var oldDirectory))
+            {
+                return;
+            }
+
+            // FileSystemWatcher errors (especially buffer overflow) invalidate the handle and
+            // may have dropped events. Rebuild the shared watcher and arm every registered file
+            // once so callers perform a safe content re-read instead of silently staying stale.
+            DisposeDirectoryWatchNoLock(oldDirectory);
+            if (oldDirectory.Files.Count == 0)
+            {
+                return;
+            }
+
+            if (!Directory.Exists(failed.Key))
+            {
+                // Keep retrying while an atomic directory replacement is in flight. The target
+                // directory is the registered watch root, so a later retry can bind it again once
+                // it has been recreated.
+                ScheduleDirectoryRecoveryNoLock(failed.Key);
+                return;
+            }
+
+            try
+            {
+                var replacement = new DirectoryWatch(EnsureWatcher(failed.Key));
+                replacement.Files.UnionWith(oldDirectory.Files);
+                _directories[failed.Key] = replacement;
+                foreach (var path in replacement.Files)
+                {
+                    if (_files.TryGetValue(path, out var file))
+                    {
+                        file.Arm();
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException)
+            {
+                // The directory may be in the middle of an atomic replacement; the scheduled
+                // retry will recreate the shared watcher after the path becomes available.
+                ScheduleDirectoryRecoveryNoLock(failed.Key);
+            }
+        }
+    }
+
+    private void ScheduleDirectoryRecoveryNoLock(string directory)
+    {
+        if (!_recoveringDirectories.Add(directory))
+        {
+            return;
+        }
+
+        _ = RecoverDirectoryWatcherAsync(directory);
+    }
+
+    private async Task RecoverDirectoryWatcherAsync(string directory)
+    {
+        try
+        {
+            await Task.Delay(500).ConfigureAwait(false);
+            lock (_gate)
+            {
+                _recoveringDirectories.Remove(directory);
+                if (_directories.ContainsKey(directory))
+                {
+                    return;
+                }
+
+                if (!Directory.Exists(directory))
+                {
+                    // Do not lose the registered files while their directory is temporarily
+                    // absent. Retry until the path is recreated or all files are unwatched.
+                    ScheduleDirectoryRecoveryNoLock(directory);
+                    return;
+                }
+
+                var paths = _files.Values
+                    .Where(file => string.Equals(file.WatchRoot, directory, StringComparison.OrdinalIgnoreCase))
+                    .Select(file => file.FullPath)
+                    .ToArray();
+                if (paths.Length == 0)
+                {
+                    return;
+                }
+
+                try
+                {
+                    var replacement = new DirectoryWatch(EnsureWatcher(directory));
+                    replacement.Files.UnionWith(paths);
+                    _directories[directory] = replacement;
+                    foreach (var path in paths)
+                    {
+                        if (_files.TryGetValue(path, out var file))
+                        {
+                            file.Arm();
+                        }
+                    }
+                }
+                catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException)
+                {
+                    ScheduleDirectoryRecoveryNoLock(directory);
+                }
+            }
+        }
+        catch (Exception)
+        {
+            lock (_gate)
+            {
+                _recoveringDirectories.Remove(directory);
+            }
+        }
+    }
+
+    private void DisposeDirectoryWatchNoLock(DirectoryWatch directoryWatch)
+    {
+        var watcher = directoryWatch.Watcher;
+        try
+        {
+            watcher.EnableRaisingEvents = false;
+        }
+        catch (Exception)
+        {
+            // Already torn down.
+        }
+
+        watcher.Changed -= OnFileSystemEvent;
+        watcher.Created -= OnFileSystemEvent;
+        watcher.Deleted -= OnFileSystemEvent;
+        watcher.Renamed -= OnRenamedEvent;
+        watcher.Error -= OnWatcherError;
+        Task.Run(() =>
+        {
+            try { watcher.Dispose(); }
+            catch (Exception) { /* best-effort native-handle release */ }
+        });
     }
 
     private void OnDebounceElapsed(WatchedFile file)

@@ -60,7 +60,17 @@ public sealed class GitGraphCell : FrameworkElement
         Unloaded += (_, _) => ThemeEvents.ThemeChanged -= OnThemeChanged;
     }
 
-    private void OnThemeChanged(object? sender, AppTheme theme) => InvalidateVisual();
+    private void OnThemeChanged(object? sender, AppTheme theme)
+    {
+        // 非宿主线程的广播归组回宿主 Dispatcher(见 CodeDocumentView.OnThemeChanged)。
+        if (!Dispatcher.CheckAccess())
+        {
+            Dispatcher.InvokeAsync(InvalidateVisual);
+            return;
+        }
+
+        InvalidateVisual();
+    }
 
     protected override Size MeasureOverride(Size availableSize) => new(GitGraphLayout.CellWidth, 0);
 
@@ -178,6 +188,7 @@ public sealed class GitGraphCell : FrameworkElement
                 StartLineCap = PenLineCap.Round,
                 EndLineCap = PenLineCap.Round,
                 LineJoin = PenLineJoin.Round,
+                DashStyle = row.DotDashed ? DashStyles.Dash : DashStyles.Solid,
             };
             dotPen.Freeze();
             drawingContext.DrawEllipse(null, dotPen, new Point(dotX, centerY), GitGraphLayout.DotRadius, GitGraphLayout.DotRadius);

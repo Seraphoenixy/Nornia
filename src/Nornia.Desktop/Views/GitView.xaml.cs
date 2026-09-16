@@ -40,6 +40,12 @@ public partial class GitView : UserControl
     private GridLength _changesExpandedHeight = new(1, GridUnitType.Star);
     private GridLength _graphExpandedHeight = new(1, GridUnitType.Star);
     private GitViewModel? _layoutViewModel;
+    private GitChangeItem? _flatChangeReopenCandidate;
+    private ListBox? _flatChangeReopenList;
+    // 按钮下拉菜单的"刚关闭"时刻:Click 相对关闭的先后决定它属于打开还是关闭手势
+    // (ButtonBase 捕获导致的菜单关闭不触发 Closed 路由事件,只能从 IsOpen 变化捕获)。
+    private readonly HashSet<Button> _menuCloseWatched = [];
+    private readonly Dictionary<Button, long> _menuClosedAtTicks = [];
 
     public GitView()
     {
@@ -210,9 +216,7 @@ public partial class GitView : UserControl
     {
         if (sender is Button { ContextMenu: { } menu } button)
         {
-            menu.PlacementTarget = button;
-            menu.Placement = PlacementMode.Bottom;
-            menu.IsOpen = true;
+            ToggleButtonContextMenu(button, menu);
         }
     }
 
@@ -221,11 +225,56 @@ public partial class GitView : UserControl
     {
         if (sender is Button { ContextMenu: { } menu } button)
         {
-            menu.PlacementTarget = button;
-            menu.Placement = PlacementMode.Bottom;
-            menu.IsOpen = true;
+            ToggleButtonContextMenu(button, menu);
             e.Handled = true;
         }
+    }
+
+    /// <summary>下压瞬间菜单还开着 → 在此关闭并吞掉事件,实现"再次点击按钮关闭下拉菜单"。
+    /// 必须用 Preview 而非 Click:ButtonBase 在 MouseLeftButtonDown 捕获鼠标时顺带抢走
+    /// 打开中菜单的捕获,菜单经捕获丢失路径关闭且 <c>ContextMenu.Closed</c> 不触发,
+    /// 随后的 Click 只能看到一个已关闭的菜单而立即把它重新打开(菜单"关不掉")。</summary>
+    private void MenuToggleButton_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (sender is Button { ContextMenu: { IsOpen: true } menu })
+        {
+            menu.IsOpen = false;
+            e.Handled = true;
+        }
+    }
+
+    private void ToggleButtonContextMenu(Button button, ContextMenu menu)
+    {
+        if (_menuCloseWatched.Add(button))
+        {
+            // ButtonBase 在 MouseDown 捕获鼠标会顺带关掉打开中的菜单,该路径不触发
+            // ContextMenu.Closed 路由事件;改挂 IsOpen 依赖属性,任何关闭都记录时刻,
+            // 供 Click 判定"这次按压是否就是关闭手势本身"。
+            DependencyPropertyDescriptor.FromProperty(ContextMenu.IsOpenProperty, typeof(ContextMenu))
+                .AddValueChanged(menu, (_, _) =>
+                {
+                    if (!menu.IsOpen) _menuClosedAtTicks[button] = Environment.TickCount64;
+                });
+        }
+
+        // 下压时菜单已被本次按压顺带关闭(见 Preview 处理器;或关闭与 Click 的竞态):
+        // 这次 Click 就是"关闭"手势本身,不得重开。400ms 覆盖单次按压的全程。
+        if (_menuClosedAtTicks.TryGetValue(button, out var closedAt)
+            && Environment.TickCount64 - closedAt < 400)
+        {
+            _menuClosedAtTicks.Remove(button);
+            return;
+        }
+
+        if (menu.IsOpen)
+        {
+            menu.IsOpen = false;
+            return;
+        }
+
+        menu.PlacementTarget = button;
+        menu.Placement = PlacementMode.Bottom;
+        menu.IsOpen = true;
     }
 
     private void FolderRow_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
@@ -246,17 +295,7 @@ public partial class GitView : UserControl
     }
 
     private static bool IsInsideButton(DependencyObject source)
-    {
-        for (var current = source; current is not null; current = VisualTreeHelper.GetParent(current))
-        {
-            if (current is Button)
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
+        => FindAncestor<Button>(source) is not null;
     /// <summary>Commit-row expansion is handled on mouse-up instead of a <see cref="MouseBinding"/>.
     /// ListBoxItem handles the first left-button-down to establish selection; MouseBinding can then
     /// miss that first gesture after the row is retemplated by an expand/collapse. The full-width
@@ -269,6 +308,49 @@ public partial class GitView : UserControl
             ViewModel.ToggleLogRowCommand.Execute(row);
             e.Handled = true;
         }
+    }
+
+    /// <summary>
+    /// ListBox 的 SelectedItem 只在选择发生变化时通知 VM；已选中平铺行再次单击不会重开
+    /// 已被其他预览替换/关闭的 diff。按下时记录“原本已选中”的行，释放仍命中同一行时补发。
+    /// </summary>
+    private void FlatChangeList_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        _flatChangeReopenCandidate = null;
+        _flatChangeReopenList = null;
+        if (sender is not ListBox list
+            || Keyboard.Modifiers != ModifierKeys.None
+            || e.OriginalSource is not DependencyObject source
+            || IsInsideButton(source)
+            || FindAncestor<ListBoxItem>(source) is not { IsSelected: true, DataContext: GitChangeItem item } container
+            || ItemsControl.ItemsControlFromItemContainer(container) != list
+            || !ReferenceEquals(list.SelectedItem, item))
+        {
+            return;
+        }
+
+        _flatChangeReopenCandidate = item;
+        _flatChangeReopenList = list;
+    }
+
+    private void FlatChangeList_PreviewMouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+    {
+        var candidate = _flatChangeReopenCandidate;
+        var candidateList = _flatChangeReopenList;
+        _flatChangeReopenCandidate = null;
+        _flatChangeReopenList = null;
+        if (candidate is null
+            || sender is not ListBox list
+            || list != candidateList
+            || e.OriginalSource is not DependencyObject source
+            || FindAncestor<ListBoxItem>(source)?.DataContext is not GitChangeItem releasedItem
+            || !ReferenceEquals(candidate, releasedItem)
+            || ViewModel?.OpenChangeDiffCommand.CanExecute(candidate) != true)
+        {
+            return;
+        }
+
+        ViewModel.OpenChangeDiffCommand.Execute(candidate);
     }
 
     // ===== 拖放暂存:未暂存 ↔ 已暂存分区之间拖动文件行(VS Code SCM) =====
@@ -363,7 +445,7 @@ public partial class GitView : UserControl
             return;
         }
 
-        if (FindVisualAncestor<ListBox>(source) is not { } list
+        if (FindAncestor<ListBox>(source) is not { } list
             || FindVisualChild<ScrollViewer>(list, _ => true) is not { } inner)
         {
             return;
@@ -380,8 +462,11 @@ public partial class GitView : UserControl
         e.Handled = true;
     }
 
-    /// <summary>视觉树祖先查找:对任意已连接元素安全,找不到返回 null。</summary>
-    private static T? FindVisualAncestor<T>(DependencyObject node) where T : DependencyObject
+    /// <summary>
+    /// 祖先查找同时支持 Visual 与 FrameworkContentElement。TextBlock 使用内联 Run 后，
+    /// 鼠标事件的 OriginalSource 可能是 Run；它不是 Visual，不能直接传给 VisualTreeHelper。
+    /// </summary>
+    internal static T? FindAncestor<T>(DependencyObject node) where T : DependencyObject
     {
         while (node is not null)
         {
@@ -390,7 +475,14 @@ public partial class GitView : UserControl
                 return match;
             }
 
-            node = VisualTreeHelper.GetParent(node);
+            node = node switch
+            {
+                FrameworkContentElement content => content.Parent ?? ContentOperations.GetParent(content),
+                ContentElement content => ContentOperations.GetParent(content),
+                Visual or System.Windows.Media.Media3D.Visual3D =>
+                    VisualTreeHelper.GetParent(node) ?? LogicalTreeHelper.GetParent(node),
+                _ => LogicalTreeHelper.GetParent(node),
+            };
         }
 
         return null;

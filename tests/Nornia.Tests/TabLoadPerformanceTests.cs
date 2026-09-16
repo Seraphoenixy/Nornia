@@ -421,13 +421,13 @@ internal sealed class GatedFakeGitService : IGitService
     public Task<string> GetDiffRevisionAsync(string repositoryPath, string path, bool staged, bool isUntracked = false, CancellationToken cancellationToken = default) =>
         Task.FromResult("revision-gated");
 
-    public Task<GitRepositoryStatus> GetStatusAsync(string repositoryPath, CancellationToken cancellationToken = default) =>
+    public Task<GitRepositoryStatus> GetStatusAsync(string repositoryPath, CancellationToken cancellationToken = default, bool includeAllUntracked = true) =>
         Task.FromResult(GitRepositoryStatus.NotARepository);
 
     public Task<string> GetRawDiffAsync(string repositoryPath, bool staged, IReadOnlyList<string>? paths = null, CancellationToken cancellationToken = default) =>
         Task.FromResult(string.Empty);
 
-    public Task ApplyHunkAsync(string repositoryPath, string path, bool staged, GitDiffHunk hunk, GitHunkOperation operation, CancellationToken cancellationToken = default) =>
+    public Task ApplyHunkAsync(string repositoryPath, string path, bool staged, GitDiffHunk hunk, GitHunkOperation operation, int? blockOrdinal = null, CancellationToken cancellationToken = default) =>
         Task.CompletedTask;
 
     public Task StageAsync(string repositoryPath, IReadOnlyCollection<string> paths, CancellationToken cancellationToken = default) =>
@@ -453,6 +453,27 @@ internal sealed class GatedFakeGitService : IGitService
 
     public Task<IReadOnlyList<GitCommitInfo>> GetOutgoingCommitsAsync(string repositoryPath, string upstreamReference, int count = 30, CancellationToken cancellationToken = default) =>
         Task.FromResult<IReadOnlyList<GitCommitInfo>>([]);
+
+    public Task<IReadOnlyList<GitTagInfo>> GetTagsAsync(string repositoryPath, CancellationToken cancellationToken = default) =>
+        Task.FromResult<IReadOnlyList<GitTagInfo>>([]);
+
+    public Task CreateTagAsync(string repositoryPath, string tagName, bool annotate = false, string? message = null, string? targetRef = null, CancellationToken cancellationToken = default) =>
+        Task.CompletedTask;
+
+    public Task DeleteTagAsync(string repositoryPath, string tagName, CancellationToken cancellationToken = default) =>
+        Task.CompletedTask;
+
+    public Task PushTagAsync(string repositoryPath, string tagName, CancellationToken cancellationToken = default) =>
+        Task.CompletedTask;
+
+    public Task PushAllTagsAsync(string repositoryPath, CancellationToken cancellationToken = default) =>
+        Task.CompletedTask;
+
+    public Task FetchTagsAsync(string repositoryPath, CancellationToken cancellationToken = default) =>
+        Task.CompletedTask;
+
+    public Task CheckoutTagAsync(string repositoryPath, string tagName, CancellationToken cancellationToken = default) =>
+        Task.CompletedTask;
 
     public Task<IReadOnlyList<GitStashInfo>> GetStashesAsync(string repositoryPath, CancellationToken cancellationToken = default) =>
         Task.FromResult<IReadOnlyList<GitStashInfo>>([]);

@@ -274,6 +274,29 @@ public sealed class DesignSystemResourceTests
         // 泳道几何与视图列宽同源:模板列宽注释引用 GitGraphLayout.CellWidth,二者不得漂移。
         var gitView = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
         Assert.Contains("GitGraphLayout.CellWidth", gitView);
+        Assert.Contains("row.DotDashed ? DashStyles.Dash : DashStyles.Solid", cell);
+        Assert.Contains("<Run Text=\"{Binding SyncTarget, Mode=OneWay}\"", gitView);
+        Assert.Contains("分界位于远端提交之后、共同/本地历史之前", gitView);
+    }
+
+    [Fact]
+    public void ButtonOpenedContextMenus_ToggleClosedOnSecondClick()
+    {
+        var code = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml.cs"));
+        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
+
+        Assert.Equal(2, Regex.Matches(code, "ToggleButtonContextMenu\\(button, menu\\);").Count);
+        // Toggle 必须在 Preview 阶段完成:下压时菜单仍开着,此刻关闭并吞掉事件。若放行到
+        // Click,ButtonBase 在 MouseDown 捕获鼠标时已顺带关闭菜单(Closed 路由事件在该
+        // 路径不触发),Click 只能看到一个已关闭的菜单而立即重开(再次点击关不掉)。
+        Assert.Equal(5, Regex.Matches(view, "PreviewMouseLeftButtonDown=\"MenuToggleButton_PreviewMouseLeftButtonDown\"").Count);
+        Assert.Contains("IsOpen: true } menu", code);
+        // 双保险:Click 侧以 IsOpen 变化记录的"刚关闭时刻"兜底(关闭与 Click 的竞态、
+        // 或预览阶段被外部关闭处理器抢先时,靠 400ms 时间窗识别"这次按压就是关闭手势")。
+        Assert.Contains("DependencyPropertyDescriptor.FromProperty(ContextMenu.IsOpenProperty", code);
+        Assert.Contains("Environment.TickCount64 - closedAt < 400", code);
+        Assert.DoesNotContain("_suppressMenuOpenButtons", code);
+        Assert.DoesNotContain("button.IsMouseOver", code);
     }
 
     [Fact]
@@ -333,8 +356,12 @@ public sealed class DesignSystemResourceTests
         Assert.Contains("SetSnapshot", source);
         Assert.Contains("LineTransformers.Add", source);
         Assert.Contains("DiffMetaLineTransformer", source);
-        Assert.Contains("ThemeHighlightingColorizer.ApplyDefinitionTheme", source);
+        Assert.Contains("DiffHighlightProjection", source);
         Assert.Contains("ApplyHighlightingTheme();", source);
+        // 不再挂 AvalonEdit 内置定义(避免“默认上色 → 文本高亮”闪变);只由 colorizer 行索引上色。
+        Assert.Contains("SetSnapshotByLine", source);
+        Assert.Contains("SyntaxHighlighting = null", source);
+        Assert.DoesNotContain("ApplyDefinitionTheme", source);
     }
 
     [Fact]
@@ -356,7 +383,8 @@ public sealed class DesignSystemResourceTests
         Assert.Contains("OnDiffContextMenuOpening", code);
         Assert.Contains("HunkIndexAtDisplayLine", code);
         Assert.Contains("FindHunkAnchorLine", code);
-        Assert.Contains("ApplyHunkAsync", code);
+        Assert.Contains("ApplyHunkBlockAsync", code);
+        Assert.Contains("TryResolveHunkBlock", code);
     }
 
     // ===== Phase 4: interaction / tooltip / font-token guards =====
@@ -682,10 +710,13 @@ public sealed class DesignSystemResourceTests
     {
         // exe 图标(ApplicationIcon)与窗口图标(Window.Icon)共用同一品牌瓦片,且资产确实存在。
         var csproj = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Nornia.Desktop.csproj"));
-        Assert.Contains("<ApplicationIcon>Assets\\app.ico</ApplicationIcon>", csproj);
-        Assert.Contains("<Resource Include=\"Assets\\app.ico\" />", csproj);
+        Assert.Contains("<RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>", csproj);
+        Assert.Contains("<NorniaAppIcon>Assets\\app.ico</NorniaAppIcon>", csproj);
+        Assert.Contains("<ApplicationIcon>$(NorniaAppIcon)</ApplicationIcon>", csproj);
+        Assert.Contains("<Resource Include=\"$(NorniaAppIcon)\" />", csproj);
         var main = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/MainWindow.xaml"));
         Assert.Contains("Icon=\"/Nornia.Desktop;component/Assets/app.ico\"", main);
+        Assert.Contains("Source=\"/Nornia.Desktop;component/Assets/app.ico\"", main);
         Assert.True(File.Exists(Path.Combine(RepoRoot, "src/Nornia.Desktop/Assets/app.ico")), "缺少应用图标资产 app.ico");
     }
 
@@ -733,7 +764,7 @@ public sealed class DesignSystemResourceTests
             ["PackagesView.xaml"] = ["{StaticResource InsetCard}", "{StaticResource GapVerticalSm}"],
             ["ProjectsView.xaml"] = ["{StaticResource InsetPage}", "{StaticResource MarginFieldRow}"],
             ["TerminalView.xaml"] = ["{StaticResource InsetToolbar}", "{StaticResource GapLeftSm}"],
-            ["EmptyStateControl.xaml"] = ["{StaticResource SpaceXxl}", "{StaticResource GapMd}"],
+            ["EmptyStateControl.xaml"] = ["{StaticResource EmptyStateTopInset}", "{StaticResource GapMd}"],
         };
 
         foreach (var (fileName, tokens) in expected)
@@ -908,7 +939,11 @@ public sealed class DesignSystemResourceTests
         Assert.Contains("IsMouseOver", comboBox);
         Assert.Contains("IsEnabled", comboBox);
         Assert.Contains("Opacity", comboBox);
-        Assert.Contains("RelativeSource AncestorType=ComboBox", comboBox);
+        // The closed selector forwards the ComboBox brushes through the outer template into its
+        // ToggleButton; relying on an AncestorType lookup from a nested template is not stable
+        // after WPF materializes the control in a DataTemplate.
+        Assert.Contains("Background=\"{TemplateBinding Background}\"", comboBox);
+        Assert.Contains("BorderBrush=\"{TemplateBinding BorderBrush}\"", comboBox);
         Assert.Contains("TextElement.Foreground=\"{TemplateBinding Foreground}\"", comboBox);
 
         var comboBoxItem = StyleBlock(app, "<Style TargetType=\"ComboBoxItem\">");
@@ -916,6 +951,19 @@ public sealed class DesignSystemResourceTests
         Assert.Contains("SelectionActiveBrush", comboBoxItem);
         Assert.Contains("IsEnabled", comboBoxItem);
         Assert.Contains("<ControlTemplate TargetType=\"ComboBoxItem\">", comboBoxItem);
+    }
+
+    [Fact]
+    public void SettingsBooleanEditor_UsesThemedCheckBoxStyle()
+    {
+        var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
+        var settings = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/SettingsView.xaml"));
+        var checkBox = StyleBlock(app, "<Style TargetType=\"CheckBox\">");
+
+        Assert.Contains("Background=\"{DynamicResource InputBrush}\"", checkBox);
+        Assert.Contains("BorderBrush=\"{TemplateBinding BorderBrush}\"", checkBox);
+        Assert.Contains("TextElement.Foreground=\"{TemplateBinding Foreground}\"", checkBox);
+        Assert.Contains("Style=\"{StaticResource {x:Type CheckBox}}\" Content=\"启用\"", settings);
     }
 
     [Fact]
@@ -1110,6 +1158,20 @@ public sealed class DesignSystemResourceTests
     }
 
     [Fact]
+    public void CommitHover_UsesContentWidthUpToFiveHundredFiftyWithoutHeightCap()
+    {
+        var git = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
+        var start = git.IndexOf("<ToolTip Style=\"{StaticResource ScmCommitToolTipStyle}\">", StringComparison.Ordinal);
+        var end = git.IndexOf("<!-- 变更统计", start, StringComparison.Ordinal);
+        var hover = git[start..end];
+
+        Assert.Contains("<StackPanel MaxWidth=\"550\" HorizontalAlignment=\"Left\">", hover);
+        Assert.Contains("MaxWidth=\"550\" HorizontalAlignment=\"Left\"", hover);
+        Assert.DoesNotContain("MinWidth=", hover);
+        Assert.DoesNotContain("MaxHeight=", hover);
+    }
+
+    [Fact]
     public void GitGraph_UsesTopBranchSelectorInsteadOfBranchCollapsibleSection()
     {
         var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
@@ -1121,6 +1183,51 @@ public sealed class DesignSystemResourceTests
         Assert.DoesNotContain("Title=\"分支\"", view);
         Assert.DoesNotContain("IsBranchesSectionExpanded", view);
         Assert.Contains("menu.Placement = PlacementMode.Bottom", code);
+    }
+
+    [Fact]
+    public void GitChangeRowInlineActions_OpenFilesInFlatAndTreeLayouts()
+    {
+        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
+
+        Assert.Equal(2, CountOccurrences(view, "ToolTip=\"打开文件\""));
+        Assert.Equal(2, CountOccurrences(view, "Content=\"{StaticResource CodiconGoToFile}\""));
+        Assert.Equal(2, CountOccurrences(view,
+            "Command=\"{Binding DataContext.OpenFilePreviewCommand, RelativeSource={RelativeSource AncestorType=views:GitView}}\""));
+        Assert.DoesNotContain("ToolTip=\"在资源管理器中显示\"", view);
+    }
+
+    [Fact]
+    public void GitFlatChangeRows_PlaceDirectoryImmediatelyAfterFileName()
+    {
+        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
+        var start = view.IndexOf("<TextBlock x:Name=\"FlatNameAndPath\"", StringComparison.Ordinal);
+        var end = view.IndexOf("</TextBlock>", start, StringComparison.Ordinal);
+        var flatText = view[start..end];
+
+        var name = flatText.IndexOf("ConverterParameter=Name", StringComparison.Ordinal);
+        var directory = flatText.IndexOf("ConverterParameter=Directory", StringComparison.Ordinal);
+        Assert.True(name >= 0 && directory > name);
+        Assert.Contains("BasedOn=\"{StaticResource ScmFileNameTextStyle}\"", flatText);
+        Assert.Contains("Foreground=\"{DynamicResource MutedTextBrush}\"", flatText);
+        Assert.Equal(4, Regex.Matches(flatText, "<Run Text=\"\\{Binding Mode=OneWay,").Count);
+    }
+
+    [Fact]
+    public void GitFlatChangeRows_ReopenDiffWhenTheSelectedRowIsClickedAgain()
+    {
+        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
+        var code = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml.cs"));
+
+        Assert.Equal(2, CountOccurrences(view, "PreviewMouseLeftButtonDown=\"FlatChangeList_PreviewMouseLeftButtonDown\""));
+        Assert.Equal(2, CountOccurrences(view, "PreviewMouseLeftButtonUp=\"FlatChangeList_PreviewMouseLeftButtonUp\""));
+        Assert.Contains("_flatChangeReopenCandidate", code);
+        Assert.Contains("OpenChangeDiffCommand.Execute(candidate)", code);
+
+        var templateStart = view.IndexOf("<DataTemplate x:Key=\"ScmFileRowTemplate\">", StringComparison.Ordinal);
+        var bindingsStart = view.IndexOf("<Grid.InputBindings>", templateStart, StringComparison.Ordinal);
+        var bindingsEnd = view.IndexOf("</Grid.InputBindings>", bindingsStart, StringComparison.Ordinal);
+        Assert.DoesNotContain("OpenLogFileDiffCommand", view[bindingsStart..bindingsEnd]);
     }
 
     [Fact]
@@ -1253,7 +1360,10 @@ public sealed class DesignSystemResourceTests
         var preview = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/FilePreviewView.xaml"));
         var document = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/CodeDocumentView.xaml"));
 
-        Assert.Contains("DataType=\"{x:Type vm:FilePreviewTab}\"", editorArea);
+        Assert.Contains("x:Name=\"PersistentFilePreview\"", editorArea);
+        Assert.Contains("DataContext=\"{Binding SelectedFileTab}\"", editorArea);
+        Assert.Contains("HasSelectedFileTab", editorArea);
+        Assert.DoesNotContain("DataType=\"{x:Type vm:FilePreviewTab}\"", editorArea);
         Assert.Contains("<views:FilePreviewView", editorArea);
         Assert.Contains("<views:CodeDocumentView", preview);
         Assert.Contains("IsReadOnly=\"True\"", document);
@@ -1312,6 +1422,16 @@ public sealed class DesignSystemResourceTests
         // Global list/tab shortcuts leave the code area alone (focus isolation).
         Assert.Contains("ICSharpCode.AvalonEdit.Editing.TextArea", mainWindow);
         Assert.Contains("FindAncestor<CodeDocumentView>", mainWindow);
+        Assert.Contains("FindAncestor<DiffDocumentView>", mainWindow);
+        Assert.Contains("FrameworkContentElement content =>", mainWindow);
+        Assert.Contains("ContentOperations.GetParent", mainWindow);
+        // Focus must be refreshed before keybinding dispatch. Keep this assertion independent of
+        // the exception-handling block's indentation so adding a dispatch guard does not make the
+        // source-wiring test fail for formatting alone.
+        var focusRefresh = mainWindow.LastIndexOf("UpdateFocusContext();", StringComparison.Ordinal);
+        var keybindingDispatch = mainWindow.IndexOf("await _keybindings.DispatchAsync", StringComparison.Ordinal);
+        Assert.True(focusRefresh >= 0 && keybindingDispatch > focusRefresh,
+            "PreviewKeyDown must refresh focus context before dispatching keybindings.");
         // Ctrl+F with a selection in the document auto-fills the find box; the prev/next
         // buttons re-evaluate their enabled state when the match count changes.
         Assert.Contains("_tab.Content[segment.Offset..(segment.Offset + segment.Length)]", previewCode);
@@ -1495,7 +1615,9 @@ public sealed class DesignSystemResourceTests
         Assert.Contains("x:Key=\"AccentBrush\" Color=\"#297AA0\"", dark);
         Assert.Contains("x:Key=\"CodeSelectionBrush\" Color=\"#DD276782\"", dark);
         Assert.Contains("x:Key=\"EditorBrush\" Color=\"#FFFFFF\"", light);
-        Assert.Contains("x:Key=\"SideBarBrush\" Color=\"#FAFAFD\"", light);
+        // Light 的侧栏/面板/活动栏走 Fluent 阶梯:引用 LayerColor(#F5F5F8)而非硬编码窗口基准色。
+        Assert.Contains("x:Key=\"LayerColor\">#F5F5F8</Color>", light);
+        Assert.Contains("x:Key=\"SideBarBrush\" Color=\"{StaticResource LayerColor}\"", light);
         Assert.Contains("x:Key=\"AccentBrush\" Color=\"#0069CC\"", light);
         Assert.Contains("x:Key=\"CodeSelectionBrush\" Color=\"#400069CC\"", light);
         Assert.Contains("x:Key=\"EditorBrush\" Color=\"#000000\"", highContrast);
@@ -1617,6 +1739,26 @@ public sealed class DesignSystemResourceTests
         Assert.Contains("MouseLeftButtonUp=\"CommitBar_MouseLeftButtonUp\"", view);
         Assert.DoesNotContain("Gesture=\"LeftClick\"\n                          Command=\"{Binding DataContext.ToggleLogRowCommand", view);
         Assert.Contains("ToggleLogRowCommand.Execute(row)", code);
+        Assert.Contains("VirtualizingPanel.ScrollUnit=\"Pixel\"", view);
+    }
+
+    [Fact]
+    public void GitTagContextMenu_ActionsCarryTagNameAndInheritThemedMenuItemStyle()
+    {
+        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
+        var model = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/ViewModels/GitViewModel.cs"));
+
+        // 操作项参数必须取条目自带 TagName:操作项位于标签 MenuItem 的嵌套弹出层内,
+        // RelativeSource AncestorType 不跨 Popup 边界,祖先查找恒为 null → 删除/推送/检出
+        // 等命令静默无操作("删除标签点击没反应"的根因)。
+        Assert.DoesNotContain("AncestorType=MenuItem", view);
+        Assert.Contains("<Setter Property=\"CommandParameter\" Value=\"{Binding TagName}\" />", view);
+        Assert.Contains("record GitMenuCommandItem(string Header, System.Windows.Input.ICommand Command, string TagName)", model);
+
+        // 嵌套菜单三层样式 + RecentCommitMessages/分支菜单的 ItemContainerStyle 必须以
+        // 主题隐式 MenuItem 样式为基,否则弹出层回落系统默认模板(丢失主题)。
+        var basedOnCount = view.Split("BasedOn=\"{StaticResource {x:Type MenuItem}}\"").Length - 1;
+        Assert.True(basedOnCount >= 5, $"GitView 菜单样式应至少 5 处 BasedOn 主题 MenuItem 样式,实际 {basedOnCount}");
     }
 
     [Fact]
@@ -1654,18 +1796,60 @@ public sealed class DesignSystemResourceTests
     }
 
     [Fact]
+    public void SearchOptionToggles_UseThemeAwareToolbarStyle()
+    {
+        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/SearchSidebarView.xaml"));
+
+        Assert.Contains("x:Key=\"SearchOptionToggleStyle\"", view);
+        Assert.Equal(4, Regex.Matches(view, "Style=\"\\{StaticResource SearchOptionToggleStyle\\}\"").Count);
+        Assert.Contains("Content=\"{loc:StringLoc Key=Search_UseIgnoreFiles}\"", view);
+        Assert.Contains("Value=\"{DynamicResource HoverBrush}\"", view);
+        Assert.Contains("Value=\"{DynamicResource SelectionActiveBrush}\"", view);
+        Assert.Contains("Value=\"{DynamicResource AccentBrush}\"", view);
+        Assert.Contains("Value=\"{DynamicResource FocusBorderBrush}\"", view);
+    }
+
+    [Fact]
+    public void CachePage_UsesResizableSummaryAndDetailTables()
+    {
+        var cache = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/CacheView.xaml"));
+
+        Assert.Contains("Height=\"2*\" MinHeight=\"120\"", cache);
+        Assert.Contains("Height=\"3*\" MinHeight=\"160\"", cache);
+        Assert.Contains("Style=\"{StaticResource HorizontalSashStyle}\"", cache);
+        Assert.Contains("ResizeBehavior=\"PreviousAndNext\"", cache);
+        Assert.Contains("SelectionMode=\"Single\"", cache);
+        Assert.Contains("Header=\"已选/总计\"", cache);
+        Assert.Contains("Header=\"清理空间/总空间\"", cache);
+        Assert.Contains("Header=\"类型\"", cache);
+        Assert.Contains("Header=\"占用空间\"", cache);
+        Assert.Contains("DataGridTemplateColumn Header=\"清理\"", cache);
+        Assert.Contains("CellStyle=\"{StaticResource CacheSelectionCellStyle}\"", cache);
+        Assert.Contains("HorizontalAlignment=\"Stretch\" VerticalAlignment=\"Stretch\"", cache);
+        Assert.Contains("HorizontalContentAlignment=\"Center\" VerticalContentAlignment=\"Center\"", cache);
+        Assert.Contains("Background=\"Transparent\"", cache);
+        Assert.Contains("Content=\"全选\" Command=\"{Binding SelectAllInCategoryCommand}\"", cache);
+        Assert.Contains("Content=\"全不选\" Command=\"{Binding ClearCategorySelectionCommand}\"", cache);
+        Assert.DoesNotContain("b:MultiSelectorBinding.SelectedItems=\"{Binding SelectedCategorySummaries}\"", cache);
+    }
+
+    [Fact]
     public void MainWorkbench_UsesStableThreeSlotPanelHeaderAndResponsiveFrame()
     {
         var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/MainWindow.xaml"));
         var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
+        var startup = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml.cs"));
 
         Assert.Contains("MinWidth=\"960\"", view);
+        Assert.Contains("ShowActivated=\"True\"", view);
         Assert.Contains("x:Name=\"EditorPanelHost\"", view);
         Assert.Contains("<Grid.ColumnDefinitions>", view);
         Assert.Contains("Grid.Column=\"2\" Orientation=\"Horizontal\" HorizontalAlignment=\"Right\"", view);
         Assert.DoesNotContain("<DockPanel Height=\"{DynamicResource SizeTabBar}\"", view);
         Assert.Contains("SizeWorkbenchSplitter", app);
         Assert.Contains("MinEditorWidth", app);
+        Assert.Contains("mainWindow.Activate();", startup);
+        Assert.Contains("DispatcherPriority.ApplicationIdle", startup);
     }
 
     [Fact]

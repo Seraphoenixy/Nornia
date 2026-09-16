@@ -229,7 +229,8 @@ public sealed class TrackedEnvironmentRepairExecutor(
         Exception? snapshotError = null;
         try
         {
-            await packageInventoryService.RefreshAsync(progress, cancellationToken);
+            // 回滚改变了环境:两个清单都必须绕过合并缓存与持久化快照 TTL 强制重扫。
+            await packageInventoryService.RefreshForcedAsync(progress, cancellationToken);
             await runtimeInventoryService.RefreshForcedAsync(cancellationToken);
         }
         catch (OperationCanceledException)

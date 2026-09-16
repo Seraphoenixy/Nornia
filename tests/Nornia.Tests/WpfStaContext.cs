@@ -5,6 +5,13 @@ using System.Windows.Threading;
 
 namespace Nornia.Tests;
 
+/// <summary>依赖共享 STA Dispatcher 队列的测试必须串行运行:并行下其它 STA 测试正在
+/// 构造/拆卸控件,外来泵会提前激活它们的绑定(转换器 NRE)甚至触发 App 关闭语义。
+/// DisableParallelization 集合在 xunit 中等所有并行集合结束后独占运行,此时泵队列
+/// 只包含本测试自己的条目。</summary>
+[CollectionDefinition("WpfStaSequential", DisableParallelization = true)]
+public sealed class WpfStaSequentialCollection;
+
 /// <summary>进程级共享的 WPF STA 上下文:WPF 只允许同一进程存在一个
 /// <see cref="Application"/> 实例,而 xUnit 默认在同进程内并行跑测试类——因此所有
 /// STA 控件测试(SectionCollapse / MarkdownPreviewView 同步 / 大纲跳转集成)共用

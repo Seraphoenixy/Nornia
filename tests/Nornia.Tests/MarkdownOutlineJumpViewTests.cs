@@ -4,6 +4,8 @@ using Nornia.Desktop.ViewModels;
 using Nornia.Desktop.Views;
 using System.Collections.Concurrent;
 using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Media;
 using System.Windows.Threading;
 
 namespace Nornia.Tests;
@@ -84,6 +86,7 @@ public sealed class MarkdownOutlineJumpViewTests : IDisposable
 
         bool rendered = false;
         double offsetBefore = 0, offsetAfter = 0;
+        double headingTopInViewport = 0, hostViewport = 0, hostExtent = 0;
         MarkdownHeading? currentHeading = null;
 
         WpfStaContext.Run(() =>
@@ -107,6 +110,16 @@ public sealed class MarkdownOutlineJumpViewTests : IDisposable
 
             currentHeading = view.MarkdownViewControl.CurrentHeading;
             offsetAfter = view.MarkdownViewControl.VerticalOffset;
+
+            // 点击跳转行为:目标标题显示在屏幕中间——标题段落顶边应落在预览视口垂直中心线上。
+            var host = FindFirstScrollViewer(view.MarkdownViewControl);
+            var gammaHeading = tab.MarkdownRenderResult!.Headings.Single(h => h.Anchor == "gamma");
+            var paragraph = view.MarkdownViewControl.HeadingParagraphsForTest![gammaHeading.DocumentName];
+            // 段落是 ContentElement 没有几何 API,按视图同款方式经零尺寸位置标记取几何。
+            var marker = Assert.IsAssignableFrom<FrameworkElement>(paragraph.Tag);
+            headingTopInViewport = marker.TransformToVisual(host).Transform(new Point(0, 0)).Y;
+            hostViewport = host.ViewportHeight;
+            hostExtent = host.ExtentHeight;
         });
 
         Assert.True(rendered);
@@ -117,6 +130,35 @@ public sealed class MarkdownOutlineJumpViewTests : IDisposable
         Assert.True(offsetAfter > offsetBefore, $"预览未滚动: {offsetBefore} → {offsetAfter}");
         Assert.NotNull(currentHeading);
         Assert.Equal("gamma", currentHeading!.Anchor);
+        // 跳转目标居中(文档边界钳制):最终偏移必须等于 clamp(标题内容坐标 − 视口/2, 0, extent − 视口)。
+        // 标题在文档底部时中心不可达,贴住文档末端仍是正确居中。
+        var contentY = offsetAfter + headingTopInViewport;
+        var expectedOffset = Math.Clamp(contentY - hostViewport / 2, 0, Math.Max(0, hostExtent - hostViewport));
+        Assert.True(Math.Abs(offsetAfter - expectedOffset) <= 3.0,
+            $"跳转目标未居中: 偏移={offsetAfter:F1}, 期望={expectedOffset:F1} (标题内容坐标={contentY:F1}, 视口={hostViewport:F1}, extent={hostExtent:F1})");
+    }
+
+    private static ScrollViewer FindFirstScrollViewer(DependencyObject parent)
+    {
+        for (var i = 0; i < VisualTreeHelper.GetChildrenCount(parent); i++)
+        {
+            var child = VisualTreeHelper.GetChild(parent, i);
+            if (child is ScrollViewer viewer)
+            {
+                return viewer;
+            }
+
+            try
+            {
+                return FindFirstScrollViewer(child);
+            }
+            catch (InvalidOperationException)
+            {
+                // 继续兄弟分支。
+            }
+        }
+
+        throw new InvalidOperationException("未找到 ScrollViewer。");
     }
 
     private static void Layout(FrameworkElement element)

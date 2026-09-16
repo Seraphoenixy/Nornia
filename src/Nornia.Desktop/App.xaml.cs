@@ -40,7 +40,32 @@ public partial class App : Application
 
     protected override async void OnStartup(StartupEventArgs e)
     {
+        try
+        {
+            await OnStartupCoreAsync(e);
+        }
+        catch (Exception exception)
+        {
+            // OnStartup is an async-void framework override. Keep failures from escaping through
+            // the dispatcher, especially when settings, DI or database setup fails before the
+            // main window has been shown.
+            Log.Fatal(exception, "Nornia 启动失败");
+            try
+            {
+                Shutdown(1);
+            }
+            catch (Exception shutdownException)
+            {
+                Log.Error(shutdownException, "启动失败后退出应用失败");
+            }
+        }
+    }
+
+    private async Task OnStartupCoreAsync(StartupEventArgs e)
+    {
         ShutdownMode = ShutdownMode.OnMainWindowClose;
+        // Windows 右键菜单"Nornia 打开"传入的路径(目录或文件,取首个确实存在的参数)。
+        var contextArg = e.Args.FirstOrDefault(arg => Directory.Exists(arg) || File.Exists(arg));
         // 数据根目录(Roaming):最先创建,后续设置/状态/数据库/日志直接落此目录。
         Directory.CreateDirectory(NorniaPaths.DataDirectory);
         var logDirectory = Path.Combine(NorniaPaths.DataDirectory, "logs");
@@ -61,6 +86,10 @@ public partial class App : Application
         // its WPF-specific services here.
         _services = new ServiceCollection()
             .AddNorniaServices()
+            // WinGet suppresses progress when launched with redirected standard streams. The
+            // desktop registers a ConPTY-backed capability so package mutations emit their
+            // native OSC 9;4 progress frames for the operation banner.
+            .AddSingleton<IInteractiveProcessRunner, WingetInteractiveProcessRunner>()
             .AddSingleton<BuiltInSettingsCatalog>()
             .AddSingleton<ISettingsDocumentStore, SettingsDocumentStore>()
             .AddSingleton<ISettingsResolver, SettingsResolver>()
@@ -87,6 +116,8 @@ public partial class App : Application
             .AddSingleton<IGitRepositoryWatcher, GitRepositoryWatcher>()
             // 源码视图自动刷新:已打开文件的外部变更监听(EditorAreaViewModel 统一 Watch/Unwatch)。
             .AddSingleton<IFileContentWatcher, FileContentWatcher>()
+            // 资源管理器树自动刷新:工作区根目录的结构性监听(文件/目录的增删改,VS Code explorer 语义)。
+            .AddSingleton<IWorkspaceFileWatcher, WorkspaceFileWatcher>()
             // Read-only code workbench services (file type, decoding, outlines, search).
             .AddSingleton<ICodeFileTypeRegistry, CodeFileTypeRegistry>()
             .AddSingleton<ITextDocumentDecoder, TextDocumentDecoder>()
@@ -147,8 +178,25 @@ public partial class App : Application
         // 窗口先显示、后台继续;首屏读库方(任务中心)以 NorniaDatabase.Initialization 为闸门。
         var databaseReady = InitializeDatabaseAsync();
 
-        MainWindow = _services.GetRequiredService<MainWindow>();
-        MainWindow.Show();
+        var mainWindow = _services.GetRequiredService<MainWindow>();
+        MainWindow = mainWindow;
+        mainWindow.Show();
+        // Show() normally activates a first window, but the asynchronous startup path and the
+        // restored layout can leave it behind the launcher's foreground window. Request
+        // activation explicitly while this user-initiated startup still owns foreground rights.
+        mainWindow.Activate();
+        mainWindow.Focus();
+        _ = Dispatcher.BeginInvoke(DispatcherPriority.ApplicationIdle, new Action(() =>
+        {
+            // Loaded layout restoration can run after Show and change WindowState/placement.
+            // A final, non-intrusive activation keeps the initial shell in front without trying
+            // to steal focus later in the application's lifetime.
+            if (mainWindow.IsVisible && !mainWindow.IsActive)
+            {
+                mainWindow.Activate();
+                mainWindow.Focus();
+            }
+        }));
         base.OnStartup(e);
 
         // M9: 窗口已显示,才做旧日志保留清理(枚举+删除 I/O 不再占用启动关键路径)。
@@ -163,6 +211,29 @@ public partial class App : Application
         // 数据库失败已在 InitializeDatabaseAsync 内处理(写日志 + 弹错 + 退出)。
         await _services.GetRequiredService<AppearanceSettingsController>().StartAsync();
         await databaseReady;
+
+        // 右键菜单"Nornia 打开"传入的路径(窗口与数据库就绪后执行):目录作为项目打开
+        // (加载资源管理器/终端/Git,并在项目目录登记);文件不打开项目,仅在编辑器视图打开该文件。
+        if (contextArg is not null)
+        {
+            try
+            {
+                if (Directory.Exists(contextArg))
+                {
+                    var explorer = _services.GetRequiredService<ExplorerPageViewModel>();
+                    await explorer.OpenProjectPathAsync(contextArg);
+                }
+                else
+                {
+                    var editor = _services.GetRequiredService<EditorAreaViewModel>();
+                    await editor.OpenFileAsync(contextArg, permanent: true);
+                }
+            }
+            catch (Exception exception)
+            {
+                Log.Warning(exception, "Failed to open path from command line: {Path}", contextArg);
+            }
+        }
     }
 
     /// <summary>每次进程启动创建独立日志文件，避免同一天的多次启动继续追加到同一文件。
@@ -208,6 +279,10 @@ public partial class App : Application
             catch (UnauthorizedAccessException)
             {
                 // The logger will report any actual file creation failure after configuration.
+            }
+            catch (Exception exception)
+            {
+                Log.Warning(exception, "日志保留清理失败");
             }
         });
     }
@@ -266,6 +341,7 @@ public partial class App : Application
         // cleanup completes) the process is about to terminate, and a still-running abandoned
         // phase must never touch a disposed token.
         var services = _services;
+        var performanceMetrics = services?.GetService<IUiPerformanceMetrics>() as UiPerformanceMetrics;
         _services = null;
         var deadline = new CancellationTokenSource(ShutdownCleanupDeadline);
         var cleanup = RunShutdownCleanupAsync(services, deadline.Token);
@@ -285,6 +361,7 @@ public partial class App : Application
                 ShutdownCleanupSeconds, string.Join(", ", cleanup.Result.Abandoned), cleanup.Result.PhasesSummary);
         }
 
+        performanceMetrics?.Flush();
         Log.CloseAndFlush();
         base.OnExit(e);
     }

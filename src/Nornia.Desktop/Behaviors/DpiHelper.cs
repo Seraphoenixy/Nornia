@@ -38,7 +38,8 @@ public static class DpiHelper
         {
             CaptionHeight = CaptionHeight(scale),
             ResizeBorderThickness = new Thickness(ResizeBorderThickness(scale)),
-            GlassFrameThickness = new Thickness(0),
+            // Mica 启用时需 -1(无限玻璃框)把 DWM 材质层延到客户区;平时 0 保持纯自绘。
+            GlassFrameThickness = Services.WindowBackdropService.ChromeGlassFrame,
             CornerRadius = new CornerRadius(0),
             UseAeroCaptionButtons = false
         });

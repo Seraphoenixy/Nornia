@@ -12,6 +12,7 @@ using Nornia.Project.Services;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Text;
 using System.Text.Json.Nodes;
@@ -52,10 +53,17 @@ public sealed record GitDiffRequest(
     string? CommitHash = null,
     bool IsPreview = false,
     string? HeadBlobId = null,
-    string? IndexBlobId = null)
+    string? IndexBlobId = null,
+    ProjectWorkspaceContext? WorkspaceContext = null)
 {
-    /// <summary>Stable identity so re-opening the same change activates its existing tab.</summary>
-    public string TabKey => CommitHash is null ? $"diff:{Path}" : $"diff:{CommitHash}:{Path}";
+    /// <summary>Stable identity so re-opening the same change activates its existing tab. The
+    /// working-tree side (w = 未暂存, s = 已暂存, u = 未跟踪) is part of the key: the staged and
+    /// unstaged diffs of one file are different documents, and keying on path alone made a re-open
+    /// from the other side silently activate the stale tab (and layout restore dropped one of the
+    /// two tabs under the duplicate-key dedupe).</summary>
+    public string TabKey => CommitHash is not null
+        ? $"diff:{CommitHash}:{Path}"
+        : $"diff:{Path}:{(IsUntracked ? "u" : IsStaged ? "s" : "w")}";
 }
 
 /// <summary>VS Code-style editor group shared by the explorer and the source-control panes. Explorer
@@ -63,6 +71,10 @@ public sealed record GitDiffRequest(
 /// the same tab strip, closable and switchable like a real editor group.</summary>
 public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownParticipant, IDisposable
 {
+    // 标签条本身只保留轻量身份/阅读状态；文件文本与派生投影按估算的驻留大小做 LRU
+    // 回收。128 MiB 是软上限：每个编辑器组当前选中的文件必须保留，以避免可见编辑器
+    // 在后台被清空；超出预算的原因只可能是这些可见文件本身过大。
+    private const long OpenFilePayloadBudgetBytes = 128L * 1024 * 1024;
     private int _maxOpenTabs = 30;
     private bool _enablePreviewTabs = true;
     private bool _editorLimitEnabled = true;
@@ -81,16 +93,26 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
     private IProjectWorkspaceService? _workspaceService;
     private IApplicationStateStore? _stateStore;
     private readonly Dictionary<string, ISettingsSession> _languageSessions = new(StringComparer.OrdinalIgnoreCase);
-    private readonly HashSet<string> _restoredWorkspaceTabs = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<EditorGroupViewModel> _wiredGroups = [];
     private readonly RevisionGate _settingsRevisionGate = new();
+    private readonly SemaphoreSlim _settingsApplyGate = new(1, 1);
+    private readonly SemaphoreSlim _settingsNotificationGate = new(1, 1);
     private readonly SemaphoreSlim _previewOptionsGate = new(1, 1);
+    private readonly object _pendingPreviewOptionsGate = new();
+    private readonly Dictionary<FilePreviewTab, int> _pendingPreviewOptionWrites = new(ReferenceEqualityComparer.Instance);
+    // Use the context that owns this view model. A process-global WPF Application may belong to
+    // another dispatcher (notably the shared STA test host) whose queue is currently idle.
+    private readonly SynchronizationContext? _uiContext;
 
     /// <summary>外部文件监听(源代码视图自动刷新):按目录复用的 FileSystemWatcher 只报告已打开
     /// 的 <see cref="FilePreviewTab"/> 目标文件;关闭/预览槽替换/LRU 驱逐时经差量同步取消监听。</summary>
     private readonly IFileContentWatcher _fileContentWatcher;
     private readonly HashSet<string> _watchedFilePaths = new(StringComparer.OrdinalIgnoreCase);
     private readonly IGitRepositoryWatcher _repositoryWatcher;
+    private ProjectWorkspaceContext? _activeWorkspaceContext;
+    private bool _workspaceContextBoundaryEnabled;
+    private CancellationTokenSource? _workspaceSwitchCancellation;
+    private bool _suppressWorkspacePersistence;
 
     /// <summary>可拆分的编辑器组网格:编辑器区现在由多个组构成,本类保留为统一门面。
     /// <see cref="OpenTabs"/> / <see cref="SelectedTab"/> 是活动组的兼容投影,视图渲染使用具体组。</summary>
@@ -165,6 +187,12 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
         _outlineParser = outlineParser;
         _searchService = searchService;
         _projectLauncher = projectLauncher;
+        // Only a WPF dispatcher context owns UI-bound collections. Test frameworks also install
+        // custom SynchronizationContexts; capturing one of those makes background settings
+        // notifications depend on the runner's scheduling/pump and can stall under CI load.
+        _uiContext = SynchronizationContext.Current is System.Windows.Threading.DispatcherSynchronizationContext
+            ? SynchronizationContext.Current
+            : null;
         _fileContentWatcher = fileContentWatcher ?? NullFileContentWatcher.Instance;
         _repositoryWatcher = repositoryWatcher ?? NullGitRepositoryWatcher.Instance;
         _fileContentWatcher.FileChanged += OnFileChanged;
@@ -209,6 +237,11 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
         _settingsService = settingsService;
         _workspaceService = workspaceService;
         _stateStore = stateStore;
+        _activeWorkspaceContext = workspaceService.Current;
+        // Editor-only embedders/tests may provide the workspace-aware constructor before the
+        // first context is activated. Keep that initial, context-less surface usable; once the
+        // service publishes a context, all subsequent opens are identity-bound.
+        _workspaceContextBoundaryEnabled = workspaceService.Current is not null;
         _workspaceService.ContextChanged += OnWorkspaceSettingsContextChangedAsync;
     }
 
@@ -274,7 +307,7 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
         {
             if (string.Equals(tab.Path, e.FullPath, StringComparison.OrdinalIgnoreCase))
             {
-                _ = tab.ReloadAsync();
+                _ = ReloadPreviewAndTrimAsync(tab);
             }
         }
     }
@@ -375,7 +408,84 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
         // VS Code 恢复语义:标签条先出现,内容按需加载 —— 选中预览标签时才读取文件内容。
         if (!_suppressSelectionLoad && SelectedTab is FilePreviewTab { IsLoadFinished: false } preview)
         {
-            _ = preview.LoadAsync();
+            _ = LoadPreviewAndTrimAsync(preview);
+        }
+    }
+
+    private async Task LoadPreviewAndTrimAsync(FilePreviewTab preview)
+    {
+        try
+        {
+            await preview.LoadAsync();
+        }
+        catch (Exception ex)
+        {
+            // Selection changes are fire-and-forget. Observe failures here so a malformed or
+            // temporarily inaccessible file cannot become an unobserved task exception.
+            _logService.Write("WARNING", $"无法加载文件预览 {preview.Path}：{ex.Message}");
+        }
+        finally
+        {
+            TrimOpenFilePayloadCache();
+        }
+    }
+
+    private async Task ReloadPreviewAndTrimAsync(FilePreviewTab preview)
+    {
+        try
+        {
+            await preview.ReloadAsync();
+        }
+        catch (Exception ex)
+        {
+            _logService.Write("WARNING", $"无法重载文件预览 {preview.Path}：{ex.Message}");
+        }
+        finally
+        {
+            TrimOpenFilePayloadCache();
+        }
+    }
+
+    /// <summary>按文件预览载荷的估算大小做全局 LRU 回收。标签仍留在标签条中，下一次选中
+    /// 时由 <see cref="FilePreviewTab.LoadAsync"/> 从磁盘懒加载；每个编辑器组的当前标签受
+    /// 保护，因为拆分编辑器的所有组都是同时可见的。这里刻意释放引用而不强制 GC，交由
+    /// CLR 在合适的时机回收大字符串、解析结果和派生集合。</summary>
+    private void TrimOpenFilePayloadCache()
+    {
+        var loaded = Groups.AllTabs.OfType<FilePreviewTab>()
+            .Where(tab => tab.IsPayloadLoaded)
+            .ToArray();
+        var retained = loaded.Sum(tab => tab.RetainedMemoryBytes);
+        if (retained <= OpenFilePayloadBudgetBytes)
+        {
+            return;
+        }
+
+        var protectedTabs = Groups.Groups
+            .Select(group => group.SelectedTab)
+            .OfType<FilePreviewTab>()
+            .ToHashSet(ReferenceEqualityComparer.Instance);
+        var visited = new HashSet<EditorTabItem>(ReferenceEqualityComparer.Instance);
+
+        // EditorsInMruOrder is newest-first. Reverse it so the least recently used payload is
+        // considered first; AllTabs is a defensive fallback for restored tabs not yet touched.
+        foreach (var candidate in Groups.EditorsInMruOrder.Reverse().Concat(Groups.AllTabs))
+        {
+            if (!visited.Add(candidate)
+                || candidate is not FilePreviewTab preview
+                || protectedTabs.Contains(preview)
+                || !preview.IsPayloadLoaded)
+            {
+                continue;
+            }
+
+            var before = preview.RetainedMemoryBytes;
+            preview.UnloadContentForCache();
+            retained -= before - preview.RetainedMemoryBytes;
+            if (retained <= OpenFilePayloadBudgetBytes)
+            {
+                break;
+            }
         }
     }
 
@@ -383,16 +493,23 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
     {
         OnPropertyChanged(nameof(OpenTabs));
         OpenTabsChanged?.Invoke(this, EventArgs.Empty);
+        TrimOpenFilePayloadCache();
     }
 
     /// <summary>Opens a file preview initialized from the persisted reading options (word wrap /
     /// font size), and persists reading-option toggles back to settings for the next
     /// session. <paramref name="permanent"/> (树双击) opens a regular tab instead of a preview,
     /// and promotes an already-open preview of the same file.</summary>
-    public async Task OpenFileAsync(string path, bool permanent = false)
+    public async Task OpenFileAsync(
+        string path,
+        bool permanent = false,
+        ProjectWorkspaceContext? expectedWorkspaceContext = null)
     {
+        var context = expectedWorkspaceContext ?? _workspaceService?.Current;
+        if (expectedWorkspaceContext is not null && !IsWorkspaceContextCurrent(context)) return;
         var languageId = _fileTypes.FromPath(path).LanguageId;
         var options = await EnsureReadingOptionsAsync(languageId);
+        if (!IsWorkspaceContextCurrent(context)) return;
         var tab = new FilePreviewTab(path, _decoder, _fileTypes, _searchService, _outlineParser)
         {
             WordWrap = options.WordWrap,
@@ -409,17 +526,31 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
             ShowFoldingControls = options.ShowFoldingControls,
             IsPreview = _enablePreviewTabs && !permanent,
         };
-        await RestoreReadingStateAsync(tab);
+        await RestoreReadingStateAsync(tab, context);
+        if (!IsWorkspaceContextCurrent(context))
+        {
+            tab.ReleaseResources();
+            return;
+        }
+
         tab.PropertyChanged += OnPreviewOptionChanged;
-        await OpenTabAsync(tab, promote: permanent);
+        await OpenTabAsync(tab, promote: permanent, workspaceContext: context);
     }
 
     /// <summary>Opens a read-only file and positions the active preview at a 1-based line/column.
     /// Search and other navigation surfaces use this façade instead of reaching into a tab's
     /// loading implementation.</summary>
-    public async Task OpenFileAtAsync(string path, int line, int column, bool permanent = false)
+    public async Task OpenFileAtAsync(
+        string path,
+        int line,
+        int column,
+        bool permanent = false,
+        ProjectWorkspaceContext? expectedWorkspaceContext = null)
     {
-        await OpenFileAsync(path, permanent);
+        var context = expectedWorkspaceContext ?? _workspaceService?.Current;
+        if (expectedWorkspaceContext is not null && !IsWorkspaceContextCurrent(context)) return;
+        await OpenFileAsync(path, permanent, expectedWorkspaceContext);
+        if (!IsWorkspaceContextCurrent(context)) return;
         if (SelectedTab is not FilePreviewTab preview)
         {
             return;
@@ -446,7 +577,7 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
         return _cachedReadingOptions ??= new CodeReadingOptions();
     }
 
-    /// <summary>Persists reading-option toggles (word wrap / font size). Fire-and-forget:
+    /// <summary>Persists reading-option toggles. Fire-and-forget:
     /// a failing write must never break the preview.</summary>
     private void OnPreviewOptionChanged(object? sender, PropertyChangedEventArgs e)
     {
@@ -460,55 +591,174 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
             or nameof(FilePreviewTab.FontSize)
             or nameof(FilePreviewTab.ShowLineNumbers)
             or nameof(FilePreviewTab.ShowIndentGuides)
-            or nameof(FilePreviewTab.ShowFoldingControls)))
+            or nameof(FilePreviewTab.ShowFoldingControls)
+            or nameof(FilePreviewTab.ShowStickyScroll)
+            or nameof(FilePreviewTab.MinimapRenderCharacters)
+            or nameof(FilePreviewTab.MinimapWidth)
+            or nameof(FilePreviewTab.LineNumbersRelative)
+            or nameof(FilePreviewTab.RulerColumns)))
         {
             return;
         }
 
-        _ = PersistPreviewOptionsAsync(tab);
+        // Capture the complete option set at the event boundary. Persistence is serialized and
+        // settings notifications from an earlier write may update the live tab before a queued
+        // write starts; reading the tab inside that queued write would then persist stale values
+        // over a newer user choice.
+        var options = new PreviewOptionsSnapshot(
+            tab.FileType.LanguageId,
+            tab.WordWrap,
+            tab.ShowMinimap,
+            tab.FontSize,
+            tab.ShowLineNumbers,
+            tab.ShowIndentGuides,
+            tab.ShowFoldingControls,
+            tab.ShowStickyScroll,
+            tab.MinimapRenderCharacters,
+            tab.MinimapWidth,
+            tab.LineNumbersRelative,
+            tab.RulerColumns);
+        MarkPreviewOptionsPending(tab);
+        _ = PersistPreviewOptionsAsync(tab, options, _workspaceService?.Current);
     }
 
-    private async Task PersistPreviewOptionsAsync(FilePreviewTab tab)
+    private async Task PersistPreviewOptionsAsync(
+        FilePreviewTab tab,
+        PreviewOptionsSnapshot options,
+        ProjectWorkspaceContext? workspaceContext)
     {
-        await _previewOptionsGate.WaitAsync();
+        var gateEntered = false;
         try
         {
+            await _previewOptionsGate.WaitAsync();
+            gateEntered = true;
+            if (!IsWorkspaceContextCurrent(workspaceContext)) return;
             if (_settingsService is not null)
             {
-                var session = await GetSettingsSessionAsync(tab.FileType.LanguageId);
-                // 持久化作者字号(tab.FontSize 是显示字号 = 作者字号 × uiScale),避免下次加载
+                var session = await GetSettingsSessionAsync(options.LanguageId, workspaceContext);
+                if (!IsWorkspaceContextCurrent(workspaceContext)) return;
+                // 持久化作者字号(options.FontSize 是显示字号 = 作者字号 × uiScale),避免下次加载
                 // 重复放大。倍率取自会话快照而非静态缓存,保证与显示侧一致且不受测试静态污染。
                 var scale = UiFontService.ClampScale(
                     session.Current?.Effective(BuiltInSettingsCatalog.UiScale) ?? UiFontService.DefaultScale);
-                await session.CommitAsync(SettingScope.User,
+                SettingOperation[] operations =
                 [
-                    new(BuiltInSettingsCatalog.EditorWordWrap.Id, JsonValue.Create(tab.WordWrap ? "on" : "off"), LanguageId: tab.FileType.LanguageId),
-                    new(BuiltInSettingsCatalog.MinimapEnabled.Id, JsonValue.Create(tab.ShowMinimap), LanguageId: tab.FileType.LanguageId),
+                    new(BuiltInSettingsCatalog.EditorWordWrap.Id, JsonValue.Create(options.WordWrap ? "on" : "off"), LanguageId: options.LanguageId),
+                    new(BuiltInSettingsCatalog.MinimapEnabled.Id, JsonValue.Create(options.ShowMinimap), LanguageId: options.LanguageId),
                     // 缩放字号写回 User 作用域(不带 LanguageId):Ctrl+滚轮调整的是"整个阅读器"的
                     // 字号,所有语言一起变。若写成语言作用域,调整 .cs 只对 csharp 生效,
                     // .csproj(xml)等其他语言仍是旧值,标签之间就会显示不同字号。
                     new(BuiltInSettingsCatalog.EditorFontSize.Id,
-                        JsonValue.Create(Math.Round(tab.FontSize / scale, 1))),
-                    new(BuiltInSettingsCatalog.LineNumbers.Id, JsonValue.Create(tab.ShowLineNumbers ? "on" : "off"), LanguageId: tab.FileType.LanguageId),
-                    new(BuiltInSettingsCatalog.IndentationGuides.Id, JsonValue.Create(tab.ShowIndentGuides), LanguageId: tab.FileType.LanguageId),
-                    new(BuiltInSettingsCatalog.Folding.Id, JsonValue.Create(tab.ShowFoldingControls), LanguageId: tab.FileType.LanguageId),
-                ]);
+                        JsonValue.Create(Math.Round(options.FontSize / scale, 1))),
+                    new(BuiltInSettingsCatalog.IndentationGuides.Id, JsonValue.Create(options.ShowIndentGuides), LanguageId: options.LanguageId),
+                    new(BuiltInSettingsCatalog.Folding.Id, JsonValue.Create(options.ShowFoldingControls), LanguageId: options.LanguageId),
+                    new(BuiltInSettingsCatalog.StickyScroll.Id, JsonValue.Create(options.ShowStickyScroll), LanguageId: options.LanguageId),
+                    new(BuiltInSettingsCatalog.MinimapRenderCharacters.Id, JsonValue.Create(options.MinimapRenderCharacters), LanguageId: options.LanguageId),
+                    new(BuiltInSettingsCatalog.MinimapWidth.Id, JsonValue.Create(options.MinimapWidth), LanguageId: options.LanguageId),
+                    new(BuiltInSettingsCatalog.LineNumbers.Id,
+                        JsonValue.Create(!options.ShowLineNumbers ? "off" : options.LineNumbersRelative ? "relative" : "on"),
+                        LanguageId: options.LanguageId),
+                    new(BuiltInSettingsCatalog.EditorRulers.Id,
+                        JsonValue.Create(options.RulerColumns is { Length: > 0 }
+                            ? string.Join(",", options.RulerColumns.Select(value => value.ToString(CultureInfo.InvariantCulture)))
+                            : string.Empty),
+                        LanguageId: options.LanguageId),
+                ];
+                for (var attempt = 0; attempt < 3; attempt++)
+                {
+                    var result = await session.CommitAsync(SettingScope.User, operations);
+                    if (result.Status == SettingsCommitStatus.Success)
+                    {
+                        return;
+                    }
+
+                    if (attempt == 2 || result.Status is not (SettingsCommitStatus.FileError or SettingsCommitStatus.Conflict))
+                    {
+                        return;
+                    }
+
+                    await Task.Delay(50 * (attempt + 1));
+                    await session.RefreshAsync();
+                }
                 return;
             }
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex)
         {
-            // Keep the preview working without persistence.
+            // Settings persistence is best effort; a disposed store/session or a transient
+            // conflict must never surface from the property-changed fire-and-forget path.
+            _logService.Write("WARNING", $"无法保存编辑器阅读选项：{ex.Message}");
         }
         finally
         {
-            _previewOptionsGate.Release();
+            if (gateEntered)
+            {
+                try
+                {
+                    _previewOptionsGate.Release();
+                }
+                catch (ObjectDisposedException)
+                {
+                    // Shutdown can dispose the gate after the write acquired it.
+                }
+            }
+
+            MarkPreviewOptionsCompleted(tab);
         }
     }
+
+    private void MarkPreviewOptionsPending(FilePreviewTab tab)
+    {
+        lock (_pendingPreviewOptionsGate)
+        {
+            _pendingPreviewOptionWrites.TryGetValue(tab, out var count);
+            _pendingPreviewOptionWrites[tab] = count + 1;
+        }
+    }
+
+    private void MarkPreviewOptionsCompleted(FilePreviewTab tab)
+    {
+        lock (_pendingPreviewOptionsGate)
+        {
+            if (!_pendingPreviewOptionWrites.TryGetValue(tab, out var count) || count <= 1)
+            {
+                _pendingPreviewOptionWrites.Remove(tab);
+            }
+            else
+            {
+                _pendingPreviewOptionWrites[tab] = count - 1;
+            }
+        }
+    }
+
+    private bool HasPendingPreviewOptions(FilePreviewTab tab)
+    {
+        lock (_pendingPreviewOptionsGate)
+        {
+            return _pendingPreviewOptionWrites.ContainsKey(tab);
+        }
+    }
+
+    private sealed record PreviewOptionsSnapshot(
+        string LanguageId,
+        bool WordWrap,
+        bool ShowMinimap,
+        double FontSize,
+        bool ShowLineNumbers,
+        bool ShowIndentGuides,
+        bool ShowFoldingControls,
+        bool ShowStickyScroll,
+        bool MinimapRenderCharacters,
+        double MinimapWidth,
+        bool LineNumbersRelative,
+        double[]? RulerColumns);
 
     public async Task OpenDiffAsync(GitDiffRequest request)
     {
         ArgumentNullException.ThrowIfNull(request);
+        var context = request.WorkspaceContext ?? _workspaceService?.Current;
+        if (request.WorkspaceContext is not null && !IsWorkspaceContextCurrent(context)) return;
+        if (_workspaceService is not null && !IsWorkspaceRepositoryCurrent(context, request.RepositoryPath)) return;
         // Diff editors follow the same reading preference as the code preview (default 14), so the
         // inline/side-by-side editors no longer inherit the smaller window font size.
         var options = await EnsureReadingOptionsAsync();
@@ -518,6 +768,7 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
             EditorFontSize = options.FontSize > 0 ? options.FontSize : 14,
             FontFamily = options.FontFamily,
             DiffMode = diffOptions.DefaultLayout == DiffLayoutMode.SideBySide ? GitDiffMode.SideBySide : GitDiffMode.Inline,
+            IsLayoutManuallySelected = false,
             IsContextCollapsed = diffOptions.CollapseUnchangedContext,
             ShowIntralineChanges = diffOptions.ShowIntralineChanges,
             ShowOverviewRuler = diffOptions.ShowOverviewRuler,
@@ -529,16 +780,41 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
         };
         tab.HunkMutationCompleted += OnDiffHunkMutationCompleted;
         // diff 右键"在代码标签页打开文件"→ 在共享编辑器组打开该文件。
-        tab.OpenInCodeRequested += (_, _) => _ = OpenFileAsync(request.Path);
-        await OpenTabAsync(tab);
+        tab.OpenInCodeRequested += (_, _) => _ = OpenFileAsync(
+            request.Path,
+            expectedWorkspaceContext: request.WorkspaceContext ?? context);
+        if (!IsWorkspaceRepositoryCurrent(context, request.RepositoryPath))
+        {
+            tab.ReleaseResources();
+            return;
+        }
+
+        await OpenTabAsync(tab, workspaceContext: context);
     }
 
-    private async Task OpenTabAsync(EditorTabItem tab, bool promote = false)
+    private async Task OpenTabAsync(
+        EditorTabItem tab,
+        bool promote = false,
+        ProjectWorkspaceContext? workspaceContext = null)
     {
+        if (!IsWorkspaceContextCurrent(workspaceContext))
+        {
+            tab.ReleaseResources();
+            return;
+        }
+
         // 跨组去重:同一个 TabKey 只允许存在于一个组;再次打开时激活已有标签所在的组。
         var existing = Groups.FindTabByKey(tab.TabKey);
         if (existing is { } hit)
         {
+            // OpenFileAsync/OpenDiffAsync build a candidate before the cross-group lookup. Dispose
+            // that unused candidate (FilePreviewTab owns a theme subscription and debounce timer)
+            // so repeatedly opening an already-open file cannot leak a hidden cache entry.
+            if (tab is FilePreviewTab candidatePreview)
+            {
+                candidatePreview.PropertyChanged -= OnPreviewOptionChanged;
+            }
+            tab.ReleaseResources();
             // 双击再次打开(树双击/标签双击):已打开的预览直接转正为常驻标签。
             if (promote && hit.Tab is { IsPreview: true } existingPreview)
             {
@@ -576,7 +852,28 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
 
         group.Tabs.Add(tab);
         group.SelectedTab = tab;
-        await tab.LoadAsync();
+        try
+        {
+            await tab.LoadAsync();
+        }
+        finally
+        {
+            // The newly selected tab is protected by TrimOpenFilePayloadCache; older inactive
+            // tabs can be released immediately after its payload has become resident.
+            TrimOpenFilePayloadCache();
+        }
+
+        if (!IsWorkspaceContextCurrent(workspaceContext))
+        {
+            // The switch handler normally closes this tab. This fallback covers a switch that
+            // arrives after the handler's clear pass but before a slow document load completes.
+            MarkTabClosed(tab, workspaceContext, persist: workspaceContext is not null);
+            if (Groups.FindGroupContaining(tab) is { } owner)
+            {
+                owner.Tabs.Remove(tab);
+                if (ReferenceEquals(owner.SelectedTab, tab)) owner.SelectedTab = owner.SelectNextRecentlyActive();
+            }
+        }
     }
 
     /// <summary>激活已有标签所在的组并选中它(资源管理器 / Git 再次打开时的目标行为)。</summary>
@@ -630,12 +927,38 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
     /// 标签条留下不属于任何组、无法关闭的幽灵标签。</summary>
     private void MarkTabClosed(EditorTabItem tab)
     {
+        if (tab is FilePreviewTab preview)
+        {
+            preview.PropertyChanged -= OnPreviewOptionChanged;
+        }
+
         if (tab is DiffTab diffTab)
         {
             diffTab.HunkMutationCompleted -= OnDiffHunkMutationCompleted;
         }
 
-        _ = PersistReadingStateAsync(tab);
+        _ = PersistReadingStateSafelyAsync(tab, _workspaceService?.Current);
+        tab.IsClosed = true;
+        tab.ReleaseResources();
+    }
+
+    private void MarkTabClosed(EditorTabItem tab, ProjectWorkspaceContext? persistenceContext, bool persist)
+    {
+        if (tab is FilePreviewTab preview)
+        {
+            preview.PropertyChanged -= OnPreviewOptionChanged;
+        }
+
+        if (tab is DiffTab diffTab)
+        {
+            diffTab.HunkMutationCompleted -= OnDiffHunkMutationCompleted;
+        }
+
+        if (persist)
+        {
+            _ = PersistReadingStateSafelyAsync(tab, persistenceContext);
+        }
+
         tab.IsClosed = true;
         tab.ReleaseResources();
     }
@@ -651,10 +974,16 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
     /// <summary>关闭组内全部标签(释放资源;空组自动移除)。先清空选中再一次性清空集合,
     /// 避免逐个移除时投影把尚未移除的标签重新加回已清空的标签条。</summary>
     public void CloseAllTabsInGroup(EditorGroupViewModel group)
+        => CloseAllTabsInGroupCore(group, _workspaceService?.Current, persist: true);
+
+    private void CloseAllTabsInGroupCore(
+        EditorGroupViewModel group,
+        ProjectWorkspaceContext? persistenceContext,
+        bool persist)
     {
         foreach (var tab in group.Tabs.ToArray())
         {
-            MarkTabClosed(tab);
+            MarkTabClosed(tab, persistenceContext, persist);
         }
 
         group.SelectedTab = null;
@@ -664,13 +993,29 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
 
     [RelayCommand]
     public void CloseAllTabs()
+        => CloseAllTabsCore(_workspaceService?.Current, persist: true);
+
+    private void CloseAllTabsCore(ProjectWorkspaceContext? persistenceContext, bool persist)
     {
         foreach (var group in Groups.Groups.ToArray())
         {
-            CloseAllTabsInGroup(group);
+            CloseAllTabsInGroupCore(group, persistenceContext, persist);
         }
 
         // 全部关闭后收敛为单组(布局保持可用且简洁)。
+        if (Groups.GroupCount > 1)
+        {
+            Groups.ResetLayout();
+        }
+    }
+
+    private void CloseAllTabsInContext(ProjectWorkspaceContext? persistenceContext, bool persist)
+    {
+        foreach (var group in Groups.Groups.ToArray())
+        {
+            CloseAllTabsInGroupCore(group, persistenceContext, persist);
+        }
+
         if (Groups.GroupCount > 1)
         {
             Groups.ResetLayout();
@@ -741,6 +1086,7 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
     {
         if (SelectedTab is DiffTab diff)
         {
+            diff.IsLayoutManuallySelected = true;
             diff.DiffMode = diff.DiffMode == GitDiffMode.Inline ? GitDiffMode.SideBySide : GitDiffMode.Inline;
         }
     }
@@ -748,7 +1094,9 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
     private SettingsContext CurrentSettingsContext(string? languageId = null) =>
         new(_workspaceService?.Current?.ProjectPath, languageId);
 
-    private async Task<ISettingsSession> GetSettingsSessionAsync(string? languageId)
+    private async Task<ISettingsSession> GetSettingsSessionAsync(
+        string? languageId,
+        ProjectWorkspaceContext? workspaceContext = null)
     {
         var key = languageId ?? "<all>";
         if (_languageSessions.TryGetValue(key, out var existing)) return existing;
@@ -756,7 +1104,7 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
         {
             // 语言会话与 <all> 会话并存:设置服务按会话上下文过滤变更,语言会话收不到
             // "所有语言"提交;先建立 <all> 会话作为"所有语言"变更的入口(见 OnAllLanguagesSettingsChangedAsync)。
-            _ = await GetSettingsSessionAsync(null);
+            _ = await GetSettingsSessionAsync(null, workspaceContext);
         }
 
         var keys = new[]
@@ -776,14 +1124,17 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
             // 界面缩放变化 → 重建阅读选项,使源码/Diff 读者字号实时跟随缩放倍率。
             BuiltInSettingsCatalog.UiScale.Id,
         };
-        var session = await _settingsService!.OpenSessionAsync(CurrentSettingsContext(languageId), keys);
+        var settingsContext = workspaceContext is null
+            ? CurrentSettingsContext(languageId)
+            : new SettingsContext(workspaceContext.ProjectPath, languageId);
+        var session = await _settingsService!.OpenSessionAsync(settingsContext, keys);
         if (languageId is null)
         {
-            session.Changed += (_, _) => _ = OnAllLanguagesSettingsChangedAsync(session);
+            session.Changed += (_, _) => _ = OnAllLanguagesSettingsChangedSafelyAsync(session);
         }
         else
         {
-            session.Changed += (_, _) => ApplySettingsSnapshot(session.Current!);
+            session.Changed += (_, _) => _ = ApplyLanguageSettingsSafelyAsync(session);
         }
 
         _languageSessions[key] = session;
@@ -794,119 +1145,337 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
     /// 必须显式刷新快照,否则语言会话会把变更前的旧快照当作 Current(旧值覆盖新值)。</summary>
     private async Task OnAllLanguagesSettingsChangedAsync(ISettingsSession allSession)
     {
-        if (allSession.Current is not { } snapshot) return;
-        ApplySettingsSnapshot(snapshot);
-        _cachedReadingOptions = null;
-        _cachedDiffOptions = null;
-        foreach (var session in _languageSessions.Values)
+        await _settingsNotificationGate.WaitAsync().ConfigureAwait(false);
+        try
         {
-            if (session.Context.LanguageId is null) continue;
-            try
+            if (allSession.Current is not { } snapshot) return;
+            await ApplySettingsSnapshotAsync(snapshot);
+            _cachedReadingOptions = null;
+            _cachedDiffOptions = null;
+            foreach (var session in _languageSessions.Values)
             {
-                ApplySettingsSnapshot(await session.RefreshAsync());
+                if (session.Context.LanguageId is null) continue;
+                try
+                {
+                    await ApplySettingsSnapshotAsync(await session.RefreshAsync());
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
+                {
+                    // 某一语言的设置文件暂不可读时保留其余语言的应用结果。
+                }
             }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
-            {
-                // 某一语言的设置文件暂不可读时保留其余语言的应用结果。
-            }
+        }
+        finally
+        {
+            _settingsNotificationGate.Release();
         }
     }
 
-    private void ApplySettingsSnapshot(SettingsSnapshot snapshot)
+    private async Task ApplySettingsSnapshotAsync(SettingsSnapshot snapshot)
     {
-        if (!_settingsRevisionGate.TryAccept(snapshot)) return;
-        void Apply()
+        await _settingsApplyGate.WaitAsync().ConfigureAwait(false);
+        try
         {
-            _applyingSettings = true;
-            try
+            if (_workspaceService is not null)
             {
-                _editorLimitEnabled = snapshot.Effective(BuiltInSettingsCatalog.EditorLimitEnabled);
-                _maxOpenTabs = snapshot.Effective(BuiltInSettingsCatalog.EditorLimitValue);
-                _enablePreviewTabs = snapshot.Effective(BuiltInSettingsCatalog.EnablePreview);
-                var code = SettingsOptionsMapper.CodeReading(snapshot);
-                foreach (var tab in Groups.AllTabs.OfType<FilePreviewTab>().Where(tab =>
-                             snapshot.Context.LanguageId is null ||
-                             string.Equals(tab.FileType.LanguageId, snapshot.Context.LanguageId, StringComparison.OrdinalIgnoreCase)))
+                var snapshotWorkspace = snapshot.Context.NormalizedWorkspacePath;
+                var currentWorkspace = _workspaceService.Current?.ProjectPath;
+                if (snapshotWorkspace is null
+                    ? currentWorkspace is not null
+                    : !PathsEqual(snapshotWorkspace, currentWorkspace))
                 {
-                    tab.WordWrap = code.WordWrap;
-                    tab.ShowMinimap = code.ShowMinimap;
-                    tab.FontSize = code.FontSize;
-                    tab.FontFamily = code.FontFamily;
-                    tab.ShowLineNumbers = code.ShowLineNumbers;
-                    tab.ShowIndentGuides = code.ShowIndentGuides;
-                    tab.ShowFoldingControls = code.ShowFoldingControls;
-                    tab.ShowStickyScroll = code.StickyScroll;
-                    tab.MinimapRenderCharacters = code.MinimapRenderCharacters;
-                    tab.MinimapWidth = code.MinimapWidth;
-                    tab.LineNumbersRelative = code.LineNumbersRelative;
-                    tab.RulerColumns = code.RulerColumns;
+                    return;
                 }
-                if (snapshot.Context.LanguageId is null)
+            }
+
+            if (!_settingsRevisionGate.TryAccept(snapshot)) return;
+            void Apply()
+            {
+                if (_workspaceService is not null)
                 {
-                    var diff = SettingsOptionsMapper.Diff(snapshot);
-                    foreach (var tab in Groups.AllTabs.OfType<DiffTab>())
+                    var snapshotWorkspace = snapshot.Context.NormalizedWorkspacePath;
+                    var currentWorkspace = _workspaceService.Current?.ProjectPath;
+                    if (snapshotWorkspace is null
+                        ? currentWorkspace is not null
+                        : !PathsEqual(snapshotWorkspace, currentWorkspace))
                     {
-                        tab.EditorFontSize = code.FontSize;
-                        tab.FontFamily = code.FontFamily;
-                        tab.DiffMode = diff.DefaultLayout == DiffLayoutMode.SideBySide ? GitDiffMode.SideBySide : GitDiffMode.Inline;
-                        tab.IsContextCollapsed = diff.CollapseUnchangedContext;
-                        tab.ShowIntralineChanges = diff.ShowIntralineChanges;
-                        tab.ShowOverviewRuler = diff.ShowOverviewRuler;
-                        tab.SynchronizeScrolling = diff.SynchronizeScrolling;
-                        tab.UseInlineWhenNarrow = diff.UseInlineWhenNarrow;
-                        tab.IgnoreTrimWhitespace = diff.IgnoreWhitespaceEndOfLine;
+                        return;
                     }
                 }
-                // 降低标签上限:只回收预览标签,常驻/固定标签不因设置变化被强制关闭。
-                if (_editorLimitEnabled)
-                {
-                    foreach (var group in Groups.Groups)
-                    {
-                        while (group.Tabs.Count > _maxOpenTabs)
-                        {
-                            if (group.EvictLeastRecentlyUsedPreview() is not { } preview)
-                            {
-                                break;
-                            }
 
-                            MarkTabClosed(preview);
-                            group.Tabs.Remove(preview);
+                _applyingSettings = true;
+                try
+                {
+                    _editorLimitEnabled = snapshot.Effective(BuiltInSettingsCatalog.EditorLimitEnabled);
+                    _maxOpenTabs = snapshot.Effective(BuiltInSettingsCatalog.EditorLimitValue);
+                    _enablePreviewTabs = snapshot.Effective(BuiltInSettingsCatalog.EnablePreview);
+                    var code = SettingsOptionsMapper.CodeReading(snapshot);
+                    foreach (var tab in Groups.AllTabs.OfType<FilePreviewTab>().Where(tab =>
+                                 snapshot.Context.LanguageId is null ||
+                                 string.Equals(tab.FileType.LanguageId, snapshot.Context.LanguageId, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        // An earlier write can publish its settings snapshot while newer local option
+                        // changes are still queued. Keep the live tab as the local source of truth
+                        // until its final captured snapshot has been persisted.
+                        if (HasPendingPreviewOptions(tab)) continue;
+                        tab.WordWrap = code.WordWrap;
+                        tab.ShowMinimap = code.ShowMinimap;
+                        tab.FontSize = code.FontSize;
+                        tab.FontFamily = code.FontFamily;
+                        tab.ShowLineNumbers = code.ShowLineNumbers;
+                        tab.ShowIndentGuides = code.ShowIndentGuides;
+                        tab.ShowFoldingControls = code.ShowFoldingControls;
+                        tab.ShowStickyScroll = code.StickyScroll;
+                        tab.MinimapRenderCharacters = code.MinimapRenderCharacters;
+                        tab.MinimapWidth = code.MinimapWidth;
+                        tab.LineNumbersRelative = code.LineNumbersRelative;
+                        tab.RulerColumns = code.RulerColumns;
+                    }
+                    if (snapshot.Context.LanguageId is null)
+                    {
+                        var diff = SettingsOptionsMapper.Diff(snapshot);
+                        foreach (var tab in Groups.AllTabs.OfType<DiffTab>())
+                        {
+                            tab.EditorFontSize = code.FontSize;
+                            tab.FontFamily = code.FontFamily;
+                            tab.DiffMode = diff.DefaultLayout == DiffLayoutMode.SideBySide ? GitDiffMode.SideBySide : GitDiffMode.Inline;
+                            tab.IsContextCollapsed = diff.CollapseUnchangedContext;
+                            tab.ShowIntralineChanges = diff.ShowIntralineChanges;
+                            tab.ShowOverviewRuler = diff.ShowOverviewRuler;
+                            tab.SynchronizeScrolling = diff.SynchronizeScrolling;
+                            tab.UseInlineWhenNarrow = diff.UseInlineWhenNarrow;
+                            tab.IgnoreTrimWhitespace = diff.IgnoreWhitespaceEndOfLine;
+                        }
+                    }
+                    // 降低标签上限:只回收预览标签,常驻/固定标签不因设置变化被强制关闭。
+                    if (_editorLimitEnabled)
+                    {
+                        foreach (var group in Groups.Groups)
+                        {
+                            while (group.Tabs.Count > _maxOpenTabs)
+                            {
+                                if (group.EvictLeastRecentlyUsedPreview() is not { } preview)
+                                {
+                                    break;
+                                }
+
+                                MarkTabClosed(preview);
+                                group.Tabs.Remove(preview);
+                            }
                         }
                     }
                 }
+                finally { _applyingSettings = false; }
             }
-            finally { _applyingSettings = false; }
+
+            if (_uiContext is null || ReferenceEquals(SynchronizationContext.Current, _uiContext))
+            {
+                Apply();
+            }
+            else
+            {
+                var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                _uiContext.Post(_ =>
+                {
+                    try
+                    {
+                        Apply();
+                        completion.TrySetResult();
+                    }
+                    catch (Exception ex)
+                    {
+                        completion.TrySetException(ex);
+                    }
+                }, null);
+                await completion.Task.ConfigureAwait(false);
+            }
         }
-        var dispatcher = System.Windows.Application.Current?.Dispatcher;
-        if (dispatcher is null || dispatcher.CheckAccess()) Apply();
-        else _ = dispatcher.BeginInvoke(Apply);
+        finally
+        {
+            _settingsApplyGate.Release();
+        }
     }
 
     private async Task OnWorkspaceSettingsContextChangedAsync(ProjectWorkspaceContext? context)
     {
+        _workspaceContextBoundaryEnabled = true;
+        var previous = _activeWorkspaceContext;
+        _activeWorkspaceContext = context;
+        var switchCancellation = ReplaceWorkspaceSwitchCancellation();
+
+        // Current is already the new context when this event is raised. Flush the old editor state
+        // with its explicit key before replacing the shared tab tree; never infer the key from the
+        // mutable workspace service during this transition.
+        if (previous is not null && !ReferenceEquals(previous, context))
+        {
+            await FlushWorkspaceStateAsync(previous, CancellationToken.None);
+        }
+
+        if (!IsWorkspaceContextCurrent(context))
+        {
+            return;
+        }
+
+        var persistenceSuppressed = _suppressWorkspacePersistence;
+        _suppressWorkspacePersistence = true;
+        try
+        {
+            // A workspace with no saved layout must still start with an empty editor. Otherwise the
+            // previous project's tabs remain visible in the newly selected project.
+            CloseAllTabsInContext(previous, persist: previous is not null);
+        }
+        finally
+        {
+            _suppressWorkspacePersistence = persistenceSuppressed;
+        }
+
         foreach (var session in _languageSessions.Values) await session.DisposeAsync();
         _languageSessions.Clear();
         _cachedReadingOptions = null;
         _cachedDiffOptions = null;
+
+        if (context is null)
+        {
+            return;
+        }
+
         foreach (var language in Groups.AllTabs.OfType<FilePreviewTab>().Select(tab => tab.FileType.LanguageId).Distinct())
-            ApplySettingsSnapshot((await GetSettingsSessionAsync(language)).Current!);
-        ApplySettingsSnapshot((await GetSettingsSessionAsync(null)).Current!);
+        {
+            var session = await GetSettingsSessionAsync(language);
+            if (!IsWorkspaceContextCurrent(context) || switchCancellation.IsCancellationRequested) return;
+            await ApplySettingsSnapshotAsync(session.Current!);
+        }
+
+        var allSession = await GetSettingsSessionAsync(null);
+        if (!IsWorkspaceContextCurrent(context) || switchCancellation.IsCancellationRequested) return;
+        await ApplySettingsSnapshotAsync(allSession.Current!);
         // 启动自动恢复工作区时不回放编辑器文件标签(源码文件不随启动自动打开);
         // 用户主动激活工作区时仍按保存的布局恢复。
         if (_workspaceService?.IsStartupAutoRestore is not true)
         {
-            await RestoreRecentTabsAsync(context?.ProjectPath);
+            try
+            {
+                await RestoreRecentTabsAsync(context, switchCancellation);
+            }
+            catch (OperationCanceledException) when (switchCancellation.IsCancellationRequested)
+            {
+                // A newer context owns the editor now; cancellation is an expected switch result.
+            }
+        }
+    }
+
+    private async Task OnAllLanguagesSettingsChangedSafelyAsync(ISettingsSession session)
+    {
+        try
+        {
+            await OnAllLanguagesSettingsChangedAsync(session);
+        }
+        catch (Exception ex)
+        {
+            _logService.Write("WARNING", $"应用编辑器设置失败：{ex.Message}");
+        }
+    }
+
+    private async Task ApplyLanguageSettingsSafelyAsync(ISettingsSession session)
+    {
+        await _settingsNotificationGate.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            if (session.Current is { } snapshot)
+            {
+                await ApplySettingsSnapshotAsync(snapshot);
+            }
+        }
+        catch (Exception ex)
+        {
+            _logService.Write("WARNING", $"应用语言编辑器设置失败：{ex.Message}");
+        }
+        finally
+        {
+            _settingsNotificationGate.Release();
+        }
+    }
+
+    private CancellationToken ReplaceWorkspaceSwitchCancellation()
+    {
+        var next = new CancellationTokenSource();
+        var previous = Interlocked.Exchange(ref _workspaceSwitchCancellation, next);
+        previous?.Cancel();
+        previous?.Dispose();
+        return next.Token;
+    }
+
+    private bool IsWorkspaceContextCurrent(ProjectWorkspaceContext? context)
+    {
+        // The lightweight constructors are also used by editor-only tests and by embedders that
+        // do not participate in the workbench context service. In that mode there is no context
+        // boundary to validate.
+        if (_workspaceService is null || !_workspaceContextBoundaryEnabled) return true;
+        return ReferenceEquals(_workspaceService.Current, context)
+            && ReferenceEquals(_activeWorkspaceContext, context);
+    }
+
+    private bool IsWorkspaceRepositoryCurrent(ProjectWorkspaceContext? context, string repositoryPath)
+    {
+        if (_workspaceService is null || !_workspaceContextBoundaryEnabled) return true;
+        return IsWorkspaceContextCurrent(context)
+            && context?.GitRepositoryPath is { } currentRepository
+            && PathsEqual(currentRepository, repositoryPath);
+    }
+
+    private static bool PathsEqual(string? left, string? right)
+    {
+        if (string.IsNullOrWhiteSpace(left) || string.IsNullOrWhiteSpace(right)) return false;
+        try
+        {
+            var normalizedLeft = Path.GetFullPath(left)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var normalizedRight = Path.GetFullPath(right)
+                .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            return string.Equals(normalizedLeft, normalizedRight, StringComparison.OrdinalIgnoreCase);
+        }
+        catch (ArgumentException)
+        {
+            return string.Equals(left, right, StringComparison.OrdinalIgnoreCase);
+        }
+    }
+
+    private async Task FlushWorkspaceStateAsync(ProjectWorkspaceContext context, CancellationToken cancellationToken)
+    {
+        if (_stateStore is null) return;
+
+        try
+        {
+            foreach (var tab in Groups.AllTabs.ToArray())
+            {
+                tab.IsActive = false;
+                await PersistReadingStateAsync(tab, context, cancellationToken);
+            }
+
+            await _stateStore.CommitAsync(new([
+                new(ApplicationStateField.WorkspaceEditorLayout, Groups.CaptureLayout(), context.ProjectPath),
+                new(ApplicationStateField.WorkspaceRecentTabs, Groups.AllTabs.Select(tab => tab.TabKey).ToArray(), context.ProjectPath),
+                new(ApplicationStateField.WorkspaceActiveEditor, SelectedTab?.TabKey, context.ProjectPath),
+            ]), cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logService.Write("WARNING", $"无法保存工作区编辑器状态：{ex.Message}");
         }
     }
 
     /// <summary>工作区切换/启动时恢复编辑器布局:优先恢复 v2 布局树;旧状态文件(
     /// 只有 <c>RecentTabs</c> / <c>ActiveEditor</c>)无损迁移为单编辑器组。</summary>
-    private async Task RestoreRecentTabsAsync(string? workspace)
+    private async Task RestoreRecentTabsAsync(ProjectWorkspaceContext context, CancellationToken cancellationToken)
     {
-        if (_stateStore is null || string.IsNullOrWhiteSpace(workspace)) return;
-        workspace = Path.GetFullPath(workspace).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-        if (!_restoredWorkspaceTabs.Add(workspace)) return;
-        var state = await _stateStore.LoadAsync();
+        if (_stateStore is null || string.IsNullOrWhiteSpace(context.ProjectPath)) return;
+        var workspace = Path.GetFullPath(context.ProjectPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var state = await _stateStore.LoadAsync(cancellationToken);
+        if (!IsWorkspaceContextCurrent(context) || cancellationToken.IsCancellationRequested) return;
         var saved = state.Workspaces?.FirstOrDefault(item => string.Equals(item.Key, workspace,
             StringComparison.OrdinalIgnoreCase)).Value;
         if (saved is null) return;
@@ -921,10 +1490,7 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
             // 置 IsClosed、释放载荷)。否则旧标签脱离任何组但 IsClosed 未置位,工作台条带会
             // 留下永远无法关闭的幽灵标签(投影只清理已关闭且离组的标签;CloseTab 对无主标签
             // 过去会静默失败)。
-            if (Groups.AllTabs.Any())
-            {
-                CloseAllTabs();
-            }
+            if (Groups.AllTabs.Any()) CloseAllTabsInContext(context, persist: false);
 
             if (saved.EditorLayout is { } layout)
             {
@@ -946,7 +1512,9 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
                 Groups.ReplaceWithSingleGroup(tabs, saved.ActiveEditor);
             }
 
-            await ApplyRestoredReadingOptionsAsync();
+            if (!IsWorkspaceContextCurrent(context) || cancellationToken.IsCancellationRequested) return;
+            await ApplyRestoredReadingOptionsAsync(context, cancellationToken);
+            if (!IsWorkspaceContextCurrent(context) || cancellationToken.IsCancellationRequested) return;
             // 恢复出的文件标签同样进入监听集合(防御性差量同步;常规路径已由 TabsChanged 覆盖)。
             SyncFileWatcher();
         }
@@ -1027,11 +1595,16 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
 
     /// <summary>恢复完成后应用阅读偏好(字号/折行等)与阅读位置。恢复出的标签一律不预加载:
     /// 内容解码推迟到用户首次交互(点标签/点编辑区/换选标签),启动关键路径只保留轻量布局恢复。</summary>
-    private async Task ApplyRestoredReadingOptionsAsync()
+    private async Task ApplyRestoredReadingOptionsAsync(
+        ProjectWorkspaceContext context,
+        CancellationToken cancellationToken)
     {
         foreach (var preview in Groups.AllTabs.OfType<FilePreviewTab>())
         {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!IsWorkspaceContextCurrent(context)) return;
             var options = await EnsureReadingOptionsAsync(preview.FileType.LanguageId);
+            if (!IsWorkspaceContextCurrent(context)) return;
             preview.WordWrap = options.WordWrap;
             preview.ShowMinimap = options.ShowMinimap;
             preview.FontSize = options.FontSize > 0 ? options.FontSize : 14;
@@ -1039,13 +1612,21 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
             preview.ShowLineNumbers = options.ShowLineNumbers;
             preview.ShowIndentGuides = options.ShowIndentGuides;
             preview.ShowFoldingControls = options.ShowFoldingControls;
+            preview.ShowStickyScroll = options.StickyScroll;
+            preview.MinimapRenderCharacters = options.MinimapRenderCharacters;
+            preview.MinimapWidth = options.MinimapWidth;
+            preview.LineNumbersRelative = options.LineNumbersRelative;
+            preview.RulerColumns = options.RulerColumns;
             preview.PropertyChanged += OnPreviewOptionChanged;
-            await RestoreReadingStateAsync(preview);
+            await RestoreReadingStateAsync(preview, context, cancellationToken);
         }
 
         foreach (var diff in Groups.AllTabs.OfType<DiffTab>())
         {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!IsWorkspaceContextCurrent(context)) return;
             var options = await EnsureReadingOptionsAsync();
+            if (!IsWorkspaceContextCurrent(context)) return;
             var diffOptions = _cachedDiffOptions ?? new DiffReadingOptions();
             diff.EditorFontSize = options.FontSize > 0 ? options.FontSize : 14;
             diff.FontFamily = options.FontFamily;
@@ -1064,15 +1645,25 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
     /// <summary>结构变化(拆分/移动/关闭/比例)后即时持久化布局,重启同工作区可恢复。</summary>
     private void PersistLayoutAsync()
     {
-        if (_stateStore is null || _workspaceService?.Current?.ProjectPath is not { } workspace)
+        if (_suppressWorkspacePersistence || _stateStore is null || _workspaceService?.Current is not { } context)
         {
             return;
         }
 
-        _ = PersistLayoutCoreAsync(workspace);
+        // Capture the layout synchronously with the context. The commit itself is asynchronous and
+        // may execute after a project switch; reading Groups inside that delayed task would then
+        // overwrite the old project's saved layout with the new project's tabs.
+        var layout = Groups.CaptureLayout();
+        var recentTabs = Groups.AllTabs.Select(tab => tab.TabKey).ToArray();
+        var activeEditor = SelectedTab?.TabKey;
+        _ = PersistLayoutCoreAsync(context.ProjectPath, layout, recentTabs, activeEditor);
     }
 
-    private async Task PersistLayoutCoreAsync(string workspace)
+    private async Task PersistLayoutCoreAsync(
+        string workspace,
+        EditorLayoutState layout,
+        IReadOnlyList<string> recentTabs,
+        string? activeEditor)
     {
         try
         {
@@ -1083,21 +1674,26 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
             }
 
             await store.CommitAsync(new([
-                new(ApplicationStateField.WorkspaceEditorLayout, Groups.CaptureLayout(), workspace),
-                new(ApplicationStateField.WorkspaceRecentTabs, Groups.AllTabs.Select(tab => tab.TabKey).ToArray(), workspace),
-                new(ApplicationStateField.WorkspaceActiveEditor, SelectedTab?.TabKey, workspace),
+                new(ApplicationStateField.WorkspaceEditorLayout, layout, workspace),
+                new(ApplicationStateField.WorkspaceRecentTabs, recentTabs, workspace),
+                new(ApplicationStateField.WorkspaceActiveEditor, activeEditor, workspace),
             ]));
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex)
         {
             // 布局持久化是尽力而为,失败不影响编辑器使用。
+            _logService.Write("WARNING", $"无法保存编辑器布局：{ex.Message}");
         }
     }
 
-    private async Task RestoreReadingStateAsync(FilePreviewTab tab)
+    private async Task RestoreReadingStateAsync(
+        FilePreviewTab tab,
+        ProjectWorkspaceContext? workspaceContext,
+        CancellationToken cancellationToken = default)
     {
-        if (_stateStore is null || _workspaceService?.Current?.ProjectPath is not { } workspace) return;
-        var state = await _stateStore.LoadAsync();
+        if (_stateStore is null || workspaceContext?.ProjectPath is not { } workspace) return;
+        var state = await _stateStore.LoadAsync(cancellationToken);
+        if (!IsWorkspaceContextCurrent(workspaceContext) || cancellationToken.IsCancellationRequested) return;
         var workspaceKey = Path.GetFullPath(workspace).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
         var saved = state.Workspaces?.FirstOrDefault(item => string.Equals(item.Key, workspaceKey,
             StringComparison.OrdinalIgnoreCase)).Value;
@@ -1114,9 +1710,12 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
         tab.MarkdownHeadingLine = reading.MarkdownHeadingLine;
     }
 
-    private Task PersistReadingStateAsync(EditorTabItem tab)
+    private Task PersistReadingStateAsync(
+        EditorTabItem tab,
+        ProjectWorkspaceContext? workspaceContext,
+        CancellationToken cancellationToken = default)
     {
-        if (_stateStore is null || _workspaceService?.Current?.ProjectPath is not { } workspace ||
+        if (_stateStore is null || workspaceContext?.ProjectPath is not { } workspace ||
             tab is not FilePreviewTab preview || preview.ViewState is not { } viewState) return Task.CompletedTask;
         var reading = new EditorReadingState(viewState.VerticalOffset, viewState.CaretLine, viewState.CaretColumn,
             ExpandedRegions: viewState.FoldedOffsets?.ToArray(), SearchText: preview.SearchText,
@@ -1125,32 +1724,63 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
             MarkdownHeadingLine: preview.MarkdownHeadingLine);
         return _stateStore.CommitAsync(new([
             new(ApplicationStateField.WorkspaceReadingState, reading, workspace, preview.Path),
-        ]));
+        ]), cancellationToken);
+    }
+
+    /// <summary>关闭/替换标签时的后台阅读状态写入边界。状态保存不应把异常留在未观察的
+    /// Task 上，尤其是应用退出时状态存储可能已经开始释放。</summary>
+    private async Task PersistReadingStateSafelyAsync(
+        EditorTabItem tab,
+        ProjectWorkspaceContext? workspaceContext)
+    {
+        try
+        {
+            await PersistReadingStateAsync(tab, workspaceContext);
+        }
+        catch (Exception ex)
+        {
+            _logService.Write("WARNING", $"无法保存文件阅读状态：{ex.Message}");
+        }
     }
 
     public async Task FlushAsync(CancellationToken cancellationToken = default)
     {
-        if (_stateStore is null || _workspaceService?.Current?.ProjectPath is not { } workspace) return;
-        foreach (var tab in Groups.AllTabs.ToArray())
-        {
-            tab.IsActive = false;
-            await PersistReadingStateAsync(tab);
-        }
+        // Option changes are intentionally saved in the background during interaction. Shutdown
+        // and tests need a real completion boundary so the last captured snapshot cannot be left
+        // behind or observed halfway through the serialized write queue.
+        await _previewOptionsGate.WaitAsync(cancellationToken);
+        _previewOptionsGate.Release();
 
-        await _stateStore.CommitAsync(new([
-            new(ApplicationStateField.WorkspaceEditorLayout, Groups.CaptureLayout(), workspace),
-            new(ApplicationStateField.WorkspaceRecentTabs, Groups.AllTabs.Select(tab => tab.TabKey).ToArray(), workspace),
-            new(ApplicationStateField.WorkspaceActiveEditor, SelectedTab?.TabKey, workspace),
-        ]), cancellationToken);
+        if (_workspaceService?.Current is not { } context) return;
+        await FlushWorkspaceStateAsync(context, cancellationToken);
     }
 
     public void Dispose()
     {
+        var workspaceSwitchCancellation = Interlocked.Exchange(ref _workspaceSwitchCancellation, null);
+        workspaceSwitchCancellation?.Cancel();
+        workspaceSwitchCancellation?.Dispose();
+        if (_workspaceService is not null)
+        {
+            _workspaceService.ContextChanged -= OnWorkspaceSettingsContextChangedAsync;
+        }
+
+        // DI disposal can happen while the workbench still holds the tab view-models. Release
+        // their payloads explicitly so closing the application does not leave decoded text,
+        // Markdown results or diff buffers reachable through those stale UI references.
+        foreach (var tab in Groups.AllTabs.ToArray())
+        {
+            tab.IsClosed = true;
+            tab.ReleaseResources();
+        }
+
         _fileContentWatcher.FileChanged -= OnFileChanged;
         _repositoryWatcher.ChangesDetected -= OnRepositoryChangesDetected;
         _fileContentWatcher.Dispose();
         _watchedFilePaths.Clear();
-        _previewOptionsGate.Dispose();
+        // Background option writes are deliberately fire-and-forget. Do not dispose the gate
+        // while one of those continuations may still be waiting; the gate is reclaimed with this
+        // view model after the pending task observes the shutdown/store failure.
     }
 
 }
@@ -1163,7 +1793,8 @@ public enum EditorFoldRequest
     ToLevel,
 }
 
-/// <summary>One open tab in the shared editor group. Content is loaded lazily on first activation.</summary>
+/// <summary>One open tab in the shared editor group. Content is loaded lazily on first activation
+/// and a file tab may evict its large payload while keeping its lightweight identity open.</summary>
 public abstract partial class EditorTabItem : ObservableObject
 {
     protected EditorTabItem(string path)
@@ -1277,7 +1908,8 @@ public abstract partial class EditorTabItem : ObservableObject
 
 /// <summary>Read-only content preview for files opened from the explorer. Capped so opening a large
 /// repository never fills the managed heap; decoding rides the shared <see cref="TextDocumentDecoder"/>
-/// (BOM / strict UTF-8 / GB18030 fallback), so legacy-encoded sources do not garble.</summary>
+/// (BOM / strict UTF-8 / GB18030 fallback), so legacy-encoded sources do not garble. The editor
+/// may release the payload of an inactive tab and load it again when selected.</summary>
 public sealed partial class FilePreviewTab : EditorTabItem
 {
     private const long PreviewLimit = ReadOnlyContentCapacity.FullSourceBytes;
@@ -1292,6 +1924,9 @@ public sealed partial class FilePreviewTab : EditorTabItem
     private CodeSymbolDocument _symbolDocument = CodeSymbolDocument.Empty;
     private readonly List<CodeSymbolNode> _wiredSymbolNodes = [];
     private Task? _loadTask;
+    private bool _payloadUnloaded;
+    private bool _resourcesReleased;
+    private int _pipelineActive;
     private CancellationTokenSource? _presentationCancellation;
     private CancellationTokenSource? _markdownCancellation;
     private CancellationTokenSource? _derivedCancellation;
@@ -1328,6 +1963,14 @@ public sealed partial class FilePreviewTab : EditorTabItem
     /// pipeline, so rapid saves apply the latest content only and stale reads cannot interleave.</summary>
     private readonly SemaphoreSlim _reloadGate = new(1, 1);
 
+    /// <summary>Serializes window publication with source replacement/disposal. Navigation requests
+    /// also cancel the previous request and carry a monotonically increasing id, so an older read
+    /// can neither overwrite a newer window nor calculate a local line against the wrong start.</summary>
+    private readonly SemaphoreSlim _windowLoadGate = new(1, 1);
+    private readonly object _windowRequestGate = new();
+    private CancellationTokenSource? _windowCancellation;
+    private int _windowRequestVersion;
+
     /// <summary>Monotonic content version shared by the initial load and every reload. Each pass
     /// captures it on entry and only the *current* version may publish, so an old decode (or the
     /// initial load racing a reload) can never overwrite newer content.</summary>
@@ -1336,6 +1979,10 @@ public sealed partial class FilePreviewTab : EditorTabItem
     /// <summary>延迟重试调度:文件暂时不可读(写入中/锁定/已删除)时周期性重试,恢复后自动刷新。</summary>
     private static readonly TimeSpan ReloadRetryDelay = TimeSpan.FromMilliseconds(300);
     private CancellationTokenSource? _reloadRetryCancellation;
+
+    private const long DocumentSourceBaseMemoryBytes = 32L * 1024;
+    private const long DocumentSourceCheckpointBytes = 32L;
+    private const int DocumentSourceCheckpointStride = 256;
 
     public FilePreviewTab(string path) : this(path, TextDocumentDecoder.Instance, CodeFileTypeRegistry.Instance, TextSearchService.Instance, CodeOutlineParser.Instance, CodeFoldingStrategy.Instance, CodeSymbolAnalyzer.Instance)
     {
@@ -2137,17 +2784,131 @@ public sealed partial class FilePreviewTab : EditorTabItem
     [RelayCommand]
     private void FoldToLevel(int level) => FoldRequested?.Invoke(this, (EditorFoldRequest.ToLevel, level));
 
-    /// <summary>True once the preview has been attempted, so activation never re-reads the file.</summary>
-    public bool IsLoadFinished => _loadTask?.IsCompleted == true;
+    /// <summary>True once the preview payload is resident and its initial load has completed. A
+    /// cache-evicted tab deliberately becomes false again so activation reads the latest file.</summary>
+    public bool IsLoadFinished => !_payloadUnloaded && _loadTask?.IsCompleted == true;
+
+    /// <summary>True when the decoded/derived payload is resident and no load or reload pass is
+    /// still publishing it. The editor cache uses this as its eviction eligibility gate.</summary>
+    internal bool IsPayloadLoaded => !IsClosed
+        && !_payloadUnloaded
+        && _loadTask?.IsCompleted == true
+        && Volatile.Read(ref _pipelineActive) == 0;
+
+    /// <summary>Approximate managed bytes retained by this tab's source payload. It intentionally
+    /// overestimates the text plus common derived projections; it is accounting for eviction, not
+    /// a profiler reading. Large file checkpoints are included even when the visible window is small.</summary>
+    internal long RetainedMemoryBytes
+    {
+        get
+        {
+            var estimate = checked((long)Content.Length * 4L); // UTF-16 text + derived projections
+            if (_documentSource is not null)
+            {
+                var checkpoints = Math.Max(1L, ((long)Math.Max(1, LineCount) / DocumentSourceCheckpointStride) + 1);
+                estimate = checked(estimate
+                    + DocumentSourceBaseMemoryBytes
+                    + checkpoints * DocumentSourceCheckpointBytes);
+            }
+
+            return estimate;
+        }
+    }
 
     /// <summary>One shared load task: the editor activates tabs both eagerly (OpenTabAsync awaits) and
     /// from the selection-changed handler, so a single task guarantees every caller observes the same
     /// finished state instead of racing two file reads.</summary>
-    public override Task LoadAsync() => _loadTask ??= RunContentPipelineAsync(initialLoad: true);
+    public override Task LoadAsync()
+    {
+        if (IsClosed || _resourcesReleased)
+        {
+            return Task.CompletedTask;
+        }
+
+        if (_loadTask is { IsCompleted: false } loading)
+        {
+            return loading;
+        }
+
+        // A completed task remains cached after a failed initial read. Only an explicit payload
+        // eviction is allowed to replace it and trigger a fresh lazy read.
+        if (_loadTask is not null && !_payloadUnloaded)
+        {
+            return _loadTask;
+        }
+
+        _payloadUnloaded = false;
+        _loadTask = RunContentPipelineAsync(initialLoad: true);
+        OnPropertyChanged(nameof(IsLoadFinished));
+        OnPropertyChanged(nameof(IsPayloadLoaded));
+        return _loadTask;
+    }
 
     /// <summary>外部变更重载:文件事件(保存/替换/创建/删除/重命名)后重新读取,所有已打开的预览
     /// (包括非活动标签)都经此串行化重载。只有最新一次请求运行解码管线,旧任务不得覆盖新内容。</summary>
-    public Task ReloadAsync() => RunContentPipelineAsync(initialLoad: false);
+    public Task ReloadAsync() => IsClosed || _resourcesReleased || _payloadUnloaded
+        ? Task.CompletedTask
+        : RunContentPipelineAsync(initialLoad: false);
+
+    internal void UnloadContentForCache()
+    {
+        if (IsClosed || _resourcesReleased || _payloadUnloaded || !IsLoadFinished
+            || Volatile.Read(ref _pipelineActive) != 0 || RetainedMemoryBytes <= 0)
+        {
+            return;
+        }
+
+        // Invalidate all workers before clearing their inputs. ContentUpdating runs while the
+        // payload is still considered loaded, allowing the visible view to capture its position.
+        _contentVersion++;
+        _presentationVersion++;
+        _derivedVersion++;
+        _markdownVersion++;
+        _foldsVersion++;
+        _searchVersion++;
+        CancelPendingWindowLoad();
+        CancelPendingReloadRetry();
+        ContentUpdating?.Invoke(this, EventArgs.Empty);
+
+        MarkdownRenderResult = null;
+        MarkdownHeadings = [];
+        MarkdownRenderNotice = string.Empty;
+        _searchTextDebounce.Cancel();
+        CancelAndDispose(ref _presentationCancellation);
+        CancelAndDispose(ref _derivedCancellation);
+        CancelAndDispose(ref _markdownCancellation);
+        if (_documentSource is not null)
+        {
+            var stale = _documentSource;
+            _documentSource = null;
+            _ = DisposeDocumentSourceAsync(stale);
+        }
+
+        Content = string.Empty;
+        Presentation = CodePresentationSnapshot.Empty();
+        Notice = string.Empty;
+        FileChangeNotice = string.Empty;
+        ClearFindResults();
+        SearchErrorMessage = string.Empty;
+        _windowedMatches.Clear();
+        _windowTextLines = 0;
+        _windowLineOffsets = [0];
+        _searchCancellation?.Cancel();
+        _searchCancellation = null;
+        FilteredOutlineEntries.ReplaceRange([]);
+        OutlineEntries.ReplaceRange([]);
+        FoldSections = [];
+        SymbolRoots.ReplaceRange([]);
+        FilteredSymbolRoots.ReplaceRange([]);
+        UnwireSymbolNodes();
+        _symbolDocument = CodeSymbolDocument.Empty;
+
+        _payloadUnloaded = true;
+        _loadTask = null;
+        OnPropertyChanged(nameof(IsLoadFinished));
+        OnPropertyChanged(nameof(IsPayloadLoaded));
+        OnPropertyChanged(nameof(RetainedMemoryBytes));
+    }
 
     private async Task RunContentPipelineAsync(bool initialLoad)
     {
@@ -2156,18 +2917,13 @@ public sealed partial class FilePreviewTab : EditorTabItem
             return;
         }
 
+        Interlocked.Increment(ref _pipelineActive);
         var version = ++_contentVersion;
+        var gateEntered = false;
         try
         {
             await _reloadGate.WaitAsync();
-        }
-        catch (ObjectDisposedException)
-        {
-            return; // 标签已释放,排队中的重载直接放弃
-        }
-
-        try
-        {
+            gateEntered = true;
             if (version != _contentVersion || IsClosed)
             {
                 return; // 等待门闩期间已被更新的请求超越
@@ -2182,21 +2938,55 @@ public sealed partial class FilePreviewTab : EditorTabItem
                 await ReloadCoreAsync(version);
             }
         }
+        catch (ObjectDisposedException)
+        {
+            return; // 标签已释放,排队中的重载直接放弃
+        }
+        catch (Exception ex)
+        {
+            if (version != _contentVersion || IsClosed || _resourcesReleased)
+            {
+                return;
+            }
+
+            if (initialLoad)
+            {
+                EnsureMarkdownSourceMode();
+                Notice = $"无法预览文件：{SingleLineMessage(ex)}";
+            }
+            else
+            {
+                FileChangeNotice = SummarizeReloadFailure(SingleLineMessage(ex), File.Exists(Path));
+                ScheduleReloadRetry();
+            }
+        }
         finally
         {
-            _reloadGate.Release();
+            if (gateEntered)
+            {
+                _reloadGate.Release();
+            }
+
+            Interlocked.Decrement(ref _pipelineActive);
         }
     }
 
     private async Task InitialLoadCoreAsync(int version)
     {
+        IReadOnlyDocumentSource? source = null;
         try
         {
             if (File.Exists(Path) && new FileInfo(Path).Length > PreviewLimit)
             {
-                _documentSource = new FileReadOnlyDocumentSource(Path);
-                var metadata = await _documentSource.GetMetadataAsync();
-                if (version != _contentVersion || IsClosed) return;
+                source = new FileReadOnlyDocumentSource(Path);
+                _documentSource = source;
+                var metadata = await source.GetMetadataAsync();
+                if (version != _contentVersion || IsClosed)
+                {
+                    if (ReferenceEquals(source, _documentSource)) _documentSource = null;
+                    await DisposeDocumentSourceAsync(source);
+                    return;
+                }
                 FileSizeText = TextDocumentDecoder.FormatSize(metadata.ByteLength);
                 CapacityTier = metadata.CapacityTier;
                 OnPropertyChanged(nameof(AnalysisModeText));
@@ -2206,6 +2996,8 @@ public sealed partial class FilePreviewTab : EditorTabItem
                 LineCount = metadata.TotalLines;
                 if (metadata.IsBinary)
                 {
+                    _documentSource = null;
+                    await DisposeDocumentSourceAsync(source);
                     IsBinary = true;
                     EnsureMarkdownSourceMode();
                     Notice = "二进制文件，无法预览。";
@@ -2223,7 +3015,10 @@ public sealed partial class FilePreviewTab : EditorTabItem
                 // 窗口阅读不产生渲染预览:模式显式落到源码,源码面(含提示)可见;
                 // 先于 LoadWindowAsync 切换,窗口派生工作(折叠等)按源码模式计算。
                 EnsureMarkdownSourceMode();
-                await LoadWindowAsync(1);
+                if (!await LoadWindowAsync(1))
+                {
+                    return;
+                }
                 if (version != _contentVersion || IsClosed) return;
                 Notice = $"文件超过 8 MB，已进入大型文件窗口阅读：当前显示第 1–{Math.Min(FileReadOnlyDocumentSource.DefaultWindowLines, LineCount)} 行，共 {LineCount} 行。";
                 return;
@@ -2264,6 +3059,11 @@ public sealed partial class FilePreviewTab : EditorTabItem
             or System.Text.Json.JsonException)
         {
             if (version != _contentVersion || IsClosed) return;
+            if (source is not null)
+            {
+                if (ReferenceEquals(source, _documentSource)) _documentSource = null;
+                await DisposeDocumentSourceAsync(source);
+            }
             Content = string.Empty;
             EnsureMarkdownSourceMode();
             Notice = $"无法预览文件：{ex.Message}";
@@ -2288,7 +3088,8 @@ public sealed partial class FilePreviewTab : EditorTabItem
             {
                 var stale = _documentSource;
                 _documentSource = null;
-                _ = stale.DisposeAsync();
+                CancelPendingWindowLoad();
+                _ = DisposeDocumentSourceAsync(stale);
                 _windowedMatches.Clear();
                 _windowTextLines = 0;
                 _windowLineOffsets = [0];
@@ -2387,58 +3188,95 @@ public sealed partial class FilePreviewTab : EditorTabItem
     private async Task ReloadWindowedCoreAsync(int version)
     {
         var focusGlobalLine = WindowStartLine;
-        if (_documentSource is not null)
+        CancelPendingWindowLoad();
+        await _windowLoadGate.WaitAsync().ConfigureAwait(true);
+        IReadOnlyDocumentSource? source = null;
+        try
         {
-            var stale = _documentSource;
-            _documentSource = null;
-            _ = stale.DisposeAsync();
-            _windowedMatches.Clear();
-            _searchCancellation?.Cancel();
-        }
+            if (version != _contentVersion || IsClosed)
+            {
+                return;
+            }
 
-        _documentSource = new FileReadOnlyDocumentSource(Path);
-        var metadata = await _documentSource.GetMetadataAsync();
-        if (version != _contentVersion || IsClosed) return;
-        FileSizeText = TextDocumentDecoder.FormatSize(metadata.ByteLength);
-        CapacityTier = metadata.CapacityTier;
-        OnPropertyChanged(nameof(AnalysisModeText));
-        LanguageName = FileType.DisplayName;
-        EncodingName = metadata.Encoding.WebName;
-        NewlineTypeText = metadata.LineEnding == "\r\n" ? "CRLF" : metadata.LineEnding == "\n" ? "LF" : "CR";
-        LineCount = metadata.TotalLines;
-        if (metadata.IsBinary)
-        {
-            CancelDerivedWork();
-            ContentUpdating?.Invoke(this, EventArgs.Empty);
-            Content = string.Empty;
-            IsBinary = true;
+            if (_documentSource is not null)
+            {
+                var stale = _documentSource;
+                _documentSource = null;
+                _windowedMatches.Clear();
+                _searchCancellation?.Cancel();
+                await stale.DisposeAsync().ConfigureAwait(true);
+            }
+
+            source = new FileReadOnlyDocumentSource(Path);
+            _documentSource = source;
+            var metadata = await source.GetMetadataAsync().ConfigureAwait(true);
+            if (version != _contentVersion || IsClosed)
+            {
+                _documentSource = null;
+                await source.DisposeAsync().ConfigureAwait(true);
+                return;
+            }
+
+            FileSizeText = TextDocumentDecoder.FormatSize(metadata.ByteLength);
+            CapacityTier = metadata.CapacityTier;
+            OnPropertyChanged(nameof(AnalysisModeText));
+            LanguageName = FileType.DisplayName;
+            EncodingName = metadata.Encoding.WebName;
+            NewlineTypeText = metadata.LineEnding == "\r\n" ? "CRLF" : metadata.LineEnding == "\n" ? "LF" : "CR";
+            LineCount = metadata.TotalLines;
+            if (metadata.IsBinary)
+            {
+                CancelDerivedWork();
+                ContentUpdating?.Invoke(this, EventArgs.Empty);
+                Content = string.Empty;
+                IsBinary = true;
+                IsTruncated = false;
+                EnsureMarkdownSourceMode();
+                Notice = "二进制文件，无法预览。";
+                FileChangeNotice = string.Empty;
+                CancelPendingReloadRetry();
+                return;
+            }
+
+            if (metadata.CapacityTier == ReadOnlyContentTier.Summary)
+            {
+                CancelDerivedWork();
+                ContentUpdating?.Invoke(this, EventArgs.Empty);
+                Content = string.Empty;
+                IsTruncated = true;
+                EnsureMarkdownSourceMode();
+                Notice = "文件超过 32 MB，已进入摘要模式；可通过跳转行进入窗口阅读。";
+                FileChangeNotice = string.Empty;
+                CancelPendingReloadRetry();
+                return;
+            }
+
+            IsBinary = false;
             IsTruncated = false;
-            EnsureMarkdownSourceMode();
-            Notice = "二进制文件，无法预览。";
+            Notice = string.Empty;
             FileChangeNotice = string.Empty;
-            CancelPendingReloadRetry();
-            return;
-        }
-
-        if (CapacityTier == ReadOnlyContentTier.Summary)
-        {
-            CancelDerivedWork();
             ContentUpdating?.Invoke(this, EventArgs.Empty);
-            Content = string.Empty;
-            IsTruncated = true;
-            EnsureMarkdownSourceMode();
-            Notice = "文件超过 32 MB，已进入摘要模式；可通过跳转行进入窗口阅读。";
-            FileChangeNotice = string.Empty;
-            CancelPendingReloadRetry();
+        }
+        catch
+        {
+            if (source is not null && ReferenceEquals(source, _documentSource))
+            {
+                _documentSource = null;
+                await source.DisposeAsync().ConfigureAwait(true);
+            }
+
+            throw;
+        }
+        finally
+        {
+            _windowLoadGate.Release();
+        }
+
+        if (!await LoadWindowAsync(Math.Max(1, focusGlobalLine)))
+        {
             return;
         }
 
-        IsBinary = false;
-        IsTruncated = false;
-        Notice = string.Empty;
-        FileChangeNotice = string.Empty;
-        ContentUpdating?.Invoke(this, EventArgs.Empty);
-        await LoadWindowAsync(Math.Max(1, focusGlobalLine));
         if (version != _contentVersion || IsClosed) return;
         // 窗口阅读不产生渲染预览:模式显式落到源码(全文→窗口迁移时释放旧渲染产物),
         // 源码面(含提示)保持可见;放在窗口内容发布后,模式切换的派生工作面向新窗口。
@@ -2458,6 +3296,94 @@ public sealed partial class FilePreviewTab : EditorTabItem
         _presentationCancellation?.Cancel();
         _searchCancellation?.Cancel();
         _markdownCancellation?.Cancel();
+    }
+
+    private static void CancelAndDispose(ref CancellationTokenSource? cancellation)
+    {
+        cancellation?.Cancel();
+        cancellation?.Dispose();
+        cancellation = null;
+    }
+
+    private void CancelPendingWindowLoad()
+    {
+        CancellationTokenSource? cancellation;
+        lock (_windowRequestGate)
+        {
+            _windowRequestVersion++;
+            cancellation = _windowCancellation;
+        }
+
+        cancellation?.Cancel();
+    }
+
+    private (int Version, CancellationTokenSource Cancellation) BeginWindowLoad()
+    {
+        CancellationTokenSource? previous;
+        CancellationTokenSource current;
+        int version;
+        lock (_windowRequestGate)
+        {
+            previous = _windowCancellation;
+            current = new CancellationTokenSource();
+            _windowCancellation = current;
+            version = ++_windowRequestVersion;
+        }
+
+        previous?.Cancel();
+        return (version, current);
+    }
+
+    private bool IsCurrentWindowLoad(int version, IReadOnlyDocumentSource source, CancellationToken cancellationToken)
+    {
+        lock (_windowRequestGate)
+        {
+            return version == _windowRequestVersion
+                && ReferenceEquals(source, _documentSource)
+                && !cancellationToken.IsCancellationRequested
+                && !_resourcesReleased
+                && !IsClosed;
+        }
+    }
+
+    private void FinishWindowLoad(int version, CancellationTokenSource cancellation)
+    {
+        lock (_windowRequestGate)
+        {
+            if (version == _windowRequestVersion && ReferenceEquals(cancellation, _windowCancellation))
+            {
+                _windowCancellation = null;
+            }
+        }
+
+        cancellation.Dispose();
+    }
+
+    private async Task DisposeDocumentSourceAsync(IReadOnlyDocumentSource source)
+    {
+        try
+        {
+            await _windowLoadGate.WaitAsync().ConfigureAwait(false);
+            try
+            {
+                await source.DisposeAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                _windowLoadGate.Release();
+            }
+        }
+        catch (Exception) when (_resourcesReleased || IsClosed)
+        {
+            // A closing tab only needs best-effort source cleanup; the source is no longer
+            // reachable from the tab after detachment.
+        }
+        catch (Exception)
+        {
+            // The source was detached before disposal. Cleanup is best effort even during a
+            // full-file/windowed migration; observing the exception here prevents an unobserved
+            // fire-and-forget disposal task from surfacing as a process-level UI error.
+        }
     }
 
     private void CancelPendingReloadRetry()
@@ -2504,24 +3430,78 @@ public sealed partial class FilePreviewTab : EditorTabItem
         }, TaskScheduler.Default);
     }
 
-    private async Task LoadWindowAsync(int globalLine)
+    private async Task<bool> LoadWindowAsync(int globalLine)
     {
-        if (_documentSource is null) return;
-        var start = Math.Max(1, globalLine - FileReadOnlyDocumentSource.DefaultWindowLines / 3);
-        var window = await _documentSource.ReadWindowAsync(new DocumentRange(start, FileReadOnlyDocumentSource.DefaultWindowLines));
-        WindowStartLine = window.StartLine;
-        Content = window.Text;
-        // 记录窗口行起点:查找匹配的全局行号→窗口内偏移依赖它。
-        _windowLineOffsets = window.LineOffsets;
-        _windowTextLines = Math.Max(0, window.LineOffsets.Count - 1);
-        var contentVersion = _contentVersion;
-        var derivedTask = BuildDerivedContentAsync(contentVersion, includeSearch: false);
-        var presentationTask = BuildPresentationAsync();
-        await Task.WhenAll(derivedTask, presentationTask);
-        // 活动查找下的窗口切换:把全文匹配列表重挂到新窗口坐标(当前匹配落位由视图侧完成)。
-        if (!string.IsNullOrEmpty(SearchText))
+        var source = _documentSource;
+        if (source is null)
         {
-            ApplyWindowedMatches();
+            return false;
+        }
+
+        var (requestVersion, cancellation) = BeginWindowLoad();
+        var gateEntered = false;
+        try
+        {
+            await _windowLoadGate.WaitAsync(cancellation.Token).ConfigureAwait(true);
+            gateEntered = true;
+            if (!IsCurrentWindowLoad(requestVersion, source, cancellation.Token))
+            {
+                return false;
+            }
+
+            var contentVersion = _contentVersion;
+            var start = Math.Max(1, globalLine - FileReadOnlyDocumentSource.DefaultWindowLines / 3);
+            var window = await source.ReadWindowAsync(
+                new DocumentRange(start, FileReadOnlyDocumentSource.DefaultWindowLines), cancellation.Token);
+            if (!IsCurrentWindowLoad(requestVersion, source, cancellation.Token)
+                || contentVersion != _contentVersion)
+            {
+                return false;
+            }
+
+            WindowStartLine = window.StartLine;
+            Content = window.Text;
+            // 记录窗口行起点:查找匹配的全局行号→窗口内偏移依赖它。
+            _windowLineOffsets = window.LineOffsets;
+            _windowTextLines = Math.Max(0, window.LineOffsets.Count - 1);
+            var derivedTask = BuildDerivedContentAsync(contentVersion, includeSearch: false);
+            var presentationTask = BuildPresentationAsync();
+            await Task.WhenAll(derivedTask, presentationTask);
+            if (!IsCurrentWindowLoad(requestVersion, source, cancellation.Token)
+                || contentVersion != _contentVersion)
+            {
+                return false;
+            }
+
+            // 活动查找下的窗口切换:把全文匹配列表重挂到新窗口坐标(当前匹配落位由视图侧完成)。
+            if (!string.IsNullOrEmpty(SearchText))
+            {
+                ApplyWindowedMatches();
+            }
+
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
+        catch (Exception ex)
+        {
+            if (IsCurrentWindowLoad(requestVersion, source, cancellation.Token))
+            {
+                Notice = $"无法加载文件窗口：{SingleLineMessage(ex)}";
+            }
+
+            return false;
+        }
+        finally
+        {
+            if (gateEntered)
+            {
+                _windowLoadGate.Release();
+            }
+
+            FinishWindowLoad(requestVersion, cancellation);
         }
     }
 
@@ -2637,11 +3617,24 @@ public sealed partial class FilePreviewTab : EditorTabItem
             return;
         }
 
-        if (version != _markdownVersion || cancellation.IsCancellationRequested) return;
+        if (version != _markdownVersion || cancellation.IsCancellationRequested)
+        {
+            // This result will never be handed to MarkdownPreviewView, so the view cannot
+            // perform its normal ownership handoff/release for the worker-side preheat refs.
+            MarkdownPreviewService.ReleasePreheatedPaths(result.PreheatedPaths);
+            return;
+        }
         MarkdownHeadings = result.Headings;
         // 完成时的模式为准:解析期间用户已切到源码则丢弃 AST(切回预览再解析),
         // 避免后台标签持有解析产物。
-        MarkdownRenderResult = MarkdownMode == MarkdownViewMode.Rendered ? result : null;
+        if (MarkdownMode == MarkdownViewMode.Rendered)
+        {
+            MarkdownRenderResult = result;
+        }
+        else
+        {
+            MarkdownPreviewService.ReleasePreheatedPaths(result.PreheatedPaths);
+        }
     }
 
     /// <summary>把异常消息压成单行供状态栏提示:换行符(\r\n/\n/\r)→空格、连续空白折叠、
@@ -2772,12 +3765,15 @@ public sealed partial class FilePreviewTab : EditorTabItem
     {
         if (string.IsNullOrEmpty(SearchText))
         {
+            CancelWindowedSearch();
+            SearchErrorMessage = string.Empty;
             ClearFindResults();
             return;
         }
 
         if (SearchUseRegex && TextSearchService.GetRegexError(SearchText, SearchCaseSensitive) is { } error)
         {
+            CancelWindowedSearch();
             ClearFindResults();
             _windowedMatches.Clear();
             SearchErrorMessage = error;
@@ -2834,9 +3830,16 @@ public sealed partial class FilePreviewTab : EditorTabItem
         CurrentMatchViewIndex = -1;
     }
 
+    private void CancelWindowedSearch()
+    {
+        Interlocked.Increment(ref _searchVersion);
+        _searchCancellation?.Cancel();
+    }
+
     private async Task RefreshWindowedSearchAsync(string query)
     {
-        if (_documentSource is null) return;
+        var source = _documentSource;
+        if (source is null) return;
         // 版本令牌必须原子自增:快速连续切换选项会并发派发多个流式搜索,
         // 非原子的 ++ 会丢失更新,让过期的旧搜索"获胜"并写回陈旧结果。
         var version = Interlocked.Increment(ref _searchVersion);
@@ -2847,14 +3850,29 @@ public sealed partial class FilePreviewTab : EditorTabItem
         try
         {
             var options = new TextSearchOptions(SearchCaseSensitive, SearchWholeWord, SearchUseRegex);
-            await foreach (var match in _documentSource.SearchAsync(query, MaxSearchMatches, options, null, cancellation.Token)) matches.Add(match);
+            await foreach (var match in source.SearchAsync(query, MaxSearchMatches, options, null, cancellation.Token)) matches.Add(match);
         }
         catch (OperationCanceledException)
         {
             return;
         }
+        catch (Exception ex)
+        {
+            if (version == _searchVersion
+                && query == SearchText
+                && ReferenceEquals(source, _documentSource)
+                && !IsClosed
+                && !_resourcesReleased)
+            {
+                SearchErrorMessage = SingleLineMessage(ex);
+            }
 
-        if (version != _searchVersion || query != SearchText || cancellation.IsCancellationRequested) return;
+            return;
+        }
+
+        if (version != _searchVersion || query != SearchText
+            || !ReferenceEquals(source, _documentSource)
+            || cancellation.IsCancellationRequested) return;
         ReplaceWindowedMatches(matches);
         MatchCount = matches.Count;
         CurrentMatchIndex = 0;
@@ -3032,7 +4050,7 @@ public sealed partial class FilePreviewTab : EditorTabItem
         SearchErrorMessage = string.Empty;
         CurrentMatchViewIndex = -1;
         _windowedMatches.Clear();
-        _searchCancellation?.Cancel(); // 中止进行中的窗口化搜索 I/O
+        CancelWindowedSearch(); // 中止进行中的窗口化搜索 I/O
     }
 
     /// <summary>全部高亮开关(VS Code toggle find highlight):关闭时视图隐藏文档内匹配装饰,
@@ -3090,10 +4108,22 @@ public sealed partial class FilePreviewTab : EditorTabItem
     /// 阅读状态(锚点/行号/偏移)在 <c>MarkTabClosed</c> 中先于本方法持久化。</summary>
     public override void ReleaseResources()
     {
+        if (_resourcesReleased)
+        {
+            return;
+        }
+
+        _resourcesReleased = true;
         ThemeEvents.ThemeChanged -= OnAppThemeChanged;
         // 使任何在途的加载/重载管线立刻失效(它们检查 version != _contentVersion 即放弃发布),
         // 关闭后的标签不得再被外部变更或重试写回内容。
         _contentVersion++;
+        _presentationVersion++;
+        _derivedVersion++;
+        _markdownVersion++;
+        _foldsVersion++;
+        _searchVersion++;
+        CancelPendingWindowLoad();
         CancelPendingReloadRetry();
         FileChangeNotice = string.Empty;
         // 渲染产物整体释放:绑定驱动视图清空 FlowDocument 并逐处释放图片引用;
@@ -3106,19 +4136,14 @@ public sealed partial class FilePreviewTab : EditorTabItem
         MarkdownRenderNotice = string.Empty;
 
         _searchTextDebounce.Dispose(); // E10: 关闭标签不得再触发挂起的查找扫描
-        _presentationCancellation?.Cancel();
-        _presentationCancellation?.Dispose();
-        _presentationCancellation = null;
-        _derivedCancellation?.Cancel();
-        _derivedCancellation?.Dispose();
-        _derivedCancellation = null;
-        _markdownCancellation?.Cancel();
-        _markdownCancellation?.Dispose();
-        _markdownCancellation = null;
+        CancelAndDispose(ref _presentationCancellation);
+        CancelAndDispose(ref _derivedCancellation);
+        CancelAndDispose(ref _markdownCancellation);
         if (_documentSource is not null)
         {
-            _ = _documentSource.DisposeAsync();
+            var stale = _documentSource;
             _documentSource = null;
+            _ = DisposeDocumentSourceAsync(stale);
         }
         Content = string.Empty;
         Presentation = CodePresentationSnapshot.Empty();
@@ -3138,6 +4163,8 @@ public sealed partial class FilePreviewTab : EditorTabItem
         _symbolDocument = CodeSymbolDocument.Empty;
         _collapsedSymbolIds.Clear();
         ViewState = null;
+        _payloadUnloaded = true;
+        _loadTask = null;
     }
 
     // ===== Go to line / column =====
@@ -3197,7 +4224,11 @@ public sealed partial class FilePreviewTab : EditorTabItem
     private async Task NavigateWindowedAsync(int globalLine, int? column = null)
     {
         if (CapacityTier == ReadOnlyContentTier.Summary) CapacityTier = ReadOnlyContentTier.Windowed;
-        await LoadWindowAsync(globalLine);
+        if (!await LoadWindowAsync(globalLine))
+        {
+            return;
+        }
+
         Notice = $"窗口分析 · 全局第 {WindowStartLine}–{Math.Min(LineCount, WindowStartLine + FileReadOnlyDocumentSource.DefaultWindowLines - 1)} 行";
         var localLine = Math.Clamp(globalLine - WindowStartLine + 1, 1, Math.Max(1, Content.Count(character => character == '\n') + 1));
         if (column is int effectiveColumn)
@@ -3217,7 +4248,11 @@ public sealed partial class FilePreviewTab : EditorTabItem
             ? WindowStartLine + FileReadOnlyDocumentSource.DefaultWindowLines
             : Math.Max(1, WindowStartLine - FileReadOnlyDocumentSource.DefaultWindowLines);
         if (target == WindowStartLine || target > LineCount) return false;
-        await LoadWindowAsync(target);
+        if (!await LoadWindowAsync(target))
+        {
+            return false;
+        }
+
         Notice = $"窗口分析 · 全局第 {WindowStartLine}–{Math.Min(LineCount, WindowStartLine + FileReadOnlyDocumentSource.DefaultWindowLines - 1)} 行";
         return true;
     }
@@ -3243,6 +4278,18 @@ public sealed partial class DiffTab : EditorTabItem
     private string? _diffRevision;
     private IDiffContentSource? _diffContentSource;
     private bool _restoreConfirmedForSession;
+
+    /// <summary>侧别覆盖:请求的 IsStaged/IsUntracked 来自打开时刻的状态快照,可能滞后于实际
+    /// index/HEAD(刷新未落地、或请求构建后更改被外部暂存/提交)——此时请求侧的 git diff 无输出,
+    /// 加载会对另一侧重试并采用有内容的侧(见 LoadCoreAsync 的空 diff 回退)。回退生效后
+    /// <c>null</c> 被替换为实际侧;显示(来源标签/标签状态)与块操作(暂存/取消暂存/还原)
+    /// 都跟随该值而非请求侧,保证"看到的差异"与"能做的操作"一致。</summary>
+    private bool? _displayStaged;
+
+    public bool DisplayIsStaged => _displayStaged ?? _request.IsStaged;
+
+    /// <summary>未跟踪侧仅当未发生回退时成立(回退必然落到暂存/未暂存侧)。</summary>
+    private bool DisplayIsUntracked => _displayStaged is null && _request.IsUntracked;
 
     /// <summary>D1 代次门:后启动的加载是唯一允许发布结果的加载。spool 读回 / 后台构建可能
     /// 跨多次 await 才落地,迟到的旧代次结果不得覆盖更新的加载(与 FilePreviewTab 的
@@ -3277,8 +4324,8 @@ public sealed partial class DiffTab : EditorTabItem
     [RelayCommand]
     private void OpenInCode() => OpenInCodeRequested?.Invoke(this, EventArgs.Empty);
 
-    public ObservableCollection<GitDiffLine> DiffLines { get; } = [];
-    public ObservableCollection<GitSideBySideRow> SideBySideRows { get; } = [];
+    public BulkObservableCollection<GitDiffLine> DiffLines { get; } = [];
+    public BulkObservableCollection<GitSideBySideRow> SideBySideRows { get; } = [];
 
     /// <summary>Hunks represented by the current Diff snapshot. This is kept beside the flattened
     /// display collections so hunk actions never infer identity from visual rows.</summary>
@@ -3300,7 +4347,7 @@ public sealed partial class DiffTab : EditorTabItem
     private ReadOnlyContentTier capacityTier = ReadOnlyContentTier.Full;
 
     [ObservableProperty]
-    private GitDiffMode diffMode = GitDiffMode.Inline;
+    private GitDiffMode diffMode = GitDiffMode.SideBySide;
 
     /// <summary>Collapses long unchanged runs into a review-friendly projection. Raw Git lines
     /// remain untouched for copying, statistics and source-line authority.</summary>
@@ -3370,14 +4417,14 @@ public sealed partial class DiffTab : EditorTabItem
     }
 
     /// <summary>以当前选项重新加载差异(重算窗口重置,集合由事件驱动视图重建)。</summary>
-    public async Task ReloadDiffAsync()
+    public async Task ReloadDiffAsync(CancellationToken cancellationToken = default)
     {
         if (_disposed)
         {
             return;
         }
 
-        await _loadGate.WaitAsync().ConfigureAwait(true);
+        await _loadGate.WaitAsync(cancellationToken).ConfigureAwait(true);
         try
         {
             if (_disposed)
@@ -3389,6 +4436,7 @@ public sealed partial class DiffTab : EditorTabItem
             var previousRows = SideBySideRows.ToArray();
             var previousHunks = Hunks;
             var previousRevision = _diffRevision;
+            var previousDisplayStaged = _displayStaged;
 
             _loadStarted = false;
             IsLoaded = false;
@@ -3407,20 +4455,12 @@ public sealed partial class DiffTab : EditorTabItem
             if (_loadFailed && !_disposed)
             {
                 var refreshNotice = DiffNotice;
-                DiffLines.Clear();
-                foreach (var line in previousLines)
-                {
-                    DiffLines.Add(line);
-                }
-
-                SideBySideRows.Clear();
-                foreach (var row in previousRows)
-                {
-                    SideBySideRows.Add(row);
-                }
+                DiffLines.ReplaceRange(previousLines);
+                SideBySideRows.ReplaceRange(previousRows);
 
                 Hunks = previousHunks;
                 _diffRevision = previousRevision;
+                _displayStaged = previousDisplayStaged;
                 IsLoaded = true;
                 DiffNotice = string.IsNullOrWhiteSpace(refreshNotice)
                     ? "无法刷新 Diff，已保留上一版本。"
@@ -3448,13 +4488,15 @@ public sealed partial class DiffTab : EditorTabItem
 
         try
         {
-            var revision = await _gitService.GetDiffRevisionWithBlobsAsync(
+            // 不用请求携带的 blob id(打开时刻状态快照,暂存/提交后即过期):复用它们会让 index
+            // 变化(如 git add)在修订标识上不可见,标签错过重载、一直显示旧侧内容。重查当前
+            // index/HEAD 的 blob(ls-files / rev-parse)使标识对侧别变化保持敏感;侧别跟随实际
+            // 显示侧(空 diff 回退后)。
+            var revision = await _gitService.GetDiffRevisionAsync(
                 _request.RepositoryPath,
                 Path,
-                _request.IsStaged,
-                _request.IsUntracked,
-                _request.HeadBlobId,
-                _request.IndexBlobId,
+                DisplayIsStaged,
+                DisplayIsUntracked,
                 _lifetimeCancellation.Token).ConfigureAwait(true);
             if (!_disposed && !string.Equals(revision, _diffRevision, StringComparison.Ordinal))
             {
@@ -3509,17 +4551,18 @@ public sealed partial class DiffTab : EditorTabItem
 
     public string ChangeCounter => ChangeCount == 0 ? string.Empty : $"{CurrentChangeIndex + 1} / {ChangeCount}";
 
-    /// <summary>Label of the diff source: 暂存 / 未暂存 / 未跟踪 / 提交 short-hash.</summary>
+    /// <summary>Label of the diff source: 暂存 / 未暂存 / 未跟踪 / 提交 short-hash. Follows the
+    /// display side so an empty-diff fallback that adopted the other side is labeled correctly.</summary>
     public string SourceLabel => _request.CommitHash is not null
         ? $"提交 {ShortHash(_request.CommitHash)}"
-        : _request.IsStaged ? "已暂存" : _request.IsUntracked ? "未跟踪" : "未暂存";
+        : DisplayIsUntracked ? "未跟踪" : DisplayIsStaged ? "已暂存" : "未暂存";
 
     /// <summary>Compact SCM marker used in the unified editor tab strip.</summary>
-    public new DiffTabStatus TabStatus => _request.CommitHash is not null
+    public override DiffTabStatus TabStatus => _request.CommitHash is not null
         ? DiffTabStatus.Commit
-        : _request.IsStaged ? DiffTabStatus.Staged : _request.IsUntracked ? DiffTabStatus.Untracked : DiffTabStatus.Modified;
+        : DisplayIsUntracked ? DiffTabStatus.Untracked : DisplayIsStaged ? DiffTabStatus.Staged : DiffTabStatus.Modified;
 
-    public new string TabStatusMarker => TabStatus switch
+    public override string TabStatusMarker => TabStatus switch
     {
         DiffTabStatus.Staged => "S",
         DiffTabStatus.Untracked => "U",
@@ -3527,7 +4570,7 @@ public sealed partial class DiffTab : EditorTabItem
         _ => "M",
     };
 
-    public new string TabStatusToolTip => $"{TabStatusMarker} · {SourceLabel}";
+    public override string TabStatusToolTip => $"{TabStatusMarker} · {SourceLabel}";
 
     /// <summary>Raised with the 0-based change-block index after 上一个/下一个更改; the view centers
     /// the target block in its current layout (inline line / side-by-side row).</summary>
@@ -3561,10 +4604,18 @@ public sealed partial class DiffTab : EditorTabItem
 
     private bool CanNavigateChanges() => _changeCount > 0;
 
+    public bool IsLayoutManuallySelected { get; set; }
+
+    public bool ShouldAutoUseInlineForWidth(double availableWidth) =>
+        UseInlineWhenNarrow && !IsLayoutManuallySelected && availableWidth < NarrowInlineWidth;
+
+    public const double NarrowInlineWidth = 700;
+
     public bool CanApplyHunk(int hunkIndex, GitHunkOperation operation)
     {
-        if (_request.CommitHash is not null
-            || _request.IsUntracked
+        if (_disposed
+            || _request.CommitHash is not null
+            || DisplayIsUntracked
             || hunkIndex < 0
             || hunkIndex >= Hunks.Count
             || IsHunkOperationBusy)
@@ -3572,29 +4623,123 @@ public sealed partial class DiffTab : EditorTabItem
             return false;
         }
 
+        // 侧别跟随实际显示侧:空 diff 回退后内容属于另一侧,块操作必须作用到那一侧。
         return operation switch
         {
-            GitHunkOperation.Stage => !_request.IsStaged,
-            GitHunkOperation.Unstage => _request.IsStaged,
-            GitHunkOperation.Restore => !_request.IsStaged,
+            GitHunkOperation.Stage => !DisplayIsStaged,
+            GitHunkOperation.Unstage => DisplayIsStaged,
+            GitHunkOperation.Restore => !DisplayIsStaged,
             _ => false,
         };
     }
+
+    /// <summary>Number of contiguous changed blocks (maximal +/- runs, Notice 行视作分隔) inside
+    /// the hunk. git 会把间距不超过 2×上下文行的多处修改合并成一个 hunk,块数 &gt; 1 时块级操作
+    /// 才与整 hunk 操作不同。</summary>
+    internal static int CountChangedBlocks(GitDiffHunk hunk)
+    {
+        var blocks = 0;
+        var inBlock = false;
+        foreach (var line in HunkBodyLines(hunk))
+        {
+            if (line.Kind is GitDiffLineKind.Added or GitDiffLineKind.Removed)
+            {
+                if (!inBlock)
+                {
+                    blocks++;
+                    inBlock = true;
+                }
+            }
+            else
+            {
+                inBlock = false;
+            }
+        }
+
+        return blocks;
+    }
+
+    /// <summary>Resolves which contiguous changed block of the hunk contains the hovered anchor
+    /// line: a removed line matches by old file line number, an added line by new file line
+    /// number. 两个锚点都为空 → 整 hunk(null);给定了锚点却匹配不到任何块 → -1,由调用方拒绝
+    /// 应用(宁可不操作,也不能错落到相邻块)。</summary>
+    internal static int? ResolveHunkBlockOrdinal(GitDiffHunk hunk, int? anchorOldLine, int? anchorNewLine)
+    {
+        if (anchorOldLine is null && anchorNewLine is null)
+        {
+            return null;
+        }
+
+        var matched = -1;
+        var ordinal = -1;
+        var inBlock = false;
+        foreach (var line in HunkBodyLines(hunk))
+        {
+            if (line.Kind is not (GitDiffLineKind.Added or GitDiffLineKind.Removed))
+            {
+                inBlock = false;
+                continue;
+            }
+
+            if (!inBlock)
+            {
+                ordinal++;
+                inBlock = true;
+            }
+
+            var matches = (line.Kind == GitDiffLineKind.Removed && line.OldLineNumber is { } old && old == anchorOldLine)
+                || (line.Kind == GitDiffLineKind.Added && line.NewLineNumber is { } New && New == anchorNewLine);
+            if (matches)
+            {
+                matched = ordinal;
+            }
+        }
+
+        return matched;
+    }
+
+    private static IEnumerable<GitDiffLine> HunkBodyLines(GitDiffHunk hunk) =>
+        hunk.Lines.SkipWhile(line => line.Kind == GitDiffLineKind.HunkHeader);
 
     [ObservableProperty]
     private bool isHunkOperationBusy;
 
     /// <summary>Applies one hunk through Git, reloads this Diff tab and notifies the SCM page.</summary>
-    public async Task<bool> ApplyHunkAsync(int hunkIndex, GitHunkOperation operation, CancellationToken cancellationToken = default)
+    public async Task<bool> ApplyHunkAsync(int hunkIndex, GitHunkOperation operation, CancellationToken cancellationToken = default) =>
+        await ApplyHunkBlockCoreAsync(hunkIndex, null, null, operation, cancellationToken).ConfigureAwait(true);
+
+    /// <summary>Applies one contiguous changed block (悬停的变更块) inside a hunk. git 会把相近的
+    /// 两处修改合并成同一个 hunk——按块操作才能只暂存其中一处。<paramref name="blockAnchorOldLine"/>
+    /// /<paramref name="blockAnchorNewLine"/> 是悬停块首行的旧/新文件行号(取得到的那侧),由此在
+    /// hunk 原始行里解析出块序号;两个都为空时回退为整 hunk 操作。</summary>
+    public async Task<bool> ApplyHunkBlockAsync(
+        int hunkIndex,
+        int? blockAnchorOldLine,
+        int? blockAnchorNewLine,
+        GitHunkOperation operation,
+        CancellationToken cancellationToken = default) =>
+        await ApplyHunkBlockCoreAsync(hunkIndex, blockAnchorOldLine, blockAnchorNewLine, operation, cancellationToken).ConfigureAwait(true);
+
+    private async Task<bool> ApplyHunkBlockCoreAsync(
+        int hunkIndex,
+        int? blockAnchorOldLine,
+        int? blockAnchorNewLine,
+        GitHunkOperation operation,
+        CancellationToken cancellationToken)
     {
         if (!CanApplyHunk(hunkIndex, operation))
         {
             return false;
         }
 
-        await _hunkOperationGate.WaitAsync(cancellationToken).ConfigureAwait(true);
+        using var operationCancellation = CancellationTokenSource.CreateLinkedTokenSource(
+            cancellationToken, _lifetimeCancellation.Token);
+        var operationToken = operationCancellation.Token;
+        var gateEntered = false;
         try
         {
+            await _hunkOperationGate.WaitAsync(operationToken).ConfigureAwait(true);
+            gateEntered = true;
             // Reloads can be triggered by the repository watcher while a hover menu is still
             // open. Re-check after acquiring the gate before indexing the current hunk snapshot.
             if (!CanApplyHunk(hunkIndex, operation) || hunkIndex >= Hunks.Count)
@@ -3604,11 +4749,22 @@ public sealed partial class DiffTab : EditorTabItem
 
             IsHunkOperationBusy = true;
             var hunk = Hunks[hunkIndex];
+            var blockOrdinal = ResolveHunkBlockOrdinal(hunk, blockAnchorOldLine, blockAnchorNewLine);
+            if (blockOrdinal is { } resolved && (resolved < 0 || resolved >= CountChangedBlocks(hunk)))
+            {
+                // 悬停快照与当前 hunk 行不一致:拒绝应用,绝不能把块序号错落到相邻块上。
+                _logService.Write("WARNING", $"无法定位悬停的变更块：{Path} #{hunkIndex + 1}。");
+                return false;
+            }
+
             if (operation == GitHunkOperation.Restore && !_restoreConfirmedForSession)
             {
+                var target = blockOrdinal is { } ordinal && CountChangedBlocks(hunk) > 1
+                    ? $"第 {hunkIndex + 1} 个 Diff 块内的一个变更块"
+                    : $"第 {hunkIndex + 1} 个 Diff 块";
                 var confirmed = _confirmationService?.Confirm(
                     "确认还原 Diff 块",
-                    $"将还原“{Path}”的第 {hunkIndex + 1} 个 Diff 块，且无法撤销。选择“否”可安全取消。") == true;
+                    $"将还原“{Path}”的{target}，且无法撤销。选择“否”可安全取消。") == true;
                 if (!confirmed)
                 {
                     _logService.Write("INFO", $"用户取消了还原 Diff 块：{Path} #{hunkIndex + 1}。");
@@ -3618,10 +4774,17 @@ public sealed partial class DiffTab : EditorTabItem
                 _restoreConfirmedForSession = true;
             }
 
-            await _gitService.ApplyHunkAsync(_request.RepositoryPath, Path, _request.IsStaged, hunk, operation, cancellationToken).ConfigureAwait(true);
-            await ReloadDiffAsync().ConfigureAwait(true);
+            await _gitService.ApplyHunkAsync(_request.RepositoryPath, Path, DisplayIsStaged, hunk, operation, blockOrdinal, operationToken).ConfigureAwait(true);
+            await ReloadDiffAsync(operationToken).ConfigureAwait(true);
             HunkMutationCompleted?.Invoke(this, EventArgs.Empty);
             return true;
+        }
+        catch (OperationCanceledException) when (_disposed || _lifetimeCancellation.IsCancellationRequested)
+        {
+            // Closing a diff tab cancels a pending menu operation. The WPF event handler is
+            // async-void, so consume only this lifecycle cancellation instead of surfacing it as
+            // an application-level unhandled exception.
+            return false;
         }
         catch (OperationCanceledException)
         {
@@ -3637,14 +4800,25 @@ public sealed partial class DiffTab : EditorTabItem
         }
         finally
         {
-            IsHunkOperationBusy = false;
-            _hunkOperationGate.Release();
+            if (gateEntered)
+            {
+                IsHunkOperationBusy = false;
+                _hunkOperationGate.Release();
+            }
         }
     }
 
     [RelayCommand]
-    private void ToggleDiffMode() =>
+    private void ToggleDiffMode()
+    {
+        IsLayoutManuallySelected = true;
         DiffMode = DiffMode == GitDiffMode.Inline ? GitDiffMode.SideBySide : GitDiffMode.Inline;
+    }
+
+    public string ContextCollapseToolTip => IsContextCollapsed ? "显示未更改上下文" : "隐藏未更改上下文";
+
+    partial void OnIsContextCollapsedChanged(bool value) =>
+        OnPropertyChanged(nameof(ContextCollapseToolTip));
 
     [RelayCommand]
     private void ToggleContextCollapse() => IsContextCollapsed = !IsContextCollapsed;
@@ -3692,8 +4866,9 @@ public sealed partial class DiffTab : EditorTabItem
         SideBySideRows.Clear();
         Hunks = [];
         SelectedDiffLines.Clear();
-        _hunkOperationGate.Dispose();
-        _lifetimeCancellation.Dispose();
+        // Do not dispose these synchronization/cancellation primitives here. A hover-menu event
+        // can still be unwinding on another continuation after the tab leaves the visual tree;
+        // the lifetime cancellation makes it stop, and the objects are reclaimed with the tab.
     }
 
     partial void OnDiffModeChanged(GitDiffMode value)
@@ -3748,6 +4923,7 @@ public sealed partial class DiffTab : EditorTabItem
 
         _loadStarted = true;
         _loadFailed = false;
+        _displayStaged = null; // 每次加载从请求侧重新开始;空 diff 回退可在本次加载中重新设置
         DiffTitle = _request.CommitHash is null
             ? Path
             : $"提交 {ShortHash(_request.CommitHash)} · {Path}";
@@ -3796,6 +4972,41 @@ public sealed partial class DiffTab : EditorTabItem
             {
                 DiffNotice = "无法读取该文件的 diff。";
                 return;
+            }
+
+            // 空差异回退:请求的侧别来自打开时刻的状态快照,可能滞后于实际 index/HEAD(静默刷新
+            // 未落地,或请求构建后更改被外部暂存/提交)。此时请求侧的 git diff 无输出,用户会看到
+            // "该文件没有可显示的差异"——而更改其实存在于另一侧。对另一侧重取一次,有内容即采用;
+            // 显示与块操作随后跟随 _displayStaged(实际侧)。两侧都空时保持原样(空态即事实)。
+            // Only a truly metadata-free result proves that the requested side went stale. Binary,
+            // rename/copy and empty-file changes can legitimately have no hunks and must remain on
+            // the side the user selected.
+            if (_request.CommitHash is null && !diff.HasMetadata && diff.Hunks.Count == 0)
+            {
+                var otherStaged = !_request.IsStaged;
+                var otherSource = await SpoolingDiffContentSource.CreateAsync(
+                    _gitService.StreamDiffAsync(_request.RepositoryPath, Path, otherStaged, false, ReadOnlyContentCapacity.WindowedDiffLines, IgnoreTrimWhitespace, _lifetimeCancellation.Token),
+                    _lifetimeCancellation.Token);
+                var otherDiff = CollectWindow((await otherSource.ReadWindowAsync(new DocumentRange(1, MaxDiffLines))).Events, Path, otherStaged);
+                if (otherDiff is not null && otherDiff.Hunks.Count > 0)
+                {
+                    if (_diffContentSource is not null)
+                    {
+                        await _diffContentSource.DisposeAsync().ConfigureAwait(true);
+                    }
+
+                    _diffContentSource = otherSource;
+                    diff = otherDiff;
+                    _displayStaged = otherStaged;
+                    OnPropertyChanged(nameof(SourceLabel));
+                    OnPropertyChanged(nameof(TabStatus));
+                    OnPropertyChanged(nameof(TabStatusMarker));
+                    OnPropertyChanged(nameof(TabStatusToolTip));
+                }
+                else
+                {
+                    await otherSource.DisposeAsync().ConfigureAwait(true);
+                }
             }
 
             // 阶段二(D1):行尾归一 → 限量填充 → 并排行构建 → 增删/块计数 全部在后台线程
@@ -3868,13 +5079,13 @@ public sealed partial class DiffTab : EditorTabItem
                 {
                     try
                     {
-                        var revision = await _gitService.GetDiffRevisionWithBlobsAsync(
+                        // 与 RefreshIfChangedAsync 同一口径:重查当前 index/HEAD 的 blob id(不复用
+                        // 请求里过期的快照值),且按实际显示侧计算——两侧口径一致,重载判定才闭环。
+                        var revision = await _gitService.GetDiffRevisionAsync(
                             _request.RepositoryPath,
                             Path,
-                            _request.IsStaged,
-                            _request.IsUntracked,
-                            _request.HeadBlobId,
-                            _request.IndexBlobId,
+                            DisplayIsStaged,
+                            DisplayIsUntracked,
                             _lifetimeCancellation.Token).ConfigureAwait(true);
                         if (!_disposed && generation == _loadGeneration)
                         {
@@ -3974,7 +5185,7 @@ public sealed partial class DiffTab : EditorTabItem
             }
         }
 
-        var rows = new List<GitSideBySideRow>();
+        var rows = new List<GitSideBySideRow>(Math.Min(sourceLineCount, MaxDiffLines));
         foreach (var row in diff.ToSideBySideRows())
         {
             if (rows.Count >= MaxDiffLines)
@@ -4023,15 +5234,10 @@ public sealed partial class DiffTab : EditorTabItem
         OnPropertyChanged(nameof(Hunks));
         CapacityTier = built.CapacityTier;
 
-        foreach (var line in built.Lines)
-        {
-            DiffLines.Add(line);
-        }
-
-        foreach (var row in built.Rows)
-        {
-            SideBySideRows.Add(row);
-        }
+        // One Reset per projection prevents AvalonEdit/list bindings from laying out once per
+        // diff line. The snapshot is already fully built off the UI thread.
+        DiffLines.ReplaceRange(built.Lines);
+        SideBySideRows.ReplaceRange(built.Rows);
 
         _addedCount = built.AddedCount;
         _removedCount = built.RemovedCount;
@@ -4092,7 +5298,8 @@ public sealed partial class DiffTab : EditorTabItem
             }
         }
         Flush();
-        return new GitFileDiff(path, metadata?.OldPath, staged, metadata?.IsBinary == true, metadata?.IsNewFile == true, hunks);
+        return new GitFileDiff(path, metadata?.OldPath, staged, metadata?.IsBinary == true,
+            metadata?.IsNewFile == true, hunks, HasMetadata: metadata is not null);
 
         void Flush()
         {

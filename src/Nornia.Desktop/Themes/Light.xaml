@@ -6,14 +6,20 @@
     VS Code JSON colors use #RRGGBBAA; WPF values below use #AARRGGBB.
   -->
 
-  <!-- Core surfaces -->
+  <!-- Core surfaces.
+       Fluent 表面阶梯(无阴影的层级表达):窗口基准 #FAFAFD → 侧栏/面板/活动栏沉一档(LayerColor)
+       → 编辑器/卡片最亮最实(焦点层)。侧栏沉档后与窗口形成层级,不再依赖纯边框区分。 -->
+  <Color x:Key="LayerColor">#F5F5F8</Color>
+  <Color x:Key="LayerAltColor">#EBEBEF</Color>
+  <SolidColorBrush x:Key="LayerBrush" Color="{StaticResource LayerColor}" />
+  <SolidColorBrush x:Key="LayerAltBrush" Color="{StaticResource LayerAltColor}" />
   <SolidColorBrush x:Key="WindowBrush" Color="#FAFAFD" />
   <SolidColorBrush x:Key="TitleBarBrush" Color="#FAFAFD" />
   <SolidColorBrush x:Key="EditorBrush" Color="#FFFFFF" />
-  <SolidColorBrush x:Key="SideBarBrush" Color="#FAFAFD" />
-  <SolidColorBrush x:Key="ActivityBarBrush" Color="#FAFAFD" />
-  <SolidColorBrush x:Key="PanelBrush" Color="#FAFAFD" />
-  <SolidColorBrush x:Key="CardBrush" Color="#FAFAFD" />
+  <SolidColorBrush x:Key="SideBarBrush" Color="{StaticResource LayerColor}" />
+  <SolidColorBrush x:Key="ActivityBarBrush" Color="{StaticResource LayerColor}" />
+  <SolidColorBrush x:Key="PanelBrush" Color="{StaticResource LayerColor}" />
+  <SolidColorBrush x:Key="CardBrush" Color="#FFFFFF" />
   <SolidColorBrush x:Key="InputBrush" Color="#FFFFFF" />
   <SolidColorBrush x:Key="CaretBrush" Color="#202020" />
   <SolidColorBrush x:Key="HoverBrush" Color="#00000014" />

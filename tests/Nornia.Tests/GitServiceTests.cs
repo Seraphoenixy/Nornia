@@ -8,6 +8,9 @@ namespace Nornia.Tests;
 
 public sealed class GitServiceTests
 {
+    private readonly Xunit.Abstractions.ITestOutputHelper? _output;
+    public GitServiceTests(Xunit.Abstractions.ITestOutputHelper? output = null) => _output = output;
+
     // 生产字段(内部注册 code-pages provider),避免测试类静态字段与 provider 注册的时序竞态。
     private static Encoding Gbk => Nornia.Core.Services.TextEncodingDetector.Gb18030;
 
@@ -486,6 +489,87 @@ public sealed class GitServiceTests
         Assert.Contains("--cached", apply.Arguments);
     }
 
+    /// <summary>git 把间距不超过 2×上下文行的多处修改合并成一个 hunk。按块(连续 +/- 行)应用
+    /// 时,patch 必须只携带目标块的 +/- 行——上下文行全部保留以便定位,兄弟块的 +/- 行被剔除,
+    /// git apply --recount 自行重算行数。</summary>
+    private const string TwoBlockRawDiff = """
+        diff --git a/src/A.cs b/src/A.cs
+        index 1111111..2222222 100644
+        --- a/src/A.cs
+        +++ b/src/A.cs
+        @@ -1,10 +1,10 @@
+         keep1
+         keep2
+         keep3
+        -old1
+        +new1
+         keep4
+         keep5
+         keep6
+        -old2
+        +new2
+         keep7
+         keep8
+         keep9
+
+        """;
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    public async Task ApplyHunkAsync_BlockOrdinal_KeepsOnlyThatBlocksLines(int blockOrdinal)
+    {
+        string? selectedPatch = null;
+        var runner = new FakeProcessRunner((_, args) =>
+        {
+            if (args.Contains("diff"))
+            {
+                return new ProcessResult(0, TwoBlockRawDiff, string.Empty);
+            }
+
+            selectedPatch = File.ReadAllText(args[^1]);
+            return new ProcessResult(0, string.Empty, string.Empty);
+        });
+        var hunk = new GitDiffHunk(1, 10, 1, 10, "@@ -1,10 +1,10 @@", []);
+
+        await new GitService(runner).ApplyHunkAsync(@"C:\repo", "src/A.cs", staged: false, hunk, GitHunkOperation.Stage, blockOrdinal);
+
+        Assert.NotNull(selectedPatch);
+        _output?.WriteLine("=== selectedPatch ===");
+        _output?.WriteLine(selectedPatch);
+        _output?.WriteLine("=== end ===");
+        var firstBlock = blockOrdinal == 0;
+        // 行锚定断言:目标块的 +/- 行原样保留;兄弟块 '-' 行转上下文(标记 '-' 换成 ' ',
+        // 内容不变 → " oldN")、'+' 行丢弃。
+        Assert.Equal(firstBlock, selectedPatch.Contains("\n-old1", StringComparison.Ordinal));
+        Assert.Equal(firstBlock, selectedPatch.Contains("\n+new1", StringComparison.Ordinal));
+        Assert.Equal(firstBlock, selectedPatch.Contains("\n old2", StringComparison.Ordinal));
+        Assert.Equal(!firstBlock, selectedPatch.Contains("\n-old2", StringComparison.Ordinal));
+        Assert.Equal(!firstBlock, selectedPatch.Contains("\n+new2", StringComparison.Ordinal));
+        Assert.Equal(!firstBlock, selectedPatch.Contains("\n old1", StringComparison.Ordinal));
+        // 上下文行全部保留。
+        Assert.Contains("\n keep1", selectedPatch, StringComparison.Ordinal);
+        Assert.Contains("\n keep9", selectedPatch, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task ApplyHunkAsync_BlockOrdinalOutOfRange_Throws()
+    {
+        var runner = new FakeProcessRunner((_, args) =>
+        {
+            if (args.Contains("diff"))
+            {
+                return new ProcessResult(0, TwoBlockRawDiff, string.Empty);
+            }
+
+            return new ProcessResult(0, string.Empty, string.Empty);
+        });
+        var hunk = new GitDiffHunk(1, 10, 1, 10, "@@ -1,10 +1,10 @@", []);
+
+        await Assert.ThrowsAsync<GitOperationException>(() =>
+            new GitService(runner).ApplyHunkAsync(@"C:\repo", "src/A.cs", false, hunk, GitHunkOperation.Stage, 2));
+    }
+
     private static bool ContainsBytes(byte[] haystack, byte[] needle)
     {
         for (var i = 0; i + needle.Length <= haystack.Length; i++)
@@ -635,7 +719,7 @@ public sealed class GitServiceTests
             $"'{subCommand}' is a write command and must not set GIT_OPTIONAL_LOCKS");
     }
 
-    // ===== G5: per-repository serialization gate =====
+    // ===== G5: per-repository read pool / exclusive write gate =====
 
     /// <summary>Runner that blocks every invocation until released and records the maximum
     /// number of concurrently in-flight git processes — both per repository and in total.</summary>
@@ -645,10 +729,12 @@ public sealed class GitServiceTests
         private int _maxPerRepository;
         private int _totalInFlight;
         private int _maxTotalInFlight;
+        private int _invocationCount;
         private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public int MaxConcurrent => Volatile.Read(ref _maxPerRepository);
         public int MaxTotalInFlight => Volatile.Read(ref _maxTotalInFlight);
+        public int InvocationCount => Volatile.Read(ref _invocationCount);
         public void Release() => _release.TrySetResult();
 
         public Task<ProcessResult> RunAsync(
@@ -660,6 +746,7 @@ public sealed class GitServiceTests
             int? maximumOutputBytes = null)
         {
             var repo = arguments[1]; // -C <path>
+            Interlocked.Increment(ref _invocationCount);
             var perRepo = _perRepository.AddOrUpdate(repo, 1, (_, v) => v + 1);
             RaiseMax(ref _maxPerRepository, perRepo);
             RaiseMax(ref _maxTotalInFlight, Interlocked.Increment(ref _totalInFlight));
@@ -701,7 +788,7 @@ public sealed class GitServiceTests
     }
 
     [Fact]
-    public async Task ConcurrentCommandsForSameRepository_NeverOverlap()
+    public async Task ConcurrentReadCommandsForSameRepository_AreBoundedAndOverlap()
     {
         var runner = new GatingProcessRunner();
         var service = new GitService(runner);
@@ -710,13 +797,35 @@ public sealed class GitServiceTests
         var second = service.GetStatusAsync(@"C:\repo");
         var third = service.GetStatusAsync(@"C:\repo");
 
-        await Task.Delay(50); // let the first acquire the gate and park, the rest queue behind it
+        await Task.Delay(50); // all three readers should acquire the bounded read pool and park
         runner.Release();
 
         var results = await Task.WhenAll(first, second, third);
 
-        Assert.True(runner.MaxConcurrent == 1, $"expected 1 concurrent git process per repository, saw {runner.MaxConcurrent}");
+        Assert.True(runner.MaxConcurrent == 3, $"expected all three readers to overlap within the pool, saw {runner.MaxConcurrent}");
         Assert.All(results, r => Assert.True(r.IsRepository));
+    }
+
+    [Fact]
+    public async Task WriteForSameRepository_WaitsForReaders()
+    {
+        var runner = new GatingProcessRunner();
+        var service = new GitService(runner);
+
+        var reads = new[]
+        {
+            service.GetStatusAsync(@"C:\repo"),
+            service.GetStatusAsync(@"C:\repo"),
+            service.GetStatusAsync(@"C:\repo"),
+        };
+        await Task.Delay(50);
+        var write = service.StageAsync(@"C:\repo", ["file.txt"]);
+        await Task.Delay(50);
+
+        Assert.Equal(3, runner.InvocationCount);
+        runner.Release();
+        await Task.WhenAll(reads.Append(write));
+        Assert.Equal(4, runner.InvocationCount);
     }
 
     [Fact]

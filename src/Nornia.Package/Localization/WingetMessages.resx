@@ -21,6 +21,7 @@
   <data name="Winget_UninstallMultipleFallback" xml:space="preserve"><value>Multiple installed versions match this package; uninstalling each installed version individually.</value></data>
   <data name="Winget_UninstallByVersion" xml:space="preserve"><value>Uninstalling {0} (version {1}).</value></data>
   <data name="Winget_InstallerCancelledHint" xml:space="preserve"><value>The installer elevation request was cancelled. Retry and choose Yes in the UAC prompt; if no prompt appears, restart and run the same winget upgrade command from an elevated terminal.</value></data>
+  <data name="Winget_ProcessStartHint" xml:space="preserve"><value>winget could not be started. Install or update Microsoft App Installer (Windows Package Manager), make sure the winget App Execution Alias is enabled, then restart Nornia.</value></data>
   <data name="Package_NoProviderAvailable" xml:space="preserve"><value>No supported package manager is available. Install Winget, Scoop, or Chocolatey and try again.</value></data>
   <data name="Package_WingetFailed" xml:space="preserve"><value>winget {0} failed (exit {1}): {2}</value></data>
   <data name="Repair_UsingProvider" xml:space="preserve"><value>Repairing {0} with {1}.</value></data>

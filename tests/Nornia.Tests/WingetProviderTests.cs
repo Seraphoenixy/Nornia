@@ -1,4 +1,5 @@
 using Nornia.Core.Models;
+using Nornia.Core.Interfaces;
 using Nornia.Package.Providers;
 using Nornia.Tests.Fakes;
 
@@ -6,6 +7,30 @@ namespace Nornia.Tests;
 
 public sealed class WingetProviderTests
 {
+    [Fact]
+    public async Task IsAvailableAsync_ExecutesVersionInsteadOfUsingWhereAliasLookup()
+    {
+        var runner = new FakeProcessRunner((_, arguments) =>
+            arguments.SequenceEqual(["--version"])
+                ? new ProcessResult(0, "Windows Package Manager v1.10.340", "")
+                : new ProcessResult(1, "", "unexpected command"));
+        var provider = new WingetProvider(runner);
+
+        Assert.True(await provider.IsAvailableAsync());
+        var call = Assert.Single(runner.Calls);
+        Assert.Equal("winget.exe", call.FileName);
+        Assert.Equal(["--version"], call.Arguments);
+    }
+
+    [Fact]
+    public async Task IsAvailableAsync_ReturnsFalseWhenAliasCannotStart()
+    {
+        var runner = new FakeProcessRunner((_, _) => new ProcessResult(-1, "", "cannot start"));
+        var provider = new WingetProvider(runner);
+
+        Assert.False(await provider.IsAvailableAsync());
+    }
+
     [Fact]
     public async Task SearchAsync_ParsesWingetTable()
     {
@@ -63,6 +88,32 @@ public sealed class WingetProviderTests
     }
 
     [Fact]
+    public async Task InstallAsync_ForwardsWingetVirtualTerminalProgressFrame()
+    {
+        const string wingetProgress = "\u001b]9;4;1;42\u0007";
+        var runner = new FakeProcessRunner((_, _) => new ProcessResult(0, wingetProgress, ""));
+        var provider = new WingetProvider(runner);
+        var progress = new CapturingProgress();
+
+        await provider.InstallAsync("Git.Git", progress: progress);
+
+        Assert.Contains(progress.Entries, entry => entry.Text == wingetProgress && !entry.IsError);
+    }
+
+    [Fact]
+    public async Task InstallAsync_UsesInteractiveRunnerWhenDesktopProvidesOne()
+    {
+        var standardRunner = new FakeProcessRunner((_, _) => new ProcessResult(0, "redirected", ""));
+        var interactiveRunner = new CapturingInteractiveProcessRunner();
+        var provider = new WingetProvider(standardRunner, interactiveProcessRunner: interactiveRunner);
+
+        await provider.InstallAsync("Git.Git");
+
+        Assert.True(interactiveRunner.Called);
+        Assert.Empty(standardRunner.Calls);
+    }
+
+    [Fact]
     public async Task ListInstalledAsync_DeduplicatesExactRecordsButKeepsArchitectureVariants()
     {
         const string output = """
@@ -79,6 +130,26 @@ public sealed class WingetProviderTests
         Assert.Equal(2, packages.Count);
         Assert.Contains(packages, package => package.Architecture == "X64");
         Assert.Contains(packages, package => package.Architecture == "X86");
+    }
+
+    [Fact]
+    public async Task ListInstalledAsync_KeepsSideBySideVersionInstances()
+    {
+        // 同 Id 多版本实例(Windows App Runtime side-by-side)必须逐版本保留:
+        // winget 只在真正可升级的实例行标注「可用」,折叠版本会把可用值错当成包级语义。
+        const string output = """
+            Name                  ID                              Version  Source
+            ---------------------------------------------------------------------
+            WindowsAppRuntime.1.6 Microsoft.WindowsAppRuntime.1.6 1.6.7    winget
+            WindowsAppRuntime.1.6 Microsoft.WindowsAppRuntime.1.6 1.6.3    winget
+            """;
+        var provider = new WingetProvider(new FakeProcessRunner((_, _) => new ProcessResult(0, output, "")));
+
+        var packages = await provider.ListInstalledAsync();
+
+        Assert.Equal(2, packages.Count);
+        Assert.Contains(packages, package => package.Version == "1.6.7");
+        Assert.Contains(packages, package => package.Version == "1.6.3");
     }
 
     [Fact]
@@ -120,6 +191,21 @@ public sealed class WingetProviderTests
     {
         public List<ProcessOutput> Entries { get; } = [];
         public void Report(ProcessOutput value) => Entries.Add(value);
+    }
+
+    private sealed class CapturingInteractiveProcessRunner : IInteractiveProcessRunner
+    {
+        public bool Called { get; private set; }
+
+        public Task<ProcessResult> RunInteractiveAsync(
+            string fileName,
+            IReadOnlyList<string> arguments,
+            IProgress<ProcessOutput>? progress = null,
+            CancellationToken cancellationToken = default)
+        {
+            Called = true;
+            return Task.FromResult(new ProcessResult(0, "installed", ""));
+        }
     }
 
     private static string PadDisplay(string value, int width)

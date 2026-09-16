@@ -176,7 +176,14 @@ public partial class EditorGroupsView : UserControl
                 return match;
             }
 
-            current = VisualTreeHelper.GetParent(current) ?? LogicalTreeHelper.GetParent(current);
+            current = current switch
+            {
+                FrameworkContentElement content => content.Parent ?? ContentOperations.GetParent(content),
+                ContentElement content => ContentOperations.GetParent(content),
+                Visual or System.Windows.Media.Media3D.Visual3D =>
+                    VisualTreeHelper.GetParent(current) ?? LogicalTreeHelper.GetParent(current),
+                _ => LogicalTreeHelper.GetParent(current),
+            };
         }
 
         return null;

@@ -5,7 +5,8 @@
              xmlns:icons="clr-namespace:Nornia.Desktop"
              xmlns:av="clr-namespace:ICSharpCode.AvalonEdit;assembly=ICSharpCode.AvalonEdit"
              xmlns:sys="clr-namespace:System;assembly=System.Runtime"
-             xmlns:wbase="clr-namespace:System.Windows;assembly=WindowsBase">
+             xmlns:wbase="clr-namespace:System.Windows;assembly=WindowsBase"
+             xmlns:media="clr-namespace:System.Windows.Media.Animation;assembly=PresentationCore">
   <Application.Resources>
     <ResourceDictionary>
       <ResourceDictionary.MergedDictionaries>
@@ -178,6 +179,9 @@
     <Thickness x:Key="InsetLink">4,2</Thickness>
     <Thickness x:Key="InsetIconButton">8,4</Thickness>
     <Thickness x:Key="InsetStatusItem">8,0</Thickness>
+    <!-- 空状态提示:图标顶边相对区域顶部的固定偏移(而非在区域内居中——居中会让同一提示的位置
+         随区域高度与窗口尺寸漂移,不同功能页之间对不齐)。上下左右边距见注释。 -->
+    <Thickness x:Key="EmptyStateTopInset">24,72,24,24</Thickness>
 
     <!-- radius scale (rounded-modern: 3 / 6 / 10, plus hero surface 14 and fully-round pill) -->
     <CornerRadius x:Key="RadiusSm">3</CornerRadius>
@@ -193,6 +197,12 @@
     <wbase:Duration x:Key="DurationFast">0:0:0.12</wbase:Duration>
     <wbase:Duration x:Key="DurationNormal">0:0:0.2</wbase:Duration>
     <wbase:Duration x:Key="DurationSlow">0:0:0.3</wbase:Duration>
+
+    <!-- easing curves (Fluent Motion). Standard ≈ cubic-bezier(0,0,0,1):快速启动、缓停到位——
+         位移类动画(展开/进入)用 Standard;透明度淡入用 Soft(更轻,不与位移叠加显得拖沓)。
+         供代码动画(MotionHelper)经 TryFindResource 复用,避免逐处手写缓动。 -->
+    <media:QuarticEase x:Key="EaseOutStandard" EasingMode="EaseOut" />
+    <media:CubicEase x:Key="EaseOutSoft" EasingMode="EaseOut" />
 
     <!-- Elevation shadows (rounded-modern). App-level (not theme-level) by design: shadow is an
          elevation cue, not a color; the black shadows read softly on Dark surfaces, clearly on
@@ -696,15 +706,18 @@
           <ControlTemplate TargetType="ComboBox">
             <Grid SnapsToDevicePixels="True">
               <ToggleButton x:Name="ToggleButton" Focusable="False" ClickMode="Press"
+                            Background="{TemplateBinding Background}"
+                            BorderBrush="{TemplateBinding BorderBrush}"
+                            BorderThickness="{TemplateBinding BorderThickness}"
+                            Foreground="{TemplateBinding Foreground}"
                             IsChecked="{Binding IsDropDownOpen, RelativeSource={RelativeSource TemplatedParent}}">
                 <ToggleButton.Template>
                   <ControlTemplate TargetType="ToggleButton">
-                    <!-- The templated parent here is ToggleButton, whose default Background is
-                         the system control colour (white). Bind to the owning ComboBox instead
-                         so the closed selector stays on the dark input surface. -->
-                    <Border Background="{Binding Background, RelativeSource={RelativeSource AncestorType=ComboBox}}"
-                            BorderBrush="{Binding BorderBrush, RelativeSource={RelativeSource AncestorType=ComboBox}}"
-                            BorderThickness="{Binding BorderThickness, RelativeSource={RelativeSource AncestorType=ComboBox}}"
+                    <!-- Bind through the outer ComboBox template so the ToggleButton never falls
+                         back to the system control colour when a selector is materialized. -->
+                    <Border Background="{TemplateBinding Background}"
+                            BorderBrush="{TemplateBinding BorderBrush}"
+                            BorderThickness="{TemplateBinding BorderThickness}"
                             CornerRadius="{StaticResource RadiusSm}">
                       <TextBlock Text="{StaticResource CodiconChevronDown}" FontFamily="{StaticResource IconFontFamily}"
                                  FontSize="{DynamicResource IconChevron}" Foreground="{DynamicResource MutedTextBrush}"
@@ -744,17 +757,24 @@
       </Style.Triggers>
     </Style>
     <Style TargetType="ComboBoxItem">
-      <Setter Property="Background" Value="{DynamicResource InputBrush}" />
+      <Setter Property="Background" Value="{DynamicResource MenuBackgroundBrush}" />
       <Setter Property="Foreground" Value="{DynamicResource TextBrush}" />
       <Setter Property="Padding" Value="8,4" />
       <!-- 显式模板:项面填满下拉表面,悬停高亮走主题令牌,消除默认模板的白色缝隙 -->
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="ComboBoxItem">
-            <Border x:Name="ItemBorder" Background="Transparent" Padding="{TemplateBinding Padding}" SnapsToDevicePixels="True">
-              <ContentPresenter />
+            <Border x:Name="ItemBorder" Background="{TemplateBinding Background}" Padding="{TemplateBinding Padding}" SnapsToDevicePixels="True">
+              <ContentPresenter Content="{TemplateBinding Content}"
+                                ContentTemplate="{TemplateBinding ContentTemplate}"
+                                ContentStringFormat="{TemplateBinding ContentStringFormat}"
+                                TextElement.Foreground="{TemplateBinding Foreground}" />
             </Border>
             <ControlTemplate.Triggers>
+              <Trigger Property="IsSelected" Value="True">
+                <Setter TargetName="ItemBorder" Property="Background" Value="{DynamicResource SelectionActiveBrush}" />
+                <Setter Property="Foreground" Value="{DynamicResource BrightTextBrush}" />
+              </Trigger>
               <Trigger Property="IsHighlighted" Value="True">
                 <Setter TargetName="ItemBorder" Property="Background" Value="{DynamicResource SelectionActiveBrush}" />
                 <Setter Property="Foreground" Value="{DynamicResource BrightTextBrush}" />
@@ -775,23 +795,34 @@
          勾选 = 强调色填充 + 亮色对勾,悬停边框加深;不再使用默认 Aero2 白盒蓝勾渲染。
          作用于查找栏(大小写/全词/正则/所选范围)、设置页开关与缓存清理列。 -->
     <Style TargetType="CheckBox">
+      <Setter Property="Background" Value="{DynamicResource InputBrush}" />
       <Setter Property="Foreground" Value="{DynamicResource TextBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource InputBorderBrush}" />
       <Setter Property="FocusVisualStyle" Value="{StaticResource AppFocusRing}" />
       <Setter Property="Template">
         <Setter.Value>
           <ControlTemplate TargetType="CheckBox">
-            <StackPanel Orientation="Horizontal" Background="Transparent">
-              <Border x:Name="Box" Width="16" Height="16" CornerRadius="{StaticResource RadiusSm}"
-                      Background="{DynamicResource InputBrush}" BorderBrush="{DynamicResource BorderBrush}"
-                      BorderThickness="1" VerticalAlignment="Center" SnapsToDevicePixels="True">
-                <Path x:Name="Check" Data="M3.2 8.4 L6.8 11.8 L12.8 4.6"
-                      Stroke="{DynamicResource BrightTextBrush}" StrokeThickness="1.8"
-                      StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"
-                      HorizontalAlignment="Center" VerticalAlignment="Center" Visibility="Collapsed" />
-              </Border>
-              <ContentPresenter Margin="6,0,0,0" VerticalAlignment="Center" RecognizesAccessKey="True" />
-            </StackPanel>
+            <Grid Background="{TemplateBinding Background}">
+              <StackPanel Orientation="Horizontal"
+                          HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                          VerticalAlignment="{TemplateBinding VerticalContentAlignment}">
+                <Border x:Name="Box" Width="16" Height="16" CornerRadius="{StaticResource RadiusSm}"
+                        Background="{DynamicResource InputBrush}" BorderBrush="{TemplateBinding BorderBrush}"
+                        BorderThickness="1" VerticalAlignment="Center" SnapsToDevicePixels="True">
+                  <Path x:Name="Check" Data="M3.2 8.4 L6.8 11.8 L12.8 4.6"
+                        Stroke="{DynamicResource BrightTextBrush}" StrokeThickness="1.8"
+                        StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"
+                        HorizontalAlignment="Center" VerticalAlignment="Center" Visibility="Collapsed" />
+                </Border>
+                <ContentPresenter x:Name="Label" Margin="6,0,0,0" VerticalAlignment="Center"
+                                  ContentSource="Content" TextElement.Foreground="{TemplateBinding Foreground}"
+                                  RecognizesAccessKey="True" />
+              </StackPanel>
+            </Grid>
             <ControlTemplate.Triggers>
+              <Trigger Property="Content" Value="{x:Null}">
+                <Setter TargetName="Label" Property="Visibility" Value="Collapsed" />
+              </Trigger>
               <Trigger Property="IsChecked" Value="True">
                 <Setter TargetName="Box" Property="Background" Value="{DynamicResource AccentBrush}" />
                 <Setter TargetName="Box" Property="BorderBrush" Value="{DynamicResource AccentBrush}" />

@@ -40,13 +40,13 @@ Git 集成（仿 VS Code 源码管理，只读 diff、不提供编辑）：Deskt
 
 Desktop 的“终端”页会发现 PowerShell 7、Windows PowerShell、cmd、Git Bash 和 WSL；可添加本机自定义 Shell 路径，并以项目工作目录启动多个会话。终端输出最多保留 200,000 个字符，关闭标签或退出应用会终止对应子进程。
 
-缓存管理会扫描 `%LOCALAPPDATA%`、`%APPDATA%` 和用户根目录中的应用及开发工具缓存；用户根目录下的 `.cache`、`.npm`、NuGet、Gradle、Maven、Cargo、Yarn、Bun 与 Go 缓存可被识别，同时跳过 Documents、Downloads、OneDrive 等用户数据树。清理只删除候选目录内容并保留目录本身。
+缓存管理会扫描 `%LOCALAPPDATA%`、`%APPDATA%` 和用户根目录中的应用及开发工具缓存；它不读取或关联已安装软件包，而是根据目录名称推测 Google Chrome、Microsoft Edge、npm、NuGet、Gradle、Maven、Cargo、Yarn、Bun、Go Modules 等应用或生态分类，将同类缓存汇总以便审查。扫描会跳过 Documents、Downloads、OneDrive 等用户数据树；清理只删除候选目录内容并保留目录本身。
 
 环境版本可使用前缀（如 `10`、`3.13`）或比较器范围（如 `>=22 <23`）。`env plan` 只生成修复建议；只有 `env fix --apply` 或 Desktop 中确认“应用修复”后才会调用 Winget。
 
 `Nornia.yaml` 还可声明项目启动命令、所需架构/操作系统以及非敏感环境变量；`project export/import` 用于在团队间复制经验证的环境声明。导出的文件不包含本机已安装软件、令牌或其他凭据。
 
-扫描到的 Runtime 和已安装 Package、初始化/检查/打开过的项目、环境配置与检查绑定，以及操作日志会持久化到 `%LOCALAPPDATA%\Nornia\nornia.db`。Packages 会显示 Winget 可识别的 `X86`、`X64`、`ARM64` 架构，并仅合并完全重复的包记录；目录缺失的项目会保留为历史记录，可在 Projects 页面手动移除。
+扫描到的 Runtime 和已安装 Package、初始化/检查/打开过的项目、环境配置与检查绑定，以及操作日志会持久化到 `%LOCALAPPDATA%\Nornia\nornia.db`。环境清单采用"快照优先"刷新：页面打开先用持久化快照秒出首屏，快照在 TTL 内（默认 6 小时）且环境指纹（PATH、工具路径、VC++ 注册表）未变时不重跑任何扫描进程；TTL 过期、指纹变化或用户点「重新扫描/刷新」时才全量扫描。任何安装/卸载/升级之后都会强制重扫以保证列表反映变更，页头会显示「上次扫描」时间供参考。Packages 会显示 Winget 可识别的 `X86`、`X64`、`ARM64` 架构，并仅合并完全重复的包记录；目录缺失的项目会保留为历史记录，可在 Projects 页面手动移除。
 
 `env fix` 批次逐步骤追踪（correlation_id + 修复日志表），失败可生成回滚计划：能自动撤销的步骤自动执行，Winget 降级等步骤给出手动命令提示。软件包渠道除 Winget 外，本机装有 Scoop/Chocolatey 时按操作自动选择。
 

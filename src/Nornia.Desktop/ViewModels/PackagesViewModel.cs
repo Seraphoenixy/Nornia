@@ -25,9 +25,9 @@ public partial class PackagesViewModel(
     IPackageInventoryService inventoryService,
     IConfirmationService confirmationService,
     IUiLogService logService,
-    CacheViewModel cache,
     IClipboardService? clipboard = null,
-    IUiPerformanceMetrics? performanceMetrics = null)
+    IUiPerformanceMetrics? performanceMetrics = null,
+    IInventoryScanStateRepository? scanStateRepository = null)
     : PageViewModel("软件包", logService), INavigationTarget
 {
     private readonly IClipboardService _clipboard = clipboard ?? NullClipboardService.Instance;
@@ -40,14 +40,6 @@ public partial class PackagesViewModel(
     public ObservableCollection<PackageInfo> SelectedPackages { get; } = [];
     public ICollectionView FilteredPackages => CollectionViewSource.GetDefaultView(Packages);
     public ICollectionView SearchView => CollectionViewSource.GetDefaultView(SearchResults);
-
-    /// <summary>Cache workspace exposed to the packages page's "缓存" tab. Cache management is part of
-    /// the package management page rather than a standalone module, sharing the page lifecycle so a
-    /// single navigation entry drives both the package list and its cache review.</summary>
-    public CacheViewModel Cache { get; } = cache;
-
-    [ObservableProperty]
-    private int selectedWorkspaceTab;
 
     [ObservableProperty]
     [NotifyCanExecuteChangedFor(nameof(InstallSelectedCommand))]
@@ -90,7 +82,10 @@ public partial class PackagesViewModel(
     [ObservableProperty]
     private bool isProviderColumnVisible;
 
-    protected override Task OnFirstActivatedAsync()
+    /// <summary>页头新鲜度提示:包清单快照何时扫描,由 scan_state 提供(空表示不可用/未注册仓库)。</summary>
+    [ObservableProperty] private string lastScanDisplay = string.Empty;
+
+    protected override async Task OnFirstActivatedAsync()
     {
         SelectedPackages.CollectionChanged += (_, _) =>
         {
@@ -100,10 +95,34 @@ public partial class PackagesViewModel(
         };
         FilteredPackages.Filter = MatchesFilter;
         SearchView.Filter = MatchesSearch;
-        // 不再预激活缓存页:首次激活曾触发全盘缓存扫描,启动/进页即静默扫盘;
-        // 缓存数据改由“扫描缓存”按钮显式加载(缓存标签页自带空状态引导)。
-        return ListInstalledAsync();
+        // 快照优先:先用持久化包清单立即渲染首屏(winget list 可能长达数十秒),再走
+        // TTL 门控刷新;快照足够新时门控刷新直接返回库内数据,不运行 winget。
+        await SeedPersistedPackagesAsync();
+        await ListInstalledGatedAsync();
     }
+
+    /// <summary>从持久化包清单立即填充列表,失败静默(门控刷新会落回全扫兜底)。</summary>
+    private async Task SeedPersistedPackagesAsync()
+    {
+        try
+        {
+            ShowInstalledList(await inventoryService.GetPersistedAsync());
+            LastScanDisplay = await InventoryScanAgeText.LoadAsync(
+                scanStateRepository, InventoryScanAgeText.PackageScanKind);
+        }
+        catch
+        {
+            // 持久化暂不可用(如表未建好):交给下面的门控刷新处理。
+        }
+    }
+
+    /// <summary>首激活的门控加载:快照在 TTL 内时零 winget 进程;过期时全量扫描一次。</summary>
+    private Task ListInstalledGatedAsync() => RunAsync("读取已安装软件包", async cancellationToken =>
+    {
+        ShowInstalledList(await inventoryService.RefreshAsync(OperationProgress, cancellationToken));
+        LastScanDisplay = await InventoryScanAgeText.LoadAsync(
+            scanStateRepository, InventoryScanAgeText.PackageScanKind, cancellationToken);
+    }, "确认包管理器可用后重试。", canCancel: true);
 
     [RelayCommand(CanExecute = nameof(CanSearch))]
     private Task SearchAsync() => RunAsync("搜索软件包", async cancellationToken =>
@@ -112,9 +131,14 @@ public partial class PackagesViewModel(
         ShowSearchResults(packages, $"“{SearchQuery}” 的搜索结果");
     }, "检查包管理器是否可用，或更换关键词后重试。", canCancel: true);
 
+    /// <summary>「重新扫描」按钮:永远强制重跑 winget 并更新持久化快照与 scan_state。</summary>
     [RelayCommand]
     private Task ListInstalledAsync() => RunAsync("读取已安装软件包", async cancellationToken =>
-        ShowInstalledList(await inventoryService.RefreshAsync(OperationProgress, cancellationToken)), "确认包管理器可用后重试。", canCancel: true);
+    {
+        ShowInstalledList(await inventoryService.RefreshForcedAsync(OperationProgress, cancellationToken));
+        LastScanDisplay = await InventoryScanAgeText.LoadAsync(
+            scanStateRepository, InventoryScanAgeText.PackageScanKind, cancellationToken);
+    }, "确认包管理器可用后重试。", canCancel: true);
 
     [RelayCommand(CanExecute = nameof(CanInstallSelected))]
     private Task InstallSelectedAsync() => InstallPackageAsync(SelectedPackage!.Id, null);
@@ -141,8 +165,13 @@ public partial class PackagesViewModel(
             return;
         }
 
-            foreach (var package in selected) await packageProvider.UninstallAsync(package.Id, package.Name, OperationProgress, cancellationToken);
-        await LoadInstalledPackagesAsync(cancellationToken);
+        foreach (var package in selected)
+        {
+            await packageProvider.UninstallAsync(package.Id, package.Name, OperationProgress, cancellationToken);
+            // Refresh after each completed mutation so a batch operation does not leave the
+            // package grid/form showing the pre-uninstall snapshot until the very end.
+            await LoadInstalledPackagesAsync(cancellationToken);
+        }
     }, "如卸载失败，请确认软件未在运行并查看 Problems。", canCancel: true);
 
     [RelayCommand(CanExecute = nameof(CanUpgrade))]
@@ -151,8 +180,13 @@ public partial class PackagesViewModel(
         var selected = SelectedPackages.Where(package => package.IsInstalled && !string.IsNullOrWhiteSpace(package.AvailableVersion)).ToArray();
         if (selected.Length == 0 && SelectedPackage is { IsInstalled: true, AvailableVersion: not null } current) selected = [current];
         if (selected.Length == 0) throw new InvalidOperationException("请选择一个或多个存在更新的软件包。");
-        foreach (var package in selected) await packageProvider.UpgradeAsync(package.Id, OperationProgress, cancellationToken);
-        await LoadInstalledPackagesAsync(cancellationToken);
+        foreach (var package in selected)
+        {
+            await packageProvider.UpgradeAsync(package.Id, OperationProgress, cancellationToken);
+            // The installed version and available-version columns are authoritative only after
+            // winget has completed and the live inventory has been scanned again.
+            await LoadInstalledPackagesAsync(cancellationToken);
+        }
     }, "查看 Output 中的包管理器诊断后重试。", canCancel: true);
 
     /// <summary>Bulk-upgrade every installed package that has an available update (the Updates view's
@@ -166,9 +200,8 @@ public partial class PackagesViewModel(
         foreach (var package in updatable)
         {
             await packageProvider.UpgradeAsync(package.Id, OperationProgress, cancellationToken);
+            await LoadInstalledPackagesAsync(cancellationToken);
         }
-
-        await LoadInstalledPackagesAsync(cancellationToken);
     }, "查看 Output 中的包管理器诊断后重试。", canCancel: true);
 
     [RelayCommand]
@@ -221,19 +254,55 @@ public partial class PackagesViewModel(
 
     private bool CanCopyAllSearchResults() => SearchResults.Count > 0;
 
-    private async Task LoadInstalledPackagesAsync(CancellationToken cancellationToken = default) =>
-        ShowInstalledList(await inventoryService.RefreshAsync(OperationProgress, cancellationToken));
+    /// <summary>安装/卸载/升级之后的重载:必须强制刷新,绕过合并缓存与持久化快照 TTL,
+    /// 否则列表会展示变更前的旧数据。</summary>
+    private async Task LoadInstalledPackagesAsync(CancellationToken cancellationToken = default)
+    {
+        ShowInstalledList(await inventoryService.RefreshForcedAsync(OperationProgress, cancellationToken));
+        LastScanDisplay = await InventoryScanAgeText.LoadAsync(
+            scanStateRepository, InventoryScanAgeText.PackageScanKind, cancellationToken);
+    }
 
     private void ShowInstalledList(IEnumerable<PackageInfo> packages)
     {
         var snapshot = packages as IReadOnlyList<PackageInfo> ?? packages.ToArray();
         using var performance = performanceMetrics?.Begin("packages.installed.publish", snapshot.Count, "ui-batch");
+        var preserveSelection = ListMode == PackageListMode.Installed;
+        var selectedIds = SelectedPackages.Select(package => package.Id)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var selectedId = SelectedPackage?.Id;
         Packages.ReplaceRange(snapshot);
 
         ListMode = PackageListMode.Installed;
+        if (preserveSelection)
+        {
+            ReselectPublishedPackages(snapshot, selectedIds, selectedId);
+        }
         IsProviderColumnVisible = Packages.Select(package => package.Provider).Distinct(StringComparer.OrdinalIgnoreCase).Skip(1).Any();
         NotifyCopyCommands();
         UpdateInstalledListState();
+    }
+
+    private void ReselectPublishedPackages(
+        IReadOnlyList<PackageInfo> snapshot,
+        IReadOnlySet<string> selectedIds,
+        string? selectedId)
+    {
+        var selected = snapshot
+            .Where(package => selectedIds.Contains(package.Id))
+            .ToArray();
+        SelectedPackages.Clear();
+        foreach (var package in selected)
+        {
+            SelectedPackages.Add(package);
+        }
+
+        // Keep the form bound to the newly scanned package record. A removed package has no
+        // replacement, so clearing it is preferable to showing its old version as if it still
+        // existed.
+        SelectedPackage = selectedId is null
+            ? null
+            : snapshot.FirstOrDefault(package => string.Equals(package.Id, selectedId, StringComparison.OrdinalIgnoreCase));
     }
 
     private void ShowSearchResults(IEnumerable<PackageInfo> packages, string summary)
@@ -299,20 +368,10 @@ public partial class PackagesViewModel(
     {
         switch (context)
         {
-            case NavigationContext.CacheHighConfidence:
-                SelectedWorkspaceTab = 1;
-                Cache.ApplyNavigationContext(new NavigationContext.CacheHighConfidence());
-                break;
-            case NavigationContext.CacheByPackage(var id, var name, var provider):
-                SelectedWorkspaceTab = 1;
-                Cache.ApplyNavigationContext(new NavigationContext.CacheByPackage(id, name, provider));
-                break;
             case NavigationContext.Updates:
-                SelectedWorkspaceTab = 0;
                 ListMode = PackageListMode.Updates;
                 break;
             default:
-                SelectedWorkspaceTab = 0;
                 ListMode = PackageListMode.Installed;
                 break;
         }

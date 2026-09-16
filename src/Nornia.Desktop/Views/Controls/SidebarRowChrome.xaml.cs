@@ -1,6 +1,7 @@
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Media;
 
 namespace Nornia.Desktop.Views.Controls;
 
@@ -98,7 +99,14 @@ public partial class SidebarRowChrome : UserControl
 
     private static Button? FindButtonAncestor(DependencyObject source)
     {
-        for (var current = source; current is not null; current = System.Windows.Media.VisualTreeHelper.GetParent(current))
+        for (var current = source; current is not null; current = current switch
+        {
+            FrameworkContentElement content => content.Parent ?? ContentOperations.GetParent(content),
+            ContentElement content => ContentOperations.GetParent(content),
+            Visual or System.Windows.Media.Media3D.Visual3D =>
+                System.Windows.Media.VisualTreeHelper.GetParent(current) ?? LogicalTreeHelper.GetParent(current),
+            _ => LogicalTreeHelper.GetParent(current),
+        })
         {
             if (current is Button button) return button;
             if (current is SidebarRowChrome) break;
