@@ -373,9 +373,9 @@ public sealed class WindowedFindDebounceTests : IDisposable
         // Strict refinement (prefix + longer literal): the previous list stays visible while the
         // debounced scan runs, and the new result is a subset of it (only line 100 survives).
         tab.SearchText = "needle alpha";
-        await Task.Delay(100);
+        // Assert synchronously: a delayed continuation may resume after the debounce expires.
         Assert.Equal(4, tab.MatchCount); // retained until the new result lands
-        await WaitForAsync(() => tab.MatchCount == 1 && tab.SearchMatches.Count == 1);
+        await WaitForAsync(() => !tab.IsSearching && tab.MatchCount == 1 && tab.SearchMatches.Count == 1);
 
         var refined = Assert.Single(tab.SearchMatches);
         Assert.Equal(100, refined.Line);
@@ -385,9 +385,9 @@ public sealed class WindowedFindDebounceTests : IDisposable
         // Re-scans with identical results keep the unchanged segment's instance (identity is the
         // hook the view uses to swap only changed segments instead of rebuilding everything).
         tab.SearchCaseSensitive = true;
-        await WaitForAsync(() => tab.MatchCount == 1 && tab.SearchMatches.Count == 1);
+        await WaitForAsync(() => !tab.IsSearching && tab.MatchCount == 1 && tab.SearchMatches.Count == 1);
         tab.SearchCaseSensitive = false;
-        await WaitForAsync(() => tab.MatchCount == 1 && tab.SearchMatches.Count == 1);
+        await WaitForAsync(() => !tab.IsSearching && tab.MatchCount == 1 && tab.SearchMatches.Count == 1);
         Assert.Same(refined, Assert.Single(tab.SearchMatches));
     }
 }

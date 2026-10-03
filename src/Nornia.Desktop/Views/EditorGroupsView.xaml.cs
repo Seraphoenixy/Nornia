@@ -19,6 +19,8 @@ public partial class EditorGroupsView : UserControl
     private EditorGroupsViewModel? _groups;
     private WorkbenchViewModel? _workbench;
     private readonly List<(EditorSplitNode Split, Grid Grid)> _splitGrids = [];
+    private readonly Dictionary<EditorGroupViewModel, EditorGroupView> _groupViews = [];
+    private EditorLayoutNode? _lastBuiltRoot;
     private Point _editorTabDragStart;
     private WorkbenchTabViewModel? _dragTab;
     private WorkbenchTabViewModel? _contextTab;
@@ -48,6 +50,8 @@ public partial class EditorGroupsView : UserControl
                 }
 
                 _groups = groups;
+                _groupViews.Clear();
+                _lastBuiltRoot = null;
                 _groups.LayoutChanged += OnLayoutChanged;
                 Rebuild();
             }
@@ -63,9 +67,48 @@ public partial class EditorGroupsView : UserControl
             return;
         }
 
+        // 布局树(结构 + 组实例 + 分割比例)与上次构建一致时整体跳过:组内标签重排、
+        // 比例写回等只改集合/网格不改树,整棵重建只会销毁 EditorAreaView 的持久预览面、
+        // 重物化全部编辑器视图,是布局操作的卡顿与视图状态丢失来源。
+        if (GroupsHost.Child is not null && SameLayout(_lastBuiltRoot, _groups.Root))
+        {
+            return;
+        }
+
+        _lastBuiltRoot = _groups.Root;
         _splitGrids.Clear();
         GroupsHost.Child = BuildNode(_groups.Root);
         WireLocked2x2();
+
+        // 复用组视图(见 BuildGroupView):清理已不在布局树中的组对应的缓存实例。
+        var live = _groups.Groups.ToHashSet();
+        foreach (var stale in _groupViews.Keys.Where(group => !live.Contains(group)).ToArray())
+        {
+            _groupViews.Remove(stale);
+        }
+    }
+
+    /// <summary>递归比较两棵布局树是否等价:分割节点要求方向、比例、子树逐位相同,
+    /// 组节点要求同一实例(布局恢复会用相同 GroupId 换新组实例,必须重建)。</summary>
+    private static bool SameLayout(EditorLayoutNode? left, EditorLayoutNode? right)
+    {
+        if (ReferenceEquals(left, right)) return true;
+        if (left is null || right is null) return false;
+        if (left is EditorSplitNode leftSplit && right is EditorSplitNode rightSplit)
+        {
+            return leftSplit.Orientation == rightSplit.Orientation
+                && leftSplit.Children.Count == rightSplit.Children.Count
+                && leftSplit.Weights.Count == rightSplit.Weights.Count
+                && leftSplit.Weights.Zip(rightSplit.Weights, (a, b) => a == b).All(equal => equal)
+                && leftSplit.Children.Zip(rightSplit.Children, SameLayout).All(equal => equal);
+        }
+
+        if (left is EditorGroupNode leftGroup && right is EditorGroupNode rightGroup)
+        {
+            return ReferenceEquals(leftGroup.Group, rightGroup.Group);
+        }
+
+        return false;
     }
 
     /// <summary>2×2 角落 Sash 联动 (VS Code GridView.trySet2x2):根分割的两个内部分割
@@ -198,12 +241,20 @@ public partial class EditorGroupsView : UserControl
 
     private EditorGroupView BuildGroupView(EditorGroupViewModel group)
     {
-        var view = new EditorGroupView { DataContext = group };
+        // 复用组视图:EditorAreaView 的持久 FilePreviewView 与文档视图跨重建存活,
+        // 布局操作(拆分/移动标签)不再丢失编辑器内部状态或重新物化文档。
+        if (!_groupViews.TryGetValue(group, out var view))
+        {
+            view = new EditorGroupView();
+            view.GroupActivated += View_GroupActivated;
+            _groupViews[group] = view;
+        }
+
+        view.DataContext = group;
         // 编辑器组最小宽高:组拆分后即使窗口变窄也不至于坍缩为不可用窄条。
         var minimum = MinimumGroupSize();
         view.MinWidth = minimum;
         view.MinHeight = MinimumGroupHeight();
-        view.GroupActivated += View_GroupActivated;
         return view;
     }
 

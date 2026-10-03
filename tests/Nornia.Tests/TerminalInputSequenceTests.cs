@@ -8,6 +8,26 @@ namespace Nornia.Tests;
 public sealed class TerminalInputSequenceTests
 {
     [Fact]
+    public void CopySelection_PreservesBlankLinesAndDragDirection()
+    {
+        var screen = new Nornia.Desktop.Terminal.TerminalScreen(columns: 20, rows: 10);
+        screen.FeedText("first\r\n\r\nlast");
+        var top = screen.Rows - 1;
+        var expected = "first" + Environment.NewLine + Environment.NewLine + "last";
+        Assert.Equal(expected, TerminalSurfaceControl.ExtractSelectionText(screen, (top, 0), (top - 2, 3)));
+        Assert.Equal(expected, TerminalSurfaceControl.ExtractSelectionText(screen, (top - 2, 3), (top, 0)));
+    }
+
+    [Fact]
+    public void CopySelection_OmitsWideCharacterContinuationCells()
+    {
+        var screen = new Nornia.Desktop.Terminal.TerminalScreen(columns: 20, rows: 10);
+        screen.FeedText("中文 ABC");
+        Assert.Equal("中文 ABC", TerminalSurfaceControl.ExtractSelectionText(screen,
+            (screen.Rows - 1, 0), (screen.Rows - 1, 7)));
+    }
+
+    [Fact]
     public void ArrowKeySequences_ArePlainVtPassThrough()
     {
         Assert.Equal("\x1b[A", TerminalSurfaceControl.ArrowUpSequence);

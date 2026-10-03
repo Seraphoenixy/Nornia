@@ -46,6 +46,7 @@ public partial class GitView : UserControl
     // (ButtonBase 捕获导致的菜单关闭不触发 Closed 路由事件,只能从 IsOpen 变化捕获)。
     private readonly HashSet<Button> _menuCloseWatched = [];
     private readonly Dictionary<Button, long> _menuClosedAtTicks = [];
+    private readonly Dictionary<Button, Delegate> _menuCloseHandlers = [];
 
     public GitView()
     {
@@ -250,11 +251,22 @@ public partial class GitView : UserControl
             // ButtonBase 在 MouseDown 捕获鼠标会顺带关掉打开中的菜单,该路径不触发
             // ContextMenu.Closed 路由事件;改挂 IsOpen 依赖属性,任何关闭都记录时刻,
             // 供 Click 判定"这次按压是否就是关闭手势本身"。
-            DependencyPropertyDescriptor.FromProperty(ContextMenu.IsOpenProperty, typeof(ContextMenu))
-                .AddValueChanged(menu, (_, _) =>
-                {
-                    if (!menu.IsOpen) _menuClosedAtTicks[button] = Environment.TickCount64;
-                });
+            var descriptor = DependencyPropertyDescriptor.FromProperty(ContextMenu.IsOpenProperty, typeof(ContextMenu));
+            EventHandler handler = (_, _) =>
+            {
+                if (!menu.IsOpen) _menuClosedAtTicks[button] = Environment.TickCount64;
+            };
+            descriptor.AddValueChanged(menu, handler);
+            _menuCloseHandlers[button] = handler;
+            // 描述符处理器会被 rooting 到 AppDomain 生命周期;列表虚拟化不断重建按钮时
+            // 若不移除会无限累积(root 住按钮与本视图)。按钮卸载时解除订阅,复用后重挂。
+            button.Unloaded += (_, _) =>
+            {
+                descriptor.RemoveValueChanged(menu, handler);
+                _menuCloseWatched.Remove(button);
+                _menuCloseHandlers.Remove(button);
+                _menuClosedAtTicks.Remove(button);
+            };
         }
 
         // 下压时菜单已被本次按压顺带关闭(见 Preview 处理器;或关闭与 Click 的竞态):

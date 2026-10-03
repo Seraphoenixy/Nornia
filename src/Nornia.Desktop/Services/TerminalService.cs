@@ -374,11 +374,18 @@ public sealed class TerminalService : ITerminalService
     private const bool TryConPtyFirst = true;
 
     /// <summary>ConPTY 会话“可用性判定”窗口:首字节在这个时间内到达视为交互式可用。</summary>
-    private static readonly TimeSpan PtyVerdictTimeout = TimeSpan.FromSeconds(2);
+    // A cold PowerShell launch can exceed two seconds under load. Wait for the first
+    // output without misclassifying a healthy, slow-starting shell as a broken ConPTY.
+    private static readonly TimeSpan PtyVerdictTimeout = TimeSpan.FromSeconds(10);
 
     private readonly List<TerminalSession> _sessions = [];
     private readonly IUiLogService? _log;
+    private IReadOnlyList<ShellProfile>? _profileCache;
+    private DateTimeOffset _profileCacheAt;
     private int _disposed;
+
+    /// <summary>Shell 发现结果的缓存时长:结果基本静态,只保留短窗口以捕捉会话中途新装的 Shell。</summary>
+    private static readonly TimeSpan ProfileCacheTtl = TimeSpan.FromSeconds(60);
 
     public TerminalService(IUiLogService? log = null)
     {
@@ -387,6 +394,15 @@ public sealed class TerminalService : ITerminalService
 
     public IReadOnlyList<ShellProfile> DiscoverProfiles()
     {
+        // 发现结果在进程生命周期内基本不变(已安装的 Shell),而调用方(工作区切换/页面激活/
+        // 设置变更)可能频繁触发:缓存一段时间,避免每次都在 UI 线程对 PATH 逐目录做
+        // File.Exists 扫描(网络盘/慢速目录下可感知卡顿)。保留短 TTL 以发现会话中途新装的 Shell。
+        var cached = _profileCache;
+        if (cached is not null && DateTimeOffset.UtcNow - _profileCacheAt < ProfileCacheTtl)
+        {
+            return cached;
+        }
+
         var profiles = new List<ShellProfile>();
         AddIfFound(profiles, "pwsh", "PowerShell 7", "pwsh.exe", "-NoLogo");
         AddIfFound(profiles, "powershell", "Windows PowerShell", "powershell.exe", "-NoLogo");
@@ -394,7 +410,10 @@ public sealed class TerminalService : ITerminalService
         AddIfFound(profiles, "wsl", "WSL", "wsl.exe");
         var gitBash = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "Git", "bin", "bash.exe");
         if (File.Exists(gitBash)) profiles.Add(new ShellProfile("git-bash", "Git Bash", gitBash, "--login -i"));
-        return profiles.Count > 0 ? profiles : [new ShellProfile("cmd", "命令提示符", "cmd.exe")];
+        var result = profiles.Count > 0 ? profiles : [new ShellProfile("cmd", "命令提示符", "cmd.exe")];
+        _profileCache = result;
+        _profileCacheAt = DateTimeOffset.UtcNow;
+        return result;
     }
 
     public async Task<TerminalSession> StartAsync(ShellProfile profile, string workingDirectory, CancellationToken cancellationToken = default)

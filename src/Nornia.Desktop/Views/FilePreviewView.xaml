@@ -78,10 +78,30 @@
         </Border>
         <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
           <StackPanel Orientation="Horizontal" Visibility="{Binding IsMarkdown, Converter={StaticResource BooleanToVisibilityConverter}}">
-            <Button Content="预览" Style="{StaticResource LinkButton}" Padding="4,1"
-                    Command="{Binding ShowMarkdownPreviewCommand}" ToolTip="显示 Markdown 渲染结果" />
-            <Button Content="源码" Style="{StaticResource LinkButton}" Padding="4,1" Margin="4,0,2,0"
-                    Command="{Binding ShowMarkdownSourceCommand}" ToolTip="显示 Markdown 源码" />
+            <Button Content="预览" Padding="4,1" Command="{Binding ShowMarkdownPreviewCommand}"
+                    ToolTip="显示 Markdown 渲染结果">
+              <Button.Style>
+                <Style TargetType="Button" BasedOn="{StaticResource LinkButton}">
+                  <Style.Triggers>
+                    <DataTrigger Binding="{Binding IsMarkdownRendered}" Value="True">
+                      <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
+                    </DataTrigger>
+                  </Style.Triggers>
+                </Style>
+              </Button.Style>
+            </Button>
+            <Button Content="源码" Padding="4,1" Margin="4,0,2,0"
+                    Command="{Binding ShowMarkdownSourceCommand}" ToolTip="显示 Markdown 源码">
+              <Button.Style>
+                <Style TargetType="Button" BasedOn="{StaticResource LinkButton}">
+                  <Style.Triggers>
+                    <DataTrigger Binding="{Binding ShowSourceSurface}" Value="True">
+                      <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
+                    </DataTrigger>
+                  </Style.Triggers>
+                </Style>
+              </Button.Style>
+            </Button>
           </StackPanel>
           <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconSearch}" FontFamily="{StaticResource IconFontFamily}" Padding="4,2"
                   Command="{Binding OpenFindBarCommand}" ToolTip="查找（Ctrl+F）" AutomationProperties.Name="查找" />
@@ -133,8 +153,13 @@
                 Padding="8,4" Margin="8,0,0,0" Command="{Binding GoToLineCommand}" />
         <TextBlock Text="转到行 / 列：" FontSize="{DynamicResource TypeBody}" Foreground="{DynamicResource MutedTextBrush}"
                    VerticalAlignment="Center" Margin="0,0,8,0" />
-        <TextBox x:Name="GoToLineBox" Text="{Binding GoToLineInput, UpdateSourceTrigger=PropertyChanged}"
-                 ToolTip="输入行号，如 42 或 42:16（Enter 定位 · Esc 关闭）" />
+        <StackPanel Width="250">
+          <TextBox x:Name="GoToLineBox" Text="{Binding GoToLineInput, UpdateSourceTrigger=PropertyChanged}"
+                   ToolTip="输入行号，如 42 或 42:16（Enter 定位 · Esc 关闭）" />
+          <TextBlock Text="{Binding GoToLineErrorMessage}" Foreground="{DynamicResource ErrorTextBrush}"
+                     FontSize="{DynamicResource TypeBody}" Margin="0,3,0,0"
+                     Visibility="{Binding GoToLineErrorMessage, Converter={StaticResource StringEmptyToCollapsedConverter}}" />
+        </StackPanel>
       </DockPanel>
     </Border>
 
@@ -163,6 +188,7 @@
         <views:CodeDocumentView x:Name="CodeView" SourceText="{Binding Content}"
                                 HighlightingName="{Binding FileType.HighlightingName}"
                                 PresentationSnapshot="{Binding Presentation}"
+                                GlobalLineStart="{Binding WindowStartLine}"
                                 EditorFontSize="{Binding FontSize, Mode=TwoWay}"
                                 ShowMinimap="{Binding ShowMinimap}"
                                 ShowStickyScroll="{Binding ShowStickyScroll}"
@@ -193,6 +219,17 @@
             </Style>
           </views:MarkdownPreviewView.Style>
         </views:MarkdownPreviewView>
+
+        <Border Background="{DynamicResource EditorBrush}" Panel.ZIndex="30" IsHitTestVisible="False"
+                Visibility="{Binding IsReadingBusy, Converter={StaticResource BooleanToVisibilityConverter}}">
+          <StackPanel HorizontalAlignment="Center" VerticalAlignment="Top" Margin="0,48,0,0">
+            <TextBlock Text="{StaticResource CodiconLoading}" FontFamily="{StaticResource IconFontFamily}"
+                       FontSize="{DynamicResource IconEmpty}" Foreground="{DynamicResource MutedTextBrush}"
+                       HorizontalAlignment="Center" />
+            <TextBlock Text="{Binding ReadingBusyText}" Foreground="{DynamicResource MutedTextBrush}"
+                       Margin="0,8,0,0" HorizontalAlignment="Center" />
+          </StackPanel>
+        </Border>
 
         <!-- 浮动查找部件(VS Code findWidget):编辑器区右上角浮层,输入框+计数+上下/全部高亮/关闭,
              选项行(大小写/全词/正则/所选范围)。 -->
@@ -232,10 +269,13 @@
                        Foreground="{DynamicResource ErrorTextBrush}" TextTrimming="CharacterEllipsis"
                        MaxWidth="340" Margin="0,4,0,0" ToolTip="{Binding SearchErrorMessage}"
                        Visibility="{Binding SearchErrorMessage, Converter={StaticResource StringEmptyToCollapsedConverter}}" />
+            <TextBlock Text="正在查找…" FontSize="{DynamicResource TypeBody}"
+                       Foreground="{DynamicResource MutedTextBrush}" Margin="0,4,0,0"
+                       Visibility="{Binding IsSearching, Converter={StaticResource BooleanToVisibilityConverter}}" />
             <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
-              <CheckBox Content="大小写" FontSize="{DynamicResource TypeBody}" IsChecked="{Binding SearchCaseSensitive, UpdateSourceTrigger=PropertyChanged}" />
-              <CheckBox Content="全词" FontSize="{DynamicResource TypeBody}" IsChecked="{Binding SearchWholeWord, UpdateSourceTrigger=PropertyChanged}" Margin="8,0,0,0" />
-              <CheckBox Content="正则" FontSize="{DynamicResource TypeBody}" IsChecked="{Binding SearchUseRegex, UpdateSourceTrigger=PropertyChanged}" Margin="8,0,0,0" />
+              <CheckBox Content="大小写" ToolTip="区分大小写（Alt+C）" FontSize="{DynamicResource TypeBody}" IsChecked="{Binding SearchCaseSensitive, UpdateSourceTrigger=PropertyChanged}" />
+              <CheckBox Content="全词" ToolTip="全词匹配（Alt+W）" FontSize="{DynamicResource TypeBody}" IsChecked="{Binding SearchWholeWord, UpdateSourceTrigger=PropertyChanged}" Margin="8,0,0,0" />
+              <CheckBox Content="正则" ToolTip="正则表达式（Alt+R）" FontSize="{DynamicResource TypeBody}" IsChecked="{Binding SearchUseRegex, UpdateSourceTrigger=PropertyChanged}" Margin="8,0,0,0" />
               <CheckBox Content="所选范围" FontSize="{DynamicResource TypeBody}" IsChecked="{Binding SearchInSelection, UpdateSourceTrigger=PropertyChanged}"
                         Margin="8,0,0,0"
                         Visibility="{Binding HasTextSelection, Converter={StaticResource BooleanToVisibilityConverter}}" />

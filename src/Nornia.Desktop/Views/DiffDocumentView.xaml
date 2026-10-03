@@ -131,7 +131,7 @@
                   Click="ToggleFindBar_Click" ToolTip="关闭查找（Esc）" />
         </StackPanel>
         <TextBox x:Name="DiffFindBox" Text="{Binding FindText, UpdateSourceTrigger=PropertyChanged}"
-                 ToolTip="在统一 Diff 文本中查找（Enter 下一个 · Esc 关闭）" MinWidth="220"
+                  ToolTip="在统一 Diff 文本中查找（Ctrl+F 聚焦 · Enter/F3 下一个 · Shift+Enter/Shift+F3 上一个 · Esc 关闭）" MinWidth="220"
                  KeyDown="DiffFindBox_KeyDown" />
       </DockPanel>
     </Border>
@@ -305,6 +305,17 @@
         <views:EmptyStateControl Icon="{StaticResource CodiconSourceControl}" Title="{Binding EmptyStateTitle}" />
       </Border>
     </Grid>
+
+    <Border Grid.Row="1" Panel.ZIndex="40" Background="{DynamicResource EditorBrush}" IsHitTestVisible="False"
+            Visibility="{Binding IsLoaded, Converter={StaticResource InverseBooleanToVisibilityConverter}}">
+      <StackPanel HorizontalAlignment="Center" VerticalAlignment="Top" Margin="0,48,0,0">
+        <TextBlock Text="{StaticResource CodiconLoading}" FontFamily="{StaticResource IconFontFamily}"
+                   FontSize="{DynamicResource IconEmpty}" Foreground="{DynamicResource MutedTextBrush}"
+                   HorizontalAlignment="Center" />
+        <TextBlock Text="正在加载 Diff…" Foreground="{DynamicResource MutedTextBrush}"
+                   Margin="0,8,0,0" HorizontalAlignment="Center" />
+      </StackPanel>
+    </Border>
 
     <!-- 只读状态(位置/Diff 模式/diff 行数)已并入窗口主状态栏(MainWindow 底部 StatusBar 的
          "当前文档状态"段),视图内不再保留独立底栏。 -->

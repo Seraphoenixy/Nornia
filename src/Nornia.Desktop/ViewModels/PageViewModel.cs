@@ -100,6 +100,12 @@ public abstract partial class PageViewModel(string title, IUiLogService logServi
     {
         if (IsBusy)
         {
+            // 去重:操作进行中不并发执行,但必须给出可见解释,否则用户点击命令会感觉"无响应"。
+            // 不调度清除,由进行中操作的终态状态覆盖本提示。
+            StatusKind = StatusKind.Warning;
+            StatusMessage = CurrentOperation is { } running
+                ? $"“{running.Title}”正在进行，已跳过“{operation}”"
+                : $"{operation}未执行：已有操作进行中";
             return false;
         }
 

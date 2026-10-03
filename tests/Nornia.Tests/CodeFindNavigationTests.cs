@@ -129,6 +129,28 @@ public sealed class FilePreviewSearchTests : IDisposable
     }
 
     [Fact]
+    public async Task SingleMatch_NavigationRepublishesViewIndexEveryTime()
+    {
+        var path = Path.Combine(_tempDir, "single.txt");
+        await File.WriteAllTextAsync(path, "first\nunique\nlast");
+        var tab = await CreateTabAsync(path);
+        tab.SearchText = "unique";
+        var notifications = 0;
+        tab.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(FilePreviewTab.CurrentMatchViewIndex)) notifications++;
+        };
+
+        tab.FindNextCommand.Execute(null);
+        tab.FindNextCommand.Execute(null);
+        tab.FindPreviousCommand.Execute(null);
+
+        Assert.Equal(3, notifications);
+        Assert.Equal(0, tab.CurrentMatchViewIndex);
+        Assert.Equal("1 / 1", tab.CurrentMatchDisplay);
+    }
+
+    [Fact]
     public async Task FindNextAndPrevious_CycleThroughMatches()
     {
         var path = Path.Combine(_tempDir, "a.txt");

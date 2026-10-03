@@ -50,7 +50,7 @@ public sealed class TerminalStartupTests
         }
 
         var service = new TerminalService();
-        var profile = new ShellProfile("pwsh", "PowerShell 7", pwsh, "-NoLogo");
+        var profile = new ShellProfile("pwsh", "PowerShell 7", pwsh, "-NoLogo -NoProfile");
         try
         {
             var first = await service.StartAsync(profile, Environment.CurrentDirectory);
@@ -91,7 +91,7 @@ public sealed class TerminalStartupTests
         }
 
         var service = new TerminalService();
-        var profile = new ShellProfile("shell", "PowerShell", pwsh, "-NoLogo");
+        var profile = new ShellProfile("shell", "PowerShell", pwsh, "-NoLogo -NoProfile");
         try
         {
             var session = await service.StartAsync(profile, Environment.CurrentDirectory);
@@ -127,7 +127,7 @@ public sealed class TerminalStartupTests
         if (pwsh is null) return;
 
         var service = new TerminalService();
-        var profile = new ShellProfile("shell-history", "PowerShell", pwsh, "-NoLogo");
+        var profile = new ShellProfile("shell-history", "PowerShell", pwsh, "-NoLogo -NoProfile");
         try
         {
             var session = await service.StartAsync(profile, Environment.CurrentDirectory);
@@ -212,7 +212,7 @@ public sealed class TerminalStartupTests
         if (!File.Exists(project)) return;
 
         var service = new TerminalService();
-        var profile = new ShellProfile("shell-dotnet-build", "PowerShell", pwsh, "-NoLogo");
+        var profile = new ShellProfile("shell-dotnet-build", "PowerShell", pwsh, "-NoLogo -NoProfile");
         try
         {
             var session = await service.StartAsync(profile, Environment.CurrentDirectory);
@@ -253,7 +253,8 @@ public sealed class TerminalStartupTests
         }
 
         var service = new TerminalService();
-        var profile = new ShellProfile("shell", "PowerShell", pwsh, "-NoLogo");
+        // Test the terminal transport, independently of user-installed profile scripts.
+        var profile = new ShellProfile("shell", "PowerShell", pwsh, "-NoLogo -NoProfile");
         try
         {
             var session = await service.StartAsync(profile, Environment.CurrentDirectory);

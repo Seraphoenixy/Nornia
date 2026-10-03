@@ -107,6 +107,12 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
         nameof(PresentationSnapshot), typeof(CodePresentationSnapshot), typeof(CodeDocumentView),
         new FrameworkPropertyMetadata(null, OnPresentationSnapshotChanged));
 
+    /// <summary>One-based source line represented by AvalonEdit document line 1. Full documents
+    /// use 1; windowed large files bind this to their current window start line.</summary>
+    public static readonly DependencyProperty GlobalLineStartProperty = DependencyProperty.Register(
+        nameof(GlobalLineStart), typeof(int), typeof(CodeDocumentView),
+        new FrameworkPropertyMetadata(1, OnGlobalLineStartChanged));
+
     private readonly SearchMatchRenderer _matchRenderer;
     private readonly LineEmphasisRenderer _lineEmphasis;
     private readonly IndentationGuideRenderer _indentGuides;
@@ -356,6 +362,14 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
     private static void OnRulerColumnsChanged(DependencyObject d, DependencyPropertyChangedEventArgs e) =>
         ((CodeDocumentView)d)._rulers.RefreshColumns((double[]?)e.NewValue);
 
+    private static void OnGlobalLineStartChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+    {
+        var view = (CodeDocumentView)d;
+        view._lineNumberMargin.InvalidateMeasure();
+        view._lineNumberMargin.InvalidateVisual();
+        view.RedrawCodeOverview();
+    }
+
     /// <summary>Immutable background language pass.  A snapshot is accepted only when the
     /// surrounding tab confirms that it belongs to the currently displayed document version.</summary>
     public CodePresentationSnapshot? PresentationSnapshot
@@ -368,6 +382,18 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
     public TextEditor Editor => CodeEditor;
 
     public TextDocument Document => CodeEditor.Document;
+
+    public int GlobalLineStart
+    {
+        get => (int)GetValue(GlobalLineStartProperty);
+        set => SetValue(GlobalLineStartProperty, value);
+    }
+
+    /// <summary>Converts a one-based AvalonEdit line to the one-based source line shown to the
+    /// reader. All editor-internal offsets remain local to the loaded document.</summary>
+    public int ToGlobalLine(int localLine) => Math.Max(1, localLine) + Math.Max(1, GlobalLineStart) - 1;
+
+    public int ToLocalLine(int globalLine) => Math.Max(1, globalLine) - Math.Max(1, GlobalLineStart) + 1;
 
     /// <summary>当前承载标签是否为窗口化大文件档(非 Full 容量)。窗口化档默认关闭
     /// sticky / 折叠背景 / 整窗词高亮扫描等大文件能力(vscode largeFileOptimizations
@@ -591,13 +617,7 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
     private static void OnShowMinimapChanged(DependencyObject source, DependencyPropertyChangedEventArgs args)
     {
         var view = (CodeDocumentView)source;
-        var visible = (bool)args.NewValue;
-        view.MinimapHost.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
-        if (visible)
-        {
-            view.HookEditorScroll();
-            view.RequestMinimapDraw();
-        }
+        view.RefreshMinimapVisibility();
     }
 
     private static void OnPresentationSnapshotChanged(DependencyObject source, DependencyPropertyChangedEventArgs args)
@@ -670,6 +690,7 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
         // 的 SetFoldingSections 时序)。
         ApplyFoldingSections();
         ApplyEditorRendering();
+        RefreshMinimapVisibility();
         InvalidateMinimapContent();
         _documentContentVersion++;
         RequestMinimapDraw();
@@ -1069,6 +1090,27 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
             return set;
         }
 
+        // 每个折叠段做 FirstOrDefault 全表扫描是 O(折叠段×sections)(上万折叠段的 C 文件下
+        // 标签切换会卡顿):先把 sections 的 (startOffset,endOffset)→section 建成字典,匹配降为 O(1)。
+        Dictionary<(int Start, int End), CodeFoldSection>? sectionsByOffset = null;
+        foreach (var candidate in _foldSections)
+        {
+            var start = document.GetLineByNumber(Math.Clamp(candidate.StartLine, 1, document.LineCount));
+            var end = document.GetLineByNumber(Math.Clamp(candidate.EndLine, 1, document.LineCount));
+            var endOffset = candidate.PreserveEndLine ? end.Offset : end.EndOffset;
+            sectionsByOffset ??= new Dictionary<(int, int), CodeFoldSection>(_foldSections.Count);
+            var key = (start.EndOffset, endOffset);
+            if (!sectionsByOffset.ContainsKey(key))
+            {
+                sectionsByOffset.Add(key, candidate);
+            }
+        }
+
+        if (sectionsByOffset is null)
+        {
+            return set;
+        }
+
         foreach (var folding in _foldManager.AllFoldings)
         {
             if (!folding.IsFolded)
@@ -1076,14 +1118,8 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
                 continue;
             }
 
-            var section = _foldSections.FirstOrDefault(candidate =>
-            {
-                var start = document.GetLineByNumber(Math.Clamp(candidate.StartLine, 1, document.LineCount));
-                var end = document.GetLineByNumber(Math.Clamp(candidate.EndLine, 1, document.LineCount));
-                var endOffset = candidate.PreserveEndLine ? end.Offset : end.EndOffset;
-                return start.EndOffset == folding.StartOffset && endOffset == folding.EndOffset;
-            });
-            if (!string.IsNullOrEmpty(section?.SymbolId))
+            if (sectionsByOffset.TryGetValue((folding.StartOffset, folding.EndOffset), out var section)
+                && !string.IsNullOrEmpty(section.SymbolId))
             {
                 set.Add(section.SymbolId);
             }
@@ -1111,15 +1147,19 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
         }
 
         _editorScroll?.ScrollToVerticalOffset(state.VerticalOffset);
+        _editorScroll?.ScrollToHorizontalOffset(state.HorizontalOffset);
         if (CodeEditor.Document is { } document && document.LineCount > 0)
         {
-            var line = Math.Clamp(state.CaretLine, 1, document.LineCount);
+            var line = Math.Clamp(ToLocalLine(state.CaretLine), 1, document.LineCount);
             var documentLine = document.GetLineByNumber(line);
             var column = Math.Clamp(state.CaretColumn, 1, documentLine.Length + 1);
             CodeEditor.TextArea.Caret.Position = new TextViewPosition(line, column);
             ClearSelectionAt(CodeEditor.CaretOffset);
             CodeEditor.ScrollTo(line, 0);
             CodeEditor.TextArea.Caret.BringCaretToView();
+            // BringCaretToView may alter both axes. The saved horizontal position is the
+            // reader's explicit position and must win after the caret has been restored.
+            _editorScroll?.ScrollToHorizontalOffset(Math.Max(0, state.HorizontalOffset));
         }
     }
 
@@ -1128,10 +1168,11 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
         HookEditorScroll(); // 无 Loaded 的离线路径(集成测试)下模板就绪时兜底挂接,幂等。
         return new(
             _editorScroll?.VerticalOffset ?? 0,
-            CodeEditor.TextArea.Caret.Line,
+            ToGlobalLine(CodeEditor.TextArea.Caret.Line),
             CodeEditor.TextArea.Caret.Column,
             CaptureFoldedOffsets(),
-            CaptureFoldedSymbolIds());
+            CaptureFoldedSymbolIds(),
+            _editorScroll?.HorizontalOffset ?? 0);
     }
 
     private void ClearSelectionAt(int offset)
@@ -1219,6 +1260,19 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
         if (!_minimapThrottle.IsEnabled)
         {
             _minimapThrottle.Start();
+        }
+    }
+
+    private void RefreshMinimapVisibility()
+    {
+        // A windowed document only contains a slice of the source. Hiding the full-file minimap
+        // avoids presenting a local window map as if it were a global navigation map.
+        var visible = ShowMinimap && !IsWindowedTier;
+        MinimapHost.Visibility = visible ? Visibility.Visible : Visibility.Collapsed;
+        if (visible)
+        {
+            HookEditorScroll();
+            RequestMinimapDraw();
         }
     }
 
@@ -1723,7 +1777,7 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
             return;
         }
 
-        var segments = new List<(int Start, int Length)>();
+        var segments = new List<(int Start, int Length, bool IsBracket)>();
         if (document.TextLength == 0)
         {
             _readingHighlights.SetSegments(segments);
@@ -1740,7 +1794,7 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
         var bracketBounds = ScanWindowToOffset(document, bracketWindow.StartLine, bracketWindow.EndLine);
         if (ComputeBracketPair(document, caret, bracketBounds.StartOffset, bracketBounds.EndOffset) is { } bracket)
         {
-            segments.Add(bracket);
+            segments.Add((bracket.Start, bracket.Length, true));
         }
 
         // 当前词:±100 行窗口 + 词级缓存。窗口化档下若扫描窗口覆盖整个文档
@@ -1774,7 +1828,7 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
 
             if (wordSegments is not null)
             {
-                segments.AddRange(wordSegments);
+                segments.AddRange(wordSegments.Select(segment => (segment.Start, segment.Length, false)));
             }
         }
 
@@ -1890,54 +1944,152 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
             return null;
         }
 
+        var start = Math.Clamp(windowStart, 0, textLength);
+        var end = Math.Clamp(windowEnd, start, textLength);
+        var code = ComputeCodeMask(document, start, end);
+        if (open < start || open >= end || !code[open - start])
+        {
+            return null;
+        }
+
         char c = document.GetCharAt(open);
         bool isClosing = c is ')' or ']' or '}';
-        char opening = c;
-        char closing = c switch { '(' => ')', ')' => '(', '[' => ']', ']' => '[', '{' => '}', _ => '}' };
-        int depth = 0;
         if (!isClosing)
         {
-            // 向前扫描:先遇到目标闭括号为匹配;深度归零处即配对;超窗停止。
-            var stop = Math.Min(windowEnd, textLength);
-            for (var i = open + 1; i < stop; i++)
+            var stack = new Stack<char>();
+            for (var i = open + 1; i < end; i++)
             {
+                if (!code[i - start]) continue;
                 var ch = document.GetCharAt(i);
-                if (ch == opening)
+                if (ch is '(' or '[' or '{')
                 {
-                    depth++;
+                    stack.Push(ch);
                 }
-                else if (ch == closing)
+                else if (ch is (')' or ']' or '}') && stack.Count > 0
+                    && MatchingBracket(stack.Peek(), ch))
                 {
-                    if (depth == 0)
-                    {
-                        return (open, 1 + i - open);
-                    }
-                    depth--;
+                    stack.Pop();
+                }
+                else if (stack.Count == 0 && ch == MatchingBracket(c))
+                {
+                    return (open, 1 + i - open);
                 }
             }
         }
         else
         {
-            // 向后扫描:找到配对的左括号;超窗停止。
-            var stop = Math.Max(windowStart, 0);
-            for (var i = open - 1; i >= stop; i--)
+            var stack = new Stack<char>();
+            for (var i = open - 1; i >= start; i--)
             {
+                if (!code[i - start]) continue;
                 var ch = document.GetCharAt(i);
-                if (ch == closing)
+                if (ch is ')' or ']' or '}')
                 {
-                    depth++;
+                    stack.Push(ch);
                 }
-                else if (ch == opening)
+                else if (ch is ('(' or '[' or '{') && stack.Count > 0
+                    && MatchingBracket(ch, stack.Peek()))
                 {
-                    if (depth == 0)
-                    {
-                        return (i, 1 + open - i);
-                    }
-                    depth--;
+                    stack.Pop();
+                }
+                else if (stack.Count == 0 && ch == MatchingBracket(c))
+                {
+                    return (i, 1 + open - i);
                 }
             }
         }
         return null;
+    }
+
+    private static char MatchingBracket(char bracket) => bracket switch
+    {
+        '(' => ')',
+        ')' => '(',
+        '[' => ']',
+        ']' => '[',
+        '{' => '}',
+        '}' => '{',
+        _ => '\0',
+    };
+
+    private static bool MatchingBracket(char opening, char closing) => MatchingBracket(opening) == closing;
+
+    /// <summary>Marks string and comment contents as non-code so bracket matching cannot treat
+    /// punctuation inside a literal or comment as syntax.</summary>
+    private static bool[] ComputeCodeMask(TextDocument document, int start, int end)
+    {
+        var mask = new bool[Math.Max(0, end - start)];
+        Array.Fill(mask, true);
+        var state = 0; // 0 = code, 1 = line comment, 2 = block comment, 3 = string, 4 = char
+        var verbatim = false;
+        for (var i = start; i < end; i++)
+        {
+            var local = i - start;
+            var ch = document.GetCharAt(i);
+            if (state == 1)
+            {
+                mask[local] = false;
+                if (ch is '\r' or '\n') state = 0;
+                continue;
+            }
+
+            if (state == 2)
+            {
+                mask[local] = false;
+                if (ch == '*' && i + 1 < end && document.GetCharAt(i + 1) == '/')
+                {
+                    mask[i + 1 - start] = false;
+                    i++;
+                    state = 0;
+                }
+                continue;
+            }
+
+            if (state is 3 or 4)
+            {
+                mask[local] = false;
+                if (!verbatim && ch == '\\' && i + 1 < end)
+                {
+                    mask[++i - start] = false;
+                }
+                else if (ch == (state == 3 ? '"' : '\''))
+                {
+                    if (verbatim && state == 3 && i + 1 < end && document.GetCharAt(i + 1) == '"')
+                    {
+                        mask[++i - start] = false;
+                    }
+                    else
+                    {
+                        state = 0;
+                        verbatim = false;
+                    }
+                }
+
+                continue;
+            }
+
+            if (ch == '/' && i + 1 < end && document.GetCharAt(i + 1) == '/')
+            {
+                mask[local] = false;
+                mask[++i - start] = false;
+                state = 1;
+            }
+            else if (ch == '/' && i + 1 < end && document.GetCharAt(i + 1) == '*')
+            {
+                mask[local] = false;
+                mask[++i - start] = false;
+                state = 2;
+            }
+            else if (ch == '"' || ch == '\'')
+            {
+                mask[local] = false;
+                state = ch == '"' ? 3 : 4;
+                verbatim = ch == '"' && i > start && document.GetCharAt(i - 1) == '@';
+                if (verbatim) mask[i - 1 - start] = false;
+            }
+        }
+
+        return mask;
     }
 
     /// <summary>当前词在 [windowStart, windowEnd) 内的全部出现(Ordinal,上限
@@ -1965,12 +2117,22 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
         while (results.Count < MaxWordHighlightOccurrences
             && (offset = windowText.IndexOf(word, offset, StringComparison.Ordinal)) >= 0)
         {
-            results.Add((from + offset, word.Length));
-            offset += word.Length;
+            var absoluteStart = from + offset;
+            var absoluteEnd = absoluteStart + word.Length;
+            var beforeIsWord = absoluteStart > 0 && IsWordCharacter(document.GetCharAt(absoluteStart - 1));
+            var afterIsWord = absoluteEnd < textLength && IsWordCharacter(document.GetCharAt(absoluteEnd));
+            if (!beforeIsWord && !afterIsWord)
+            {
+                results.Add((from + offset, word.Length));
+            }
+
+            offset += Math.Max(1, word.Length);
         }
 
         return results;
     }
+
+    private static bool IsWordCharacter(char value) => char.IsLetterOrDigit(value) || value == '_';
 
     /// <summary>VS Code sticky scroll:滚动时把覆盖视口顶端的折叠段头钉在编辑器顶部。
     /// 只钉尚未折叠且段首已滚出视口上缘的段(段首仍可见时不重复显示),最多 <see cref="MaxStickyRows"/>
@@ -2177,7 +2339,8 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
         {
             // Stable width: fit the widest line number in the whole document (VS Code adapts the
             // gutter to the current line count) + 12px padding each side.
-            var digits = Math.Max(1, _owner.CodeEditor.Document.LineCount.ToString().Length);
+            var lastGlobalLine = _owner.ToGlobalLine(Math.Max(1, _owner.CodeEditor.Document.LineCount));
+            var digits = Math.Max(1, lastGlobalLine.ToString().Length);
             var digitWidth = _owner.EditorFontSize * 0.6;
             return new Size(12 + digits * digitWidth + 12, availableSize.Height);
         }
@@ -2203,19 +2366,20 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
 
             foreach (var visualLine in visualLines)
             {
-                var lineNumber = visualLine.FirstDocumentLine.LineNumber;
-                if (lineNumber == lastDocumentLine)
+                var localLineNumber = visualLine.FirstDocumentLine.LineNumber;
+                if (localLineNumber == lastDocumentLine)
                 {
                     continue; // wrapped continuation of the same document line
                 }
-                lastDocumentLine = lineNumber;
+                lastDocumentLine = localLineNumber;
 
-                var isActive = lineNumber == caretLine;
+                var isActive = localLineNumber == caretLine;
+                var lineNumber = _owner.ToGlobalLine(localLineNumber);
                 var numberText = lineNumber.ToString();
                 if (_owner.LineNumbersRelative && !isActive)
                 {
                     // VS Code relative line numbers: 其余行显示与光标的距离。
-                    numberText = Math.Abs(lineNumber - caretLine).ToString();
+                    numberText = Math.Abs(localLineNumber - caretLine).ToString();
                 }
 
                 // 按 (文本, 字号, DPI) 组合键复用 FormattedText:滚动只是位置变化,
@@ -2227,7 +2391,7 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
                 // top). The margin is fixed to the viewport — only the text layer is repositioned
                 // on scroll — so subtract the current scroll offset to get the viewport Y.
                 var y = view.GetVisualPosition(
-                    new TextViewPosition(lineNumber, 1),
+                    new TextViewPosition(localLineNumber, 1),
                     VisualYPosition.TextTop).Y - view.ScrollOffset.Y;
                 drawingContext.DrawText(formatted, new Point(ActualWidth - formatted.Width - 12, y));
             }
@@ -2461,7 +2625,8 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
     private sealed class ReadingHighlightRenderer : IBackgroundRenderer
     {
         private readonly CodeDocumentView _owner;
-        private TextSegmentCollection<TextSegment>? _segments;
+        private TextSegmentCollection<TextSegment>? _bracketSegments;
+        private TextSegmentCollection<TextSegment>? _wordSegments;
         private Brush _bracketBrush = Brushes.Transparent;
         private Brush _wordBrush = Brushes.Transparent;
 
@@ -2476,22 +2641,30 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
             _owner.InvalidateBackground();
         }
 
-        public void SetSegments(IReadOnlyList<(int Start, int Length)> segments)
+        public void SetSegments(IReadOnlyList<(int Start, int Length, bool IsBracket)> segments)
         {
-            var collection = _segments;
-            if (collection is null)
+            if (segments.Count == 0 && _bracketSegments is null && _wordSegments is null)
             {
-                if (segments.Count == 0) return;
-                collection = new TextSegmentCollection<TextSegment>(_owner.CodeEditor.Document);
-                _segments = collection;
+                return;
             }
 
-            collection.Clear();
-            foreach (var (start, length) in segments)
+            _bracketSegments ??= new TextSegmentCollection<TextSegment>(_owner.CodeEditor.Document);
+            _wordSegments ??= new TextSegmentCollection<TextSegment>(_owner.CodeEditor.Document);
+            _bracketSegments.Clear();
+            _wordSegments.Clear();
+            foreach (var (start, length, isBracket) in segments)
             {
                 if (start >= 0 && start + length <= _owner.CodeEditor.Document.TextLength)
                 {
-                    collection.Add(new TextSegment { StartOffset = start, Length = length });
+                    var segment = new TextSegment { StartOffset = start, Length = length };
+                    if (isBracket)
+                    {
+                        _bracketSegments.Add(segment);
+                    }
+                    else
+                    {
+                        _wordSegments.Add(segment);
+                    }
                 }
             }
 
@@ -2501,31 +2674,30 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
         public void Draw(TextView textView, DrawingContext drawingContext)
         {
             var visualLines = GetValidVisualLines(textView);
-            if (_segments is null || _segments.Count == 0 || visualLines is null || visualLines.Count == 0)
+            if ((_bracketSegments is null || _bracketSegments.Count == 0)
+                && (_wordSegments is null || _wordSegments.Count == 0)
+                || visualLines is null || visualLines.Count == 0)
             {
                 return;
             }
 
             var start = visualLines[0].FirstDocumentLine.Offset;
             var end = visualLines[^1].LastDocumentLine.EndOffset;
-            var relevant = _segments.FindOverlappingSegments(start, end - start);
-            if (relevant.Count == 0)
-            {
-                return;
-            }
-
             var brackets = new BackgroundGeometryBuilder { AlignToWholePixels = true, CornerRadius = 2 };
             var words = new BackgroundGeometryBuilder { AlignToWholePixels = true, CornerRadius = 2 };
-            foreach (var segment in relevant)
+            if (_wordSegments is not null)
             {
-                // 括号对 = 全选中长度 1-2 的短段;词出现 = 其余。
-                if (segment.Length <= 2)
-                {
-                    brackets.AddSegment(textView, segment);
-                }
-                else
+                foreach (var segment in _wordSegments.FindOverlappingSegments(start, end - start))
                 {
                     words.AddSegment(textView, segment);
+                }
+            }
+
+            if (_bracketSegments is not null)
+            {
+                foreach (var segment in _bracketSegments.FindOverlappingSegments(start, end - start))
+                {
+                    brackets.AddSegment(textView, segment);
                 }
             }
 

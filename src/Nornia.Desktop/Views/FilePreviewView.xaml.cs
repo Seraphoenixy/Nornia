@@ -109,6 +109,8 @@ public partial class FilePreviewView : UserControl
             return;
         }
 
+        CodeView.GlobalLineStart = _tab.WindowStartLine;
+
         _tab.PropertyChanged += OnTabPropertyChanged;
         _tab.ContentUpdating += OnTabContentUpdating;
         _tab.GoToLineRequested += OnGoToLineRequested;
@@ -236,7 +238,8 @@ public partial class FilePreviewView : UserControl
             return;
         }
 
-                CodeView.SetFoldingSections(_tab.FoldSections, _tab.ViewState?.FoldedOffsets, _tab.ViewState?.FoldedSymbolIds);
+        CodeView.GlobalLineStart = _tab.WindowStartLine;
+        CodeView.SetFoldingSections(_tab.FoldSections, _tab.ViewState?.FoldedOffsets, _tab.ViewState?.FoldedSymbolIds);
         // Search results may have been applied while the replacement document was still empty;
         // reapply them after the new document is installed so valid matches are highlighted.
         CodeView.SetSearchMatches(_tab.SearchMatches, _tab.CurrentMatchViewIndex);
@@ -369,7 +372,7 @@ public partial class FilePreviewView : UserControl
                 && caretLine == line
                 ? caretColumn
                 : 1;
-            CodeView.JumpToPosition(line, column, emphasize: false);
+            CodeView.JumpToPosition(CodeView.ToLocalLine(line), column, emphasize: false);
         }
     }
 
@@ -394,6 +397,20 @@ public partial class FilePreviewView : UserControl
             case nameof(FilePreviewTab.MarkdownRenderResult):
                 // 文档就绪后按恢复优先级落位(锚点 → 行号 → 偏移)。
                 RestoreMarkdownPosition();
+                break;
+            case nameof(FilePreviewTab.WindowStartLine):
+                CodeView.GlobalLineStart = _tab.WindowStartLine;
+                break;
+            case nameof(FilePreviewTab.CapacityTier):
+                // Re-apply the preference when a file crosses the full/windowed threshold so the
+                // CodeDocumentView can hide its local-only minimap immediately.
+                CodeView.ShowMinimap = _tab.ShowMinimap;
+                break;
+            case nameof(FilePreviewTab.MarkdownAnchor) when _tab.IsMarkdownRendered:
+                if (!string.IsNullOrEmpty(_tab.MarkdownAnchor))
+                {
+                    MarkdownView.ScrollToAnchor(_tab.MarkdownAnchor);
+                }
                 break;
             case nameof(FilePreviewTab.MarkdownMode):
                 // 模式切换:预览 → 源码跳当前标题行(无标题恢复光标),源码 → 预览按优先级落位。
@@ -434,12 +451,10 @@ public partial class FilePreviewView : UserControl
                 // Deactivated tab: save the reading position before the editor is swapped away.
                 CaptureViewState();
                 break;
-            case nameof(FilePreviewTab.CurrentMatchIndex):
+            case nameof(FilePreviewTab.CurrentMatchViewIndex):
             case nameof(FilePreviewTab.MatchCount):
-                if (_tab.ShowAllHighlights)
-                {
-                    CodeView.SetSearchMatches(_tab.SearchMatches, _tab.CurrentMatchViewIndex);
-                }
+                CodeView.SetSearchMatches(_tab.SearchMatches, _tab.CurrentMatchViewIndex);
+                if (!_tab.ShowAllHighlights) CodeView.ClearSearchMarkers();
                 break;
             case nameof(FilePreviewTab.ShowAllHighlights):
                 if (_tab.ShowAllHighlights)
@@ -537,7 +552,9 @@ public partial class FilePreviewView : UserControl
 
         try
         {
-            var pathPart = url.Split('#', 2)[0];
+            var parts = url.Split('#', 2);
+            var pathPart = parts[0];
+            var anchor = parts.Length == 2 ? Uri.UnescapeDataString(parts[1]) : string.Empty;
             if (pathPart.Length == 0) return;
             var path = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(_tab.Path) ?? string.Empty,
                 Uri.UnescapeDataString(pathPart)));
@@ -545,13 +562,36 @@ public partial class FilePreviewView : UserControl
             {
                 if (FindAncestor<EditorAreaView>(this)?.DataContext is EditorAreaViewModel editor)
                 {
-                    _ = editor.OpenFileAsync(path);
+                    _ = OpenLocalMarkdownLinkAsync(editor, path, anchor);
                 }
             }
         }
         catch (Exception ex) when (ex is ArgumentException or IOException or NotSupportedException)
         {
             _tab.MarkdownRenderNotice = $"无法打开本地链接：{FilePreviewTab.SingleLineMessage(ex)}";
+        }
+    }
+
+    private async Task OpenLocalMarkdownLinkAsync(EditorAreaViewModel editor, string path, string anchor)
+    {
+        await editor.OpenFileAsync(path);
+        if (string.IsNullOrEmpty(anchor) || editor.SelectedTab is not FilePreviewTab target
+            || !target.IsMarkdown)
+        {
+            return;
+        }
+
+        var heading = target.MarkdownHeadings.FirstOrDefault(item =>
+            string.Equals(item.Anchor, anchor, StringComparison.OrdinalIgnoreCase));
+        if (heading is not null)
+        {
+            target.SetMarkdownHeading(heading.Anchor, heading.Line);
+        }
+        else
+        {
+            // Keep the requested fragment for the view's normal anchor resolver. This also lets
+            // a later render completion retry the jump if the heading list was not ready yet.
+            target.MarkdownAnchor = anchor;
         }
     }
 
@@ -608,7 +648,7 @@ public partial class FilePreviewView : UserControl
 
         var caret = CodeView.Editor.TextArea.Caret.Position;
         var selection = CodeView.Editor.TextArea.Selection;
-        var text = caret is { } c ? $"Ln {c.Line}, Col {c.Column}" : string.Empty;
+        var text = caret is { } c ? $"Ln {CodeView.ToGlobalLine(c.Line)}, Col {c.Column}" : string.Empty;
         var document = CodeView.Editor.Document;
         if (!selection.IsEmpty && document.TextLength > 0)
         {
@@ -618,10 +658,13 @@ public partial class FilePreviewView : UserControl
                 ? -1
                 : Math.Clamp(segment.Offset + segment.Length, start, document.TextLength);
             var chars = start < 0 || end <= start ? 0 : end - start;
-            var lines = start < 0 || end <= start
-                ? 0
-                : document.GetLineByOffset(start).LineNumber
-                  - document.GetLineByOffset(end - 1).LineNumber + 1;
+            var lines = 0;
+            if (start >= 0 && end > start)
+            {
+                var startLine = document.GetLineByOffset(start).LineNumber;
+                var endLine = document.GetLineByOffset(end - 1).LineNumber;
+                lines = endLine - startLine + 1;
+            }
             text += $"  (已选择 {chars} 字符 / {lines} 行)";
         }
 
@@ -663,16 +706,31 @@ public partial class FilePreviewView : UserControl
 
     private void HandleEditorShortcut(KeyEventArgs e)
     {
-        if (_tab is null)
+        if (_tab is null || e.Handled)
         {
             return;
         }
 
-        var ctrl = (Keyboard.Modifiers & ModifierKeys.Control) != 0;
-        var shift = (Keyboard.Modifiers & ModifierKeys.Shift) != 0;
+        var modifiers = Keyboard.Modifiers;
+        var ctrl = modifiers == ModifierKeys.Control;
+        var shift = modifiers == ModifierKeys.Shift;
+        var key = e.Key == Key.System ? e.SystemKey : e.Key;
+
+        if (_tab.IsFindBarOpen && modifiers == ModifierKeys.Alt
+            && key is Key.C or Key.W or Key.R)
+        {
+            switch (key)
+            {
+                case Key.C: _tab.SearchCaseSensitive = !_tab.SearchCaseSensitive; break;
+                case Key.W: _tab.SearchWholeWord = !_tab.SearchWholeWord; break;
+                case Key.R: _tab.SearchUseRegex = !_tab.SearchUseRegex; break;
+            }
+            e.Handled = true;
+            return;
+        }
 
         // VS Code: Ctrl+Shift+. 聚焦面包屑。
-        if (ctrl && shift && e.Key == Key.OemPeriod)
+        if (modifiers == (ModifierKeys.Control | ModifierKeys.Shift) && e.Key == Key.OemPeriod)
         {
             FocusBreadcrumb();
             e.Handled = true;
@@ -683,7 +741,7 @@ public partial class FilePreviewView : UserControl
         {
             // 正文有选定内容时按 Ctrl+F,用选中文本覆盖更新搜索框(无论搜索框是否为空);
             // 选区文本按当前显示文档(全文/窗口)的坐标从 Content 截取。
-            if (!_tab.IsMarkdownRendered)
+            if (!_tab.IsMarkdownRendered && CodeView.IsKeyboardFocusWithin)
             {
                 var selection = CodeView.Editor.TextArea.Selection;
                 if (!selection.IsEmpty
@@ -707,7 +765,7 @@ public partial class FilePreviewView : UserControl
             return;
         }
 
-        if (e.Key == Key.F3)
+        if (e.Key == Key.F3 && modifiers is ModifierKeys.None or ModifierKeys.Shift)
         {
             if (shift)
             {
@@ -725,21 +783,23 @@ public partial class FilePreviewView : UserControl
         if (ctrl && e.Key == Key.G)
         {
             _tab.OpenGoToLineBarCommand.Execute(null);
+            GoToLineBox.Focus();
+            GoToLineBox.SelectAll();
             e.Handled = true;
             return;
         }
 
-        if (e.Key == Key.Escape)
+        if (e.Key == Key.Escape && modifiers == ModifierKeys.None)
         {
-            if (_tab.IsFindBarOpen || _tab.IsGoToLineBarOpen)
+            if (_tab.IsGoToLineBarOpen)
             {
-                _tab.IsFindBarOpen = false;
                 _tab.IsGoToLineBarOpen = false;
             }
-            else
+            else if (_tab.IsFindBarOpen)
             {
                 _tab.ClearSearchCommand.Execute(null);
             }
+            else return;
 
             FocusReadingSurface();
             e.Handled = true;
@@ -765,7 +825,7 @@ public partial class FilePreviewView : UserControl
             return;
         }
 
-        if (e.Key == Key.Enter)
+        if (e.Key == Key.Enter && Keyboard.Modifiers is ModifierKeys.None or ModifierKeys.Shift)
         {
             // Enter 下一个 · Shift+Enter 上一个(与工具提示一致)。
             if ((Keyboard.Modifiers & ModifierKeys.Shift) != 0)
@@ -797,7 +857,7 @@ public partial class FilePreviewView : UserControl
         if (e.Key == Key.Enter)
         {
             _tab.GoToLineCommand.Execute(null);
-            FocusReadingSurface();
+            if (!_tab.IsGoToLineBarOpen) FocusReadingSurface();
             e.Handled = true;
         }
         else if (e.Key == Key.Escape)

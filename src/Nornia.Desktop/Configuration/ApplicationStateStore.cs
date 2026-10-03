@@ -14,7 +14,8 @@ public sealed record EditorReadingState(double VerticalOffset = 0, int CaretLine
     double HorizontalOffset = 0,
     IReadOnlyList<int>? ExpandedRegions = null, string? SearchText = null,
     string? MarkdownMode = null, double MarkdownVerticalOffset = 0,
-    string? MarkdownAnchor = null, int MarkdownHeadingLine = 0);
+    string? MarkdownAnchor = null, int MarkdownHeadingLine = 0,
+    IReadOnlyList<string>? FoldedSymbolIds = null);
 
 /// <summary>
 /// 工作区级应用状态。schema v2 起携带可拆分的编辑器组布局树(<see cref="EditorLayout"/>);
@@ -403,6 +404,12 @@ public sealed class ApplicationStateStore : IApplicationStateStore, IDisposable
             return await JsonSerializer.DeserializeAsync<ApplicationState>(stream, JsonOptions, cancellationToken) ?? new();
         }
         catch (JsonException) { return new(); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // state.json 可能被杀毒/同步盘瞬时锁定:加载失败按"无保存状态"降级,
+            // 决不能让打开文件、恢复布局这类主路径调用方收到异常而静默失败。
+            return new();
+        }
     }
 
     private async Task WriteCoreAsync(string text)

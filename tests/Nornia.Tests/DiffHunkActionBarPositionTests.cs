@@ -83,11 +83,15 @@ public sealed class DiffHunkActionBarPositionTests
             visible.Max(line => line.VisualTop + line.Height - textView.ScrollOffset.Y));
     }
 
-    private static void PumpUntil(Func<bool> condition, int maxRounds = 60)
+    private static void PumpUntil(Func<bool> condition)
     {
-        for (var i = 0; i < maxRounds && !condition(); i++)
+        var deadline = Environment.TickCount64 + 10_000;
+        while (!condition())
         {
+            Assert.True(Environment.TickCount64 < deadline, "Diff view did not finish loading in time.");
             WpfStaContext.PumpQueue();
+            // Background analysis needs actual time, not a fixed number of fast queue drains.
+            Thread.Sleep(10);
         }
     }
 
@@ -117,7 +121,10 @@ public sealed class DiffHunkActionBarPositionTests
         };
         window.Show();
         window.UpdateLayout();
-        PumpUntil(() => tab.IsLoaded && view.InlineEditor.Document is { LineCount: > 0 });
+        var displayField = mode == GitDiffMode.Inline ? "_inlineLines" : "_newLines";
+        var editor = mode == GitDiffMode.Inline ? view.InlineEditor : view.NewEditor;
+        PumpUntil(() => tab.IsLoaded && GetDisplayLines(view, displayField).Count > 0
+            && editor.Document is { LineCount: > 1 });
         window.UpdateLayout();
         WpfStaContext.PumpQueue();
         return (tab, view, window);

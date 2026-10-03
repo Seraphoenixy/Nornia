@@ -17,6 +17,7 @@ public partial class SearchSidebarView : UserControl
     public SearchSidebarView()
     {
         InitializeComponent();
+        PreviewKeyDown += OnSearchPreviewKeyDown;
         DataContextChanged += OnDataContextChanged;
         Loaded += (_, _) => Attach(DataContext as SearchViewModel);
         Unloaded += (_, _) =>
@@ -32,6 +33,61 @@ public partial class SearchSidebarView : UserControl
     {
         Detach(e.OldValue as SearchViewModel);
         Attach(e.NewValue as SearchViewModel);
+    }
+
+    private void OnSearchPreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Handled || DataContext is not SearchViewModel viewModel) return;
+        var searchInput = FindVisualChild<TextBox>(this);
+        var searchResults = FindVisualChild<ListBox>(this);
+        if (searchInput is null || searchResults is null) return;
+        var modifiers = Keyboard.Modifiers;
+        var key = e.Key == Key.System ? e.SystemKey : e.Key;
+        if (modifiers == ModifierKeys.Alt && key is Key.C or Key.W or Key.R)
+        {
+            switch (key)
+            {
+                case Key.C: viewModel.SearchCaseSensitive = !viewModel.SearchCaseSensitive; break;
+                case Key.W: viewModel.SearchWholeWord = !viewModel.SearchWholeWord; break;
+                case Key.R: viewModel.SearchUseRegex = !viewModel.SearchUseRegex; break;
+            }
+            e.Handled = true;
+        }
+        else if (searchInput.IsKeyboardFocusWithin && key == Key.Down
+            && modifiers == ModifierKeys.None && searchResults.Items.Count > 0)
+        {
+            if (searchResults.SelectedIndex < 0) searchResults.SelectedIndex = 0;
+            searchResults.ScrollIntoView(searchResults.SelectedItem);
+            searchResults.UpdateLayout();
+            (searchResults.ItemContainerGenerator.ContainerFromItem(searchResults.SelectedItem) as ListBoxItem)?.Focus();
+            e.Handled = true;
+        }
+        else if (searchResults.IsKeyboardFocusWithin && searchResults.SelectedItem is SearchTreeNode node)
+        {
+            if (key == Key.Enter && modifiers is ModifierKeys.None or ModifierKeys.Control)
+            {
+                if (node.IsMatch)
+                {
+                    var command = modifiers == ModifierKeys.Control
+                        ? viewModel.OpenMatchPermanentCommand : viewModel.OpenMatchCommand;
+                    if (command.CanExecute(node)) command.Execute(node);
+                }
+                else viewModel.ToggleNodeCommand.Execute(node);
+                e.Handled = true;
+            }
+            else if (key is Key.Left or Key.Right && modifiers == ModifierKeys.None && node.IsContainer)
+            {
+                if (node.HasChildren && node.IsExpanded != (key == Key.Right))
+                    viewModel.ToggleNodeCommand.Execute(node);
+                e.Handled = true;
+            }
+            else if (key == Key.Escape && modifiers == ModifierKeys.None)
+            {
+                searchInput.Focus();
+                searchInput.SelectAll();
+                e.Handled = true;
+            }
+        }
     }
 
     private void Attach(SearchViewModel? viewModel)

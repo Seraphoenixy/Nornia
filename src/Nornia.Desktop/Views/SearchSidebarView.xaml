@@ -177,7 +177,7 @@
       <DockPanel>
       <StackPanel DockPanel.Dock="Top" Margin="8,6,8,0">
         <TextBox Text="{Binding SearchText, UpdateSourceTrigger=PropertyChanged}"
-                 ToolTip="{loc:StringLoc Key=Search_Placeholder}" AutomationProperties.Name="{loc:StringLoc Key=Search_Placeholder}" />
+                 ToolTip="搜索（↓ 进入结果 · Alt+C 大小写 · Alt+W 全词 · Alt+R 正则）" AutomationProperties.Name="{loc:StringLoc Key=Search_Placeholder}" />
         <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
           <CheckBox Style="{StaticResource SearchOptionToggleStyle}" Width="28" Content="Aa" IsChecked="{Binding SearchCaseSensitive}"
                     ToolTip="{loc:StringLoc Key=Search_CaseSensitive}" Margin="0,0,4,0" />
@@ -211,6 +211,7 @@
       </StackPanel>
 
       <ListBox ItemsSource="{Binding Rows}" ItemContainerStyle="{StaticResource SidebarRowItemStyle}"
+               ToolTip="Enter 打开预览 · Ctrl+Enter 固定打开 · ←/→ 折叠/展开 · Esc 返回搜索框"
                Background="Transparent" BorderThickness="0" Padding="0,6,8,0"
                ScrollViewer.HorizontalScrollBarVisibility="Disabled"
                VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"

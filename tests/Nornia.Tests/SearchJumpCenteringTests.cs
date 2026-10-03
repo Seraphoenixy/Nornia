@@ -15,6 +15,48 @@ public sealed class SearchJumpCenteringTests
     private const int TargetLine = 120;
     private static readonly string Lines = string.Join("\n", Enumerable.Range(1, 200).Select(i => $"line {i}"));
 
+    [Theory]
+    [InlineData(true, true)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(false, false)]
+    public async Task SingleMatch_NavigationReturnsToResultAfterScrollingAway(bool highlightAll, bool next)
+    {
+        var directory = Path.Combine(Path.GetTempPath(), $"nornia-single-match-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(directory);
+        try
+        {
+            var path = Path.Combine(directory, "single.txt");
+            await File.WriteAllTextAsync(path, Lines);
+            var tab = new FilePreviewTab(path, TextDocumentDecoder.Instance, CodeFileTypeRegistry.Instance);
+            await tab.LoadAsync();
+            WpfStaContext.Run(() =>
+            {
+                var view = new FilePreviewView { DataContext = tab };
+                Layout(view);
+                PumpQueue();
+                tab.ShowAllHighlights = highlightAll;
+                tab.SearchText = "line 120";
+                Assert.Equal(1, tab.MatchCount);
+                for (var repeat = 0; repeat < 2; repeat++)
+                {
+                    view.CodeViewControl.JumpToPosition(1, 1, false);
+                    PumpQueue();
+                    Assert.Equal(1, view.CodeViewControl.Editor.TextArea.Caret.Line);
+                    (next ? tab.FindNextCommand : tab.FindPreviousCommand).Execute(null);
+                    PumpQueue();
+                    Assert.Equal(TargetLine, view.CodeViewControl.Editor.TextArea.Caret.Line);
+                    Assert.True(view.CodeViewControl.CaptureViewState().VerticalOffset > 0);
+                }
+                view.DataContext = null;
+            });
+        }
+        finally
+        {
+            try { Directory.Delete(directory, recursive: true); } catch (IOException) { }
+        }
+    }
+
     [Fact]
     public async Task SearchResultJump_BeforeFirstLayout_CentersTargetLine()
     {

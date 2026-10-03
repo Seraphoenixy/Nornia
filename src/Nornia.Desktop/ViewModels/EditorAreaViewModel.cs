@@ -35,13 +35,16 @@ public enum DiffTabStatus
 }
 
 /// <summary>Editor reading position captured when the preview loses the editor: vertical scroll
-/// offset, caret line/column and the document offsets of folded sections (restored on re-activate).</summary>
+/// offset, horizontal offset, caret line/column and the document offsets of folded sections
+/// (restored on re-activate). CaretLine is a global source line; windowed documents translate it
+/// to the currently loaded AvalonEdit document before restoring the caret.</summary>
 public sealed record EditorViewState(
     double VerticalOffset,
     int CaretLine,
     int CaretColumn,
     IReadOnlySet<int>? FoldedOffsets = null,
-    IReadOnlySet<string>? FoldedSymbolIds = null);
+    IReadOnlySet<string>? FoldedSymbolIds = null,
+    double HorizontalOffset = 0);
 
 /// <summary>A git diff the source-control view asks the shared editor to open. Covers working-tree
 /// changes (staged / unstaged / untracked) and commit-file diffs (<see cref="CommitHash"/> set).</summary>
@@ -1699,7 +1702,8 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
             StringComparison.OrdinalIgnoreCase)).Value;
         if (saved is null || !saved.SafeReadingStates.TryGetValue(tab.Path, out var reading)) return;
         tab.ViewState = new(reading.VerticalOffset, reading.CaretLine, reading.CaretColumn,
-            reading.ExpandedRegions?.ToHashSet());
+            reading.ExpandedRegions?.ToHashSet(), reading.FoldedSymbolIds?.ToHashSet(),
+            reading.HorizontalOffset);
         tab.SearchText = reading.SearchText ?? string.Empty;
         if (Enum.TryParse<MarkdownViewMode>(reading.MarkdownMode, true, out var markdownMode))
         {
@@ -1718,7 +1722,9 @@ public sealed partial class EditorAreaViewModel : ObservableObject, IShutdownPar
         if (_stateStore is null || workspaceContext?.ProjectPath is not { } workspace ||
             tab is not FilePreviewTab preview || preview.ViewState is not { } viewState) return Task.CompletedTask;
         var reading = new EditorReadingState(viewState.VerticalOffset, viewState.CaretLine, viewState.CaretColumn,
-            ExpandedRegions: viewState.FoldedOffsets?.ToArray(), SearchText: preview.SearchText,
+            HorizontalOffset: viewState.HorizontalOffset,
+            ExpandedRegions: viewState.FoldedOffsets?.ToArray(),
+            FoldedSymbolIds: viewState.FoldedSymbolIds?.ToArray(), SearchText: preview.SearchText,
             MarkdownMode: preview.MarkdownMode.ToString(), MarkdownVerticalOffset: preview.MarkdownVerticalOffset,
             MarkdownAnchor: string.IsNullOrEmpty(preview.MarkdownAnchor) ? null : preview.MarkdownAnchor,
             MarkdownHeadingLine: preview.MarkdownHeadingLine);
@@ -2073,6 +2079,32 @@ public sealed partial class FilePreviewTab : EditorTabItem
 
     [ObservableProperty]
     private string content = string.Empty;
+
+    /// <summary>True while the initial payload or an external reload is being published.</summary>
+    [ObservableProperty]
+    private bool isLoading;
+
+    /// <summary>True while a rendered Markdown document is being built and no previous rendered
+    /// document is available to keep visible.</summary>
+    [ObservableProperty]
+    private bool isMarkdownRendering;
+
+    public bool IsReadingBusy => IsLoading || IsMarkdownRendering;
+
+    public string ReadingBusyText => IsMarkdownRendering ? "正在生成 Markdown 预览…" : "正在加载文件…";
+
+    partial void OnIsLoadingChanged(bool value)
+    {
+        OnPropertyChanged(nameof(IsReadingBusy));
+        OnPropertyChanged(nameof(ReadingBusyText));
+        OnPropertyChanged(nameof(IsLoadFinished));
+    }
+
+    partial void OnIsMarkdownRenderingChanged(bool value)
+    {
+        OnPropertyChanged(nameof(IsReadingBusy));
+        OnPropertyChanged(nameof(ReadingBusyText));
+    }
 
     /// <summary>Markdown files open as a rendered read-only document and can switch back to the
     /// existing AvalonEdit source surface.</summary>
@@ -2745,6 +2777,10 @@ public sealed partial class FilePreviewTab : EditorTabItem
     [ObservableProperty]
     private string searchErrorMessage = string.Empty;
 
+    /// <summary>True while a windowed search is waiting for debounce or scanning the source.</summary>
+    [ObservableProperty]
+    private bool isSearching;
+
     /// <summary>All capped matches of the active search; the view renders these as background markers.</summary>
     public BulkObservableCollection<TextSearchMatch> SearchMatches { get; } = [];
 
@@ -2760,6 +2796,17 @@ public sealed partial class FilePreviewTab : EditorTabItem
 
     [ObservableProperty]
     private string goToLineInput = string.Empty;
+
+    [ObservableProperty]
+    private string goToLineErrorMessage = string.Empty;
+
+    partial void OnGoToLineInputChanged(string value)
+    {
+        if (!string.IsNullOrEmpty(GoToLineErrorMessage))
+        {
+            GoToLineErrorMessage = string.Empty;
+        }
+    }
 
     /// <summary>Raised after a validated go-to-line jump; the view centers + emphasizes the line.</summary>
     public event EventHandler<int>? GoToLineRequested;
@@ -2786,7 +2833,7 @@ public sealed partial class FilePreviewTab : EditorTabItem
 
     /// <summary>True once the preview payload is resident and its initial load has completed. A
     /// cache-evicted tab deliberately becomes false again so activation reads the latest file.</summary>
-    public bool IsLoadFinished => !_payloadUnloaded && _loadTask?.IsCompleted == true;
+    public bool IsLoadFinished => !_payloadUnloaded && _loadTask is not null && !IsLoading;
 
     /// <summary>True when the decoded/derived payload is resident and no load or reload pass is
     /// still publishing it. The editor cache uses this as its eviction eligibility gate.</summary>
@@ -2838,6 +2885,7 @@ public sealed partial class FilePreviewTab : EditorTabItem
         }
 
         _payloadUnloaded = false;
+        IsLoading = true;
         _loadTask = RunContentPipelineAsync(initialLoad: true);
         OnPropertyChanged(nameof(IsLoadFinished));
         OnPropertyChanged(nameof(IsPayloadLoaded));
@@ -2846,9 +2894,16 @@ public sealed partial class FilePreviewTab : EditorTabItem
 
     /// <summary>外部变更重载:文件事件(保存/替换/创建/删除/重命名)后重新读取,所有已打开的预览
     /// (包括非活动标签)都经此串行化重载。只有最新一次请求运行解码管线,旧任务不得覆盖新内容。</summary>
-    public Task ReloadAsync() => IsClosed || _resourcesReleased || _payloadUnloaded
-        ? Task.CompletedTask
-        : RunContentPipelineAsync(initialLoad: false);
+    public Task ReloadAsync()
+    {
+        if (IsClosed || _resourcesReleased || _payloadUnloaded)
+        {
+            return Task.CompletedTask;
+        }
+
+        IsLoading = true;
+        return RunContentPipelineAsync(initialLoad: false);
+    }
 
     internal void UnloadContentForCache()
     {
@@ -2967,7 +3022,13 @@ public sealed partial class FilePreviewTab : EditorTabItem
                 _reloadGate.Release();
             }
 
-            Interlocked.Decrement(ref _pipelineActive);
+            if (Interlocked.Decrement(ref _pipelineActive) == 0)
+            {
+                IsLoading = false;
+            }
+
+            OnPropertyChanged(nameof(IsLoadFinished));
+            OnPropertyChanged(nameof(IsPayloadLoaded));
         }
     }
 
@@ -3015,12 +3076,13 @@ public sealed partial class FilePreviewTab : EditorTabItem
                 // 窗口阅读不产生渲染预览:模式显式落到源码,源码面(含提示)可见;
                 // 先于 LoadWindowAsync 切换,窗口派生工作(折叠等)按源码模式计算。
                 EnsureMarkdownSourceMode();
-                if (!await LoadWindowAsync(1))
+                var focusGlobalLine = Math.Clamp(ViewState?.CaretLine ?? 1, 1, Math.Max(1, LineCount));
+                if (!await LoadWindowAsync(focusGlobalLine))
                 {
                     return;
                 }
                 if (version != _contentVersion || IsClosed) return;
-                Notice = $"文件超过 8 MB，已进入大型文件窗口阅读：当前显示第 1–{Math.Min(FileReadOnlyDocumentSource.DefaultWindowLines, LineCount)} 行，共 {LineCount} 行。";
+                Notice = $"文件超过 8 MB，已进入大型文件窗口阅读：当前显示第 {WindowStartLine}–{Math.Min(LineCount, WindowStartLine + _windowTextLines - 1)} 行，共 {LineCount} 行。";
                 return;
             }
 
@@ -3148,6 +3210,9 @@ public sealed partial class FilePreviewTab : EditorTabItem
     {
         ContentUpdating?.Invoke(this, EventArgs.Empty);
         Content = result.Text ?? string.Empty;
+        WindowStartLine = 1;
+        _windowTextLines = 0;
+        _windowLineOffsets = [0];
         EncodingName = result.EncodingName ?? string.Empty;
         NewlineTypeText = result.NewlineType switch
         {
@@ -3576,6 +3641,7 @@ public sealed partial class FilePreviewTab : EditorTabItem
         // 替换(视图侧 Rebuild 按结果对象身份换文档),消除"渲染视图 → 空白/源码 → 新渲染"
         // 的闪帧。不产生新结果的分支在返回前显式清空,旧 AST 不随标签长期驻留。
         MarkdownRenderNotice = string.Empty;
+        IsMarkdownRendering = false;
         OnPropertyChanged(nameof(IsMarkdown));
         if (!IsMarkdown)
         {
@@ -3597,43 +3663,56 @@ public sealed partial class FilePreviewTab : EditorTabItem
             return;
         }
 
-        MarkdownRenderResult result;
-        var cancellation = _markdownCancellation = new CancellationTokenSource();
+        // Keep a previously rendered document visible while refreshing it. Only a first render
+        // (or a render after switching back from source mode) needs a blocking progress surface.
+        IsMarkdownRendering = MarkdownRenderResult is null;
         try
         {
-            result = await MarkdownPreviewService.Instance.ParseAsync(Content, Path, cancellation.Token);
-        }
-        catch (OperationCanceledException)
-        {
-            // 令牌默认不取消;保留显式分支以防未来接入取消。
-            return;
-        }
-        catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
-        {
-            // 仅解析失败才回退源码模式;结果赋值触发的视图侧异常不属于"渲染失败"。
-            if (version != _markdownVersion) return;
-            MarkdownMode = MarkdownViewMode.Source;
-            MarkdownRenderNotice = $"Markdown 渲染失败，已切换到源码视图：{SingleLineMessage(ex)}";
-            return;
-        }
+            MarkdownRenderResult result;
+            var cancellation = _markdownCancellation = new CancellationTokenSource();
+            try
+            {
+                result = await MarkdownPreviewService.Instance.ParseAsync(Content, Path, cancellation.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                // 令牌默认不取消;保留显式分支以防未来接入取消。
+                return;
+            }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+            {
+                // 仅解析失败才回退源码模式;结果赋值触发的视图侧异常不属于"渲染失败"。
+                if (version != _markdownVersion) return;
+                MarkdownMode = MarkdownViewMode.Source;
+                MarkdownRenderNotice = $"Markdown 渲染失败，已切换到源码视图：{SingleLineMessage(ex)}";
+                return;
+            }
 
-        if (version != _markdownVersion || cancellation.IsCancellationRequested)
-        {
-            // This result will never be handed to MarkdownPreviewView, so the view cannot
-            // perform its normal ownership handoff/release for the worker-side preheat refs.
-            MarkdownPreviewService.ReleasePreheatedPaths(result.PreheatedPaths);
-            return;
+            if (version != _markdownVersion || cancellation.IsCancellationRequested)
+            {
+                // This result will never be handed to MarkdownPreviewView, so the view cannot
+                // perform its normal ownership handoff/release for the worker-side preheat refs.
+                MarkdownPreviewService.ReleasePreheatedPaths(result.PreheatedPaths);
+                return;
+            }
+            MarkdownHeadings = result.Headings;
+            // 完成时的模式为准:解析期间用户已切到源码则丢弃 AST(切回预览再解析),
+            // 避免后台标签持有解析产物。
+            if (MarkdownMode == MarkdownViewMode.Rendered)
+            {
+                MarkdownRenderResult = result;
+            }
+            else
+            {
+                MarkdownPreviewService.ReleasePreheatedPaths(result.PreheatedPaths);
+            }
         }
-        MarkdownHeadings = result.Headings;
-        // 完成时的模式为准:解析期间用户已切到源码则丢弃 AST(切回预览再解析),
-        // 避免后台标签持有解析产物。
-        if (MarkdownMode == MarkdownViewMode.Rendered)
+        finally
         {
-            MarkdownRenderResult = result;
-        }
-        else
-        {
-            MarkdownPreviewService.ReleasePreheatedPaths(result.PreheatedPaths);
+            if (version == _markdownVersion)
+            {
+                IsMarkdownRendering = false;
+            }
         }
     }
 
@@ -3720,6 +3799,7 @@ public sealed partial class FilePreviewTab : EditorTabItem
             return;
         }
 
+        IsSearching = true;
         _searchTextDebounce.Schedule();
     }
 
@@ -3766,6 +3846,7 @@ public sealed partial class FilePreviewTab : EditorTabItem
         if (string.IsNullOrEmpty(SearchText))
         {
             CancelWindowedSearch();
+            IsSearching = false;
             SearchErrorMessage = string.Empty;
             ClearFindResults();
             return;
@@ -3774,6 +3855,7 @@ public sealed partial class FilePreviewTab : EditorTabItem
         if (SearchUseRegex && TextSearchService.GetRegexError(SearchText, SearchCaseSensitive) is { } error)
         {
             CancelWindowedSearch();
+            IsSearching = false;
             ClearFindResults();
             _windowedMatches.Clear();
             SearchErrorMessage = error;
@@ -3784,10 +3866,12 @@ public sealed partial class FilePreviewTab : EditorTabItem
 
         if (_documentSource is not null)
         {
+            IsSearching = true;
             _ = RefreshWindowedSearchAsync(SearchText);
             return;
         }
 
+        IsSearching = false;
         if (Content.Length == 0)
         {
             ClearFindResults();
@@ -3824,6 +3908,7 @@ public sealed partial class FilePreviewTab : EditorTabItem
 
     private void ClearFindResults()
     {
+        IsSearching = false;
         SearchMatches.ReplaceRange([]);
         MatchCount = 0;
         CurrentMatchIndex = 0;
@@ -3839,7 +3924,11 @@ public sealed partial class FilePreviewTab : EditorTabItem
     private async Task RefreshWindowedSearchAsync(string query)
     {
         var source = _documentSource;
-        if (source is null) return;
+        if (source is null)
+        {
+            IsSearching = false;
+            return;
+        }
         // 版本令牌必须原子自增:快速连续切换选项会并发派发多个流式搜索,
         // 非原子的 ++ 会丢失更新,让过期的旧搜索"获胜"并写回陈旧结果。
         var version = Interlocked.Increment(ref _searchVersion);
@@ -3854,6 +3943,10 @@ public sealed partial class FilePreviewTab : EditorTabItem
         }
         catch (OperationCanceledException)
         {
+            if (version == _searchVersion)
+            {
+                IsSearching = false;
+            }
             return;
         }
         catch (Exception ex)
@@ -3865,6 +3958,7 @@ public sealed partial class FilePreviewTab : EditorTabItem
                 && !_resourcesReleased)
             {
                 SearchErrorMessage = SingleLineMessage(ex);
+                IsSearching = false;
             }
 
             return;
@@ -3877,6 +3971,7 @@ public sealed partial class FilePreviewTab : EditorTabItem
         MatchCount = matches.Count;
         CurrentMatchIndex = 0;
         ApplyWindowedMatches();
+        IsSearching = false;
     }
 
     /// <summary>E10: 权威窗口化匹配列表的增量替换。新结果里存活的匹配保留上一轮的实例
@@ -4042,6 +4137,7 @@ public sealed partial class FilePreviewTab : EditorTabItem
     private void ClearSearch()
     {
         _searchTextDebounce.Cancel(); // E10: Escape 立即清空,挂起的去抖扫描不得再跑
+        IsSearching = false;
         SearchText = string.Empty;
         IsFindBarOpen = false;
         SearchMatches.ReplaceRange([]);
@@ -4075,6 +4171,7 @@ public sealed partial class FilePreviewTab : EditorTabItem
 
         var next = (CurrentMatchIndex + offset + MatchCount) % MatchCount;
         CurrentMatchIndex = next;
+        var previousViewIndex = CurrentMatchViewIndex;
 
         if (_documentSource is not null && _windowedMatches.Count > 0)
         {
@@ -4095,6 +4192,10 @@ public sealed partial class FilePreviewTab : EditorTabItem
         {
             CurrentMatchViewIndex = next;
         }
+        // Navigation is an action even when the only match keeps the same index.
+        // Re-publish it so Enter/F3 can return to a match after the user scrolls away.
+        if (CurrentMatchViewIndex >= 0 && CurrentMatchViewIndex == previousViewIndex)
+            OnPropertyChanged(nameof(CurrentMatchViewIndex));
     }
 
     [RelayCommand]
@@ -4173,6 +4274,7 @@ public sealed partial class FilePreviewTab : EditorTabItem
     private void OpenGoToLineBar()
     {
         GoToLineInput = string.Empty;
+        GoToLineErrorMessage = string.Empty;
         IsGoToLineBarOpen = true;
     }
 
@@ -4180,17 +4282,17 @@ public sealed partial class FilePreviewTab : EditorTabItem
     [RelayCommand]
     private void GoToLine()
     {
-        IsGoToLineBarOpen = false;
-
         var input = GoToLineInput?.Trim() ?? string.Empty;
         if (input.Length == 0)
         {
+            GoToLineErrorMessage = "请输入行号，例如 42 或 42:16。";
             return;
         }
 
         var parts = input.Split(':', 2);
         if (!int.TryParse(parts[0], out var line) || line < 1)
         {
+            GoToLineErrorMessage = "行号必须是大于 0 的整数。";
             return;
         }
 
@@ -4202,8 +4304,15 @@ public sealed partial class FilePreviewTab : EditorTabItem
         {
             column = parsedColumn;
         }
+        else if (parts.Length == 2)
+        {
+            GoToLineErrorMessage = "列号必须是大于 0 的整数。";
+            return;
+        }
 
         var effectiveLine = Math.Min(line, Math.Max(LineCount, 1));
+        GoToLineErrorMessage = string.Empty;
+        IsGoToLineBarOpen = false;
         if (_documentSource is null)
         {
             if (column is int effectiveColumn)

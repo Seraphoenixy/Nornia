@@ -309,7 +309,15 @@ public sealed class SearchPerformanceTests : IDisposable
             WindowsIdentity.GetCurrent().Name,
             FileSystemRights.ReadData | FileSystemRights.ListDirectory | FileSystemRights.ReadAndExecute,
             AccessControlType.Deny));
-        info.SetAccessControl(deny);
+        try
+        {
+            info.SetAccessControl(deny);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            // Restricted test hosts cannot change ACLs; no deny rule was installed.
+            return;
+        }
         try
         {
             // Confirm the deny is effective; if this environment cannot be locked down

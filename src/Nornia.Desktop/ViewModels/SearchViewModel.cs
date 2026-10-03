@@ -457,8 +457,12 @@ public partial class SearchViewModel : PageViewModel
     private void ShowListView() => ResultsViewMode = SearchResultsViewMode.List;
 
     [RelayCommand]
-    private void CancelSearch() =>
+    private void CancelSearch()
+    {
+        // 防抖窗口内的输入仍会触发新一轮扫描,取消必须连同防抖一起停掉,否则"取消"是半个实现。
+        _debounceCancellation?.Cancel();
         _searchCancellation?.Cancel();
+    }
 
     [RelayCommand]
     private void ClearSearch()
@@ -585,8 +589,9 @@ public partial class SearchViewModel : PageViewModel
         var root = _workspace.Current?.ProjectPath;
         if (string.IsNullOrWhiteSpace(root) || generation != _generation) return;
 
+        // 只 Cancel 不 Dispose:旧扫描任务可能仍在通过链接令牌引用它(取消传播),
+        // 提前释放会让仍在枚举中的旧任务抛 ObjectDisposedException。Dispose 留给 GC。
         _searchCancellation?.Cancel();
-        _searchCancellation?.Dispose();
         _searchCancellation = CancellationTokenSource.CreateLinkedTokenSource(debounceToken);
         var token = _searchCancellation.Token;
         var query = new WorkspaceSearchQuery(root, SearchText,
@@ -685,6 +690,19 @@ public partial class SearchViewModel : PageViewModel
                 IsSearching = false;
                 StatusMessage = "搜索失败";
                 LogService.WriteException("ERROR", "工作区搜索失败", ex);
+            });
+        }
+        catch (Exception ex)
+        {
+            // 兜底:任何未预期异常都不能让 UI 永远停在"正在搜索…"(否则搜索按钮再无响应且无感知)。
+            await _dispatcher.InvokeAsync(() =>
+            {
+                if (generation != _generation) return;
+                _refinement = null;
+                IsSearching = false;
+                StatusMessage = "搜索失败";
+                SearchErrorMessage = "搜索过程中出现内部错误";
+                LogService.WriteException("ERROR", "工作区搜索出现未预期异常", ex);
             });
         }
     }

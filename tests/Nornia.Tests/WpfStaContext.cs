@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Threading;
 using System.Windows;
 using System.Windows.Threading;
@@ -16,7 +15,7 @@ public sealed class WpfStaSequentialCollection;
 /// <see cref="Application"/> 实例,而 xUnit 默认在同进程内并行跑测试类——因此所有
 /// STA 控件测试(SectionCollapse / MarkdownPreviewView 同步 / 大纲跳转集成)共用
 /// 这一条 STA 线程与同一个 <c>Nornia.Desktop.App</c>(完整 App.xaml 资源字典;
-/// 只构造 + InitializeComponent,不 Run,OnStartup 不执行)。
+/// 仅加载资源,不启动工作台;Dispatcher 持续处理队列)。
 /// 用法:<c>WpfStaContext.Run(() => { ...控件操作...; WpfStaContext.PumpQueue(); });</c></summary>
 public static class WpfStaContext
 {
@@ -36,7 +35,7 @@ public static class WpfStaContext
 
     private sealed class Pump
     {
-        private readonly BlockingCollection<(Action Work, ManualResetEventSlim Done, List<Exception> Errors)> _queue = [];
+        private readonly TaskCompletionSource<Dispatcher> _ready = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         public Pump()
         {
@@ -44,30 +43,21 @@ public static class WpfStaContext
             {
                 // ApplicationDefinition 的 InitializeComponent 由 Main() 显式调用(构造函数不调),
                 // 手动触发以载入 App.xaml 完整资源字典。
-                var app = new Nornia.Desktop.App();
+                var app = new Nornia.Desktop.App(initializeWorkbench: false);
                 app.InitializeComponent();
-                // 测试 App 不执行 OnStartup(其中才设 OnMainWindowClose):默认
+                // 测试 App 不启动工作台(其中才设 OnMainWindowClose):默认
                 // OnLastWindowClose 下,任一测试窗口 Show+Close(如侧栏模板测试)会关闭整个
                 // App,其后所有 STA 测试全部命中"应用程序对象正在关闭"。测试 App 随进程退出,
                 // 显式关闭语义即可。
                 app.ShutdownMode = ShutdownMode.OnExplicitShutdown;
                 // 与真实 UI 线程一致:async 续帖经 DispatcherSynchronizationContext 回排到
-                // Dispatcher 队列(由 PumpQueue 驱动),避免 VM 属性变更/视图操作跨线程。
+                // Dispatcher 队列,避免 VM 属性变更/视图操作跨线程。
                 SynchronizationContext.SetSynchronizationContext(
                     new DispatcherSynchronizationContext(Dispatcher.CurrentDispatcher));
-                foreach (var (work, done, errors) in _queue.GetConsumingEnumerable())
-                {
-                    try
-                    {
-                        work();
-                    }
-                    catch (Exception ex)
-                    {
-                        errors.Add(ex);
-                    }
-
-                    done.Set();
-                }
+                _ready.SetResult(Dispatcher.CurrentDispatcher);
+                // View models can invoke the UI dispatcher outside Run(). Keep it pumping,
+                // rather than blocking on a separate queue between individual test actions.
+                Dispatcher.Run();
             })
             {
                 IsBackground = true,
@@ -78,14 +68,15 @@ public static class WpfStaContext
 
         public void Run(Action work)
         {
-            using var done = new ManualResetEventSlim(false);
-            var errors = new List<Exception>();
-            _queue.Add((work, done, errors));
-            done.Wait();
-            if (errors.Count > 0)
+            var dispatcher = _ready.Task.GetAwaiter().GetResult();
+            Exception? error = null;
+            dispatcher.Invoke(() =>
             {
-                throw new AggregateException(errors);
-            }
+                try { work(); }
+                catch (Exception ex) { error = ex; }
+            });
+            if (error is not null) throw new AggregateException(error);
         }
     }
+
 }

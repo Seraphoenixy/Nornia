@@ -52,7 +52,7 @@ public sealed class DesktopCommandBootstrapper(ICommandRegistry registry, IKeybi
             "!inputFocus");
         Add("workbench.action.terminal.toggleTerminal", "切换终端", "终端", Codicons.Terminal, "ctrl+`");
         Add("workbench.action.terminal.new", "新建终端", "终端", Codicons.Terminal, "ctrl+shift+`");
-        Add("nornia.action.copyFocused", "复制所选内容", "编辑", Codicons.Copy, "ctrl+c", "!inputFocus");
+        Add("nornia.action.copyFocused", "复制所选内容", "编辑", Codicons.Copy, "ctrl+c", "!inputFocus && !terminalFocus");
         Add("nornia.action.selectAllFocused", "全选当前列表", "编辑", Codicons.CheckAll, "ctrl+a", "!inputFocus");
         Add("workbench.action.terminal.clear", "清除终端", "终端", Codicons.ClearAll, "ctrl+shift+k", "terminalFocus");
         Add("workbench.action.terminal.focus", "聚焦终端", "终端", Codicons.Terminal, "ctrl+/");

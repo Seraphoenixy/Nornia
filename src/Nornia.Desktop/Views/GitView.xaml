@@ -882,10 +882,13 @@
       <Border DockPanel.Dock="Top" Padding="8,4,8,6"
               Visibility="{Binding IsRepository, Converter={StaticResource BooleanToVisibilityConverter}}">
         <StackPanel>
-          <!-- 空消息时提示文字显示在输入框内部；输入框默认单行,有换行时按内容自动增高。 -->
+          <!-- 空消息时提示文字显示在输入框内部；输入框默认单行,有换行时按内容自动增高。
+               MaxHeight 封顶并启用内部滚动条:无上限时多行消息会把下方的提交按钮挤出
+               可视区域,增高的输入框也会盖住右上角的历史图标。 -->
           <Grid>
             <TextBox Text="{Binding CommitMessage, UpdateSourceTrigger=PropertyChanged}" AcceptsReturn="True"
-                     MinHeight="{DynamicResource SizeRowMd}" VerticalContentAlignment="Top"
+                     MinHeight="{DynamicResource SizeRowMd}" MaxHeight="104"
+                     VerticalContentAlignment="Top" VerticalScrollBarVisibility="Auto"
                      TextWrapping="Wrap" Padding="6,5,30,5"
                      ToolTip="输入提交消息（回车换行，Ctrl+Enter 提交）">
               <TextBox.InputBindings>

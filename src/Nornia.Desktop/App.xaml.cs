@@ -22,6 +22,13 @@ namespace Nornia.Desktop;
 
 public partial class App : Application
 {
+    private readonly bool _initializeWorkbench;
+
+    public App() : this(initializeWorkbench: true) { }
+
+    // Allows resource-only hosts to pump WPF without starting services or opening a window.
+    internal App(bool initializeWorkbench) => _initializeWorkbench = initializeWorkbench;
+
     private ServiceProvider? _services;
     private InputLatencyTracker? _inputLatencyTracker;
 
@@ -40,6 +47,7 @@ public partial class App : Application
 
     protected override async void OnStartup(StartupEventArgs e)
     {
+        if (!_initializeWorkbench) return;
         try
         {
             await OnStartupCoreAsync(e);

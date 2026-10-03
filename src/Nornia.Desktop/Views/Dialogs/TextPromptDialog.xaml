@@ -25,7 +25,7 @@
                 <CheckBox x:Name="AnnotateCheck" Content="创建注释化标签（附消息）" Foreground="{DynamicResource TextBrush}"
                           Checked="AnnotateCheck_Checked" Unchecked="AnnotateCheck_Checked" Margin="0,0,0,8" />
                 <TextBox x:Name="MessageBox" FontSize="{DynamicResource TypeBody}" Padding="4"
-                         Height="72" AcceptsReturn="True" TextWrapping="Wrap"
+                         Height="72" AcceptsReturn="True" TextWrapping="Wrap" ScrollViewer.VerticalScrollBarVisibility="Auto"
                          Background="{DynamicResource QuickInputBackgroundBrush}"
                          Foreground="{DynamicResource TextBrush}"
                          BorderBrush="{DynamicResource ButtonSplitDividerBrush}"

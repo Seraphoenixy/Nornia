@@ -639,7 +639,7 @@ public sealed class TerminalSurfaceControl : FrameworkElement
                     {
                         ClearSelection();
                     }
-                    else
+                    else if (Keyboard.Modifiers == ModifierKeys.Control)
                     {
                         WriteInput(session, "\x03");
                     }
@@ -824,7 +824,14 @@ public sealed class TerminalSurfaceControl : FrameworkElement
 
         var visibleRows = Math.Max(1, (int)(ActualHeight / _cellHeight));
         var maxOffset = Math.Max(0, screen.TotalLines - visibleRows);
-        var newOffset = Math.Clamp(_scrollOffset + (e.Delta > 0 ? 1 : -1), 0, maxOffset);
+        // 标准滚轮一格 delta=120 → 3 行(与 Windows Terminal/VS Code 惯例一致);
+        // 触控板小 delta 按比例缩放,非零 delta 至少滚 1 行。
+        var wheelLines = (int)Math.Round(e.Delta * 3.0 / 120.0, MidpointRounding.AwayFromZero);
+        if (wheelLines == 0)
+        {
+            wheelLines = Math.Sign(e.Delta);
+        }
+        var newOffset = Math.Clamp(_scrollOffset - wheelLines, 0, maxOffset);
         if (newOffset != _scrollOffset)
         {
             _scrollOffset = newOffset;
@@ -860,7 +867,7 @@ public sealed class TerminalSurfaceControl : FrameworkElement
             return false;
         }
 
-        var text = SelectedText(anchor, end);
+        var text = Session?.Screen is { } screen ? ExtractSelectionText(screen, anchor, end) : string.Empty;
         if (text.Length == 0)
         {
             return false;
@@ -877,20 +884,15 @@ public sealed class TerminalSurfaceControl : FrameworkElement
         RequestRender();
     }
 
-    private string SelectedText((int Row, int Column) anchor, (int Row, int Column) end)
+    internal static string ExtractSelectionText(TerminalScreen screen, (int Row, int Column) anchor, (int Row, int Column) end)
     {
-        var screen = Session?.Screen;
-        if (screen is null)
-        {
-            return string.Empty;
-        }
-
         var minIndex = Math.Min(anchor.Row, end.Row);
         var maxIndex = Math.Max(anchor.Row, end.Row);
         var anchorIsTop = anchor.Row > end.Row || (anchor.Row == end.Row && anchor.Column >= end.Column);
         var topColumn = anchorIsTop ? anchor.Column : end.Column;
         var bottomColumn = anchorIsTop ? end.Column : anchor.Column;
         var builder = new StringBuilder();
+        var hasLine = false;
         // Visual top (max) to bottom (min)
         for (var lineIndex = maxIndex; lineIndex >= minIndex; lineIndex--)
         {
@@ -923,28 +925,31 @@ public sealed class TerminalSurfaceControl : FrameworkElement
 
             if (endCol <= start) continue;
 
+            if (hasLine) builder.Append(Environment.NewLine);
+            hasLine = true;
+
             if (start == 0 && endCol == line.Length)
             {
                 // T8: 整行选择复用屏幕行文本缓存(渲染与复制共用),不再逐行物化字符数组。
                 var cached = screen.GetRenderedLine(lineIndex)?.TrimEnd() ?? string.Empty;
-                if (builder.Length > 0) builder.Append(Environment.NewLine);
                 builder.Append(cached);
                 continue;
             }
 
-            var chars = new char[endCol - start];
+            var segmentBuilder = new StringBuilder(endCol - start);
             for (var column = start; column < endCol; column++)
             {
-                chars[column - start] = line[column].Char;
+                // A wide character's continuation cell has Width=0 and must not enter the clipboard.
+                if (!(line[column].Width == 0 && column > 0 && line[column - 1].Width == 2))
+                    segmentBuilder.Append(line[column].Char == '\0' ? ' ' : line[column].Char);
             }
 
             // Trim trailing NULs/spaces per line then join
-            var segment = new string(chars).TrimEnd('\0').TrimEnd();
-            if (builder.Length > 0) builder.Append(Environment.NewLine);
+            var segment = segmentBuilder.ToString().TrimEnd();
             builder.Append(segment);
         }
 
-        return builder.ToString().TrimEnd();
+        return builder.ToString();
     }
 
     private void PasteClipboard()

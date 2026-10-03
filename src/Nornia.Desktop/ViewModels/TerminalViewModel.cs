@@ -17,6 +17,7 @@ public partial class TerminalViewModel : PageViewModel
     private readonly IClipboardService _clipboard;
     private readonly SemaphoreSlim _defaultProfileSaveGate = new(1, 1);
     private readonly SemaphoreSlim _workspaceContextGate = new(1, 1);
+    private readonly SemaphoreSlim _profileLoadGate = new(1, 1);
     private ProjectWorkspaceContext? _workspaceContext;
     private long _workspaceGeneration;
     private bool _profilesLoaded;
@@ -58,6 +59,20 @@ public partial class TerminalViewModel : PageViewModel
     public Task RefreshProfilesAsync() => LoadProfilesAsync(useSavedDefault: false);
 
     private async Task LoadProfilesAsync(bool useSavedDefault)
+    {
+        // 首次激活、设置变更、新建终端兜底可能并发触发加载:串行化避免 Profiles 被重复填充。
+        await _profileLoadGate.WaitAsync();
+        try
+        {
+            await LoadProfilesCoreAsync(useSavedDefault);
+        }
+        finally
+        {
+            _profileLoadGate.Release();
+        }
+    }
+
+    private async Task LoadProfilesCoreAsync(bool useSavedDefault)
     {
         var generation = Volatile.Read(ref _workspaceGeneration);
         var context = _workspaceContext;
@@ -261,8 +276,15 @@ public partial class TerminalViewModel : PageViewModel
         await _workspaceContextGate.WaitAsync();
         try
         {
-            var profile = SelectedProfile;
             var context = _workspaceContext;
+            // 首次激活后立即新建终端:profile 加载(含线程池 PATH 扫描)可能尚未完成,
+            // 这里补齐一次加载,而不是因 SelectedProfile 尚空而无声放弃。
+            if (SelectedProfile is null && !_profilesLoaded)
+            {
+                await LoadProfilesAsync(useSavedDefault: true);
+            }
+
+            var profile = SelectedProfile;
             var directory = WorkingDirectory;
             if (profile is null) return;
 
@@ -281,7 +303,7 @@ public partial class TerminalViewModel : PageViewModel
                 session.Exited += (_, _) => tab.Refresh();
                 Sessions.Add(tab);
                 SelectedSession = tab;
-            }, canCancel: false);
+            }, canCancel: true);
         }
         finally
         {

@@ -93,16 +93,34 @@ public partial class DiffDocumentView : UserControl
     // 原始 hunk 头文本(按 hunk 序):折叠投影会把 @@ 元数据从内联文档隐藏(hideHunkHeader),
     // sticky 行仍显示真实头文本;第 k 个显示 hunk 头与第 k 个原始 hunk 头一一对应。
     private IReadOnlyList<string> _rawHunkHeaderTexts = [];
+    // sticky 段头的 hunk 头行索引缓存(随 _inlineLines 在 RebuildDocuments 失效),
+    // 以及上次构建的(段序号,段首行):滚动事件高频调用,内容未变时跳过重建。
+    private List<int>? _stickyHeaderCache;
+    private (int Ordinal, int HeaderStart)? _lastStickyVisual;
+    private bool _stickyVisualInvalid = true;
     // 并排两侧的行对齐变更掩码(RebuildDocuments 随 _oldLines/_newLines 一次性重建):
     // 变更导航/概览 current 标记按并排行号空间定位。每次重建只分配一次,
     // 滚动路径上的 BlockAtIndex 扫描零分配。
     private IReadOnlyList<DiffRenderLine> _sideChangeMask = [];
     private bool _positionedFirstChange;
-    private readonly List<int> _diffFindMatches = [];
-    private DiffFindRenderer? _diffFindRenderer;
+    private readonly List<DiffFindMatch> _diffFindMatches = [];
+    // 与 _diffFindMatches 一一对应的文档偏移段,跳转时复用,避免每次对全部匹配重建段集合。
+    // 内联模式只用 Inline 列表;并排模式统一行模型文档为空,按旧/新侧分别建段。
+    private readonly List<(int Start, int Length)> _diffFindSegments = [];
+    private readonly List<(int Start, int Length)> _oldFindSegments = [];
+    private readonly List<(int Start, int Length)> _newFindSegments = [];
+    private System.Windows.Threading.DispatcherTimer? _diffFindDebounceTimer;
+    private DiffFindRenderer? _inlineFindRenderer;
+    private DiffFindRenderer? _oldFindRenderer;
+    private DiffFindRenderer? _newFindRenderer;
     private DiffHunkBlock? _hoverBlock;
     private TextView? _hoverTextView;
     private DiffScrollState? _pendingScrollRestore;
+
+    /// <summary>查找匹配所在的编辑器面板:内联模式在统一行模型上,并排模式直接在旧/新侧行模型上。</summary>
+    private enum DiffFindPane { Inline, Old, New }
+
+    private readonly record struct DiffFindMatch(DiffFindPane Pane, int LineIndex, int Column, int Length);
 
     /// <summary>One contiguous changed block (连续 +/- 行) inside a hunk. git 把间距不超过
     /// 2×上下文行的多处修改合并成一个 hunk——工具条按块锚定、按块应用,用户才能只暂存其中
@@ -124,6 +142,7 @@ public partial class DiffDocumentView : UserControl
         OldEditor.TextArea.TextView.LineTransformers.Add(_oldSemanticTokens);
         NewEditor.TextArea.TextView.LineTransformers.Add(_newSemanticTokens);
         DataContextChanged += OnDataContextChanged;
+        PreviewKeyDown += OnReadingPreviewKeyDown;
         OverviewCanvas.SizeChanged += (_, _) => RedrawOverview();
         OverviewCanvas.MouseLeftButtonDown += OnOverviewMouseDown;
         OldOverviewCanvas.SizeChanged += (_, _) => RedrawSideOverviews();
@@ -185,6 +204,7 @@ public partial class DiffDocumentView : UserControl
         };
         Unloaded += (_, _) => ThemeEvents.ThemeChanged -= OnThemeChanged;
         Unloaded += (_, _) => CancelPresentation();
+        Unloaded += (_, _) => StopDiffFindDebounce();
         SizeChanged += (_, _) =>
         {
             UpdateLayoutMode();
@@ -1106,7 +1126,18 @@ public partial class DiffDocumentView : UserControl
         }
         else if (e.PropertyName == nameof(DiffTab.FindText))
         {
-            RefreshDiffFind();
+            // 查找输入逐键触发全量扫描(遍历全部 diff 行 + 构建段集合):150ms 去抖合并
+            // 连续按键,大 diff 下避免每键一次 UI 线程遍历。
+            if (_diffFindDebounceTimer is null)
+            {
+                _diffFindDebounceTimer = new System.Windows.Threading.DispatcherTimer
+                {
+                    Interval = TimeSpan.FromMilliseconds(150),
+                };
+                _diffFindDebounceTimer.Tick += OnDiffFindDebounceTick;
+            }
+            _diffFindDebounceTimer.Stop();
+            _diffFindDebounceTimer.Start();
         }
         else if (e.PropertyName == nameof(DiffTab.ShowOverviewRuler))
         {
@@ -1123,10 +1154,51 @@ public partial class DiffDocumentView : UserControl
             _oldNumbers?.InvalidateVisual();
             _newNumbers?.InvalidateMeasure();
             _newNumbers?.InvalidateVisual();
+            // sticky 行文本按编辑器字号构建,字号变化后需重建。
+            _stickyVisualInvalid = true;
+            UpdateDiffSticky();
         }
     }
 
     // ===== Diff 内查找(统一文本) =====
+
+    private void OnReadingPreviewKeyDown(object sender, KeyEventArgs e)
+    {
+        if (_tab is null || e.Handled) return;
+        var modifiers = Keyboard.Modifiers;
+        if (e.Key == Key.F && modifiers == ModifierKeys.Control)
+        {
+            var editor = _positionedEditor;
+            if (editor is not null && editor.IsKeyboardFocusWithin && editor.SelectionLength > 0)
+                _tab.FindText = editor.SelectedText;
+            _tab.IsFindBarOpen = true;
+            Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Input, () =>
+            {
+                DiffFindBox.Focus();
+                DiffFindBox.SelectAll();
+            });
+            RefreshDiffFind();
+            e.Handled = true;
+        }
+        else if (e.Key == Key.F3 && modifiers is ModifierKeys.None or ModifierKeys.Shift)
+        {
+            DiffFindJump(modifiers == ModifierKeys.Shift ? -1 : 1);
+            e.Handled = true;
+        }
+        else if (e.Key == Key.Escape && modifiers == ModifierKeys.None && _tab.IsFindBarOpen)
+        {
+            _tab.IsFindBarOpen = false;
+            FocusDiffReadingSurface();
+            e.Handled = true;
+        }
+    }
+
+    private void FocusDiffReadingSurface()
+    {
+        var editor = EffectiveInline() ? InlineEditor
+            : _positionedEditor == OldEditor ? OldEditor : NewEditor;
+        editor.TextArea.Focus();
+    }
 
     private void ToggleFindBar_Click(object sender, RoutedEventArgs e)
     {
@@ -1140,9 +1212,9 @@ public partial class DiffDocumentView : UserControl
 
     private void DiffFindBox_KeyDown(object sender, KeyEventArgs e)
     {
-        if (e.Key == Key.Enter)
+        if (e.Key == Key.Enter && Keyboard.Modifiers is ModifierKeys.None or ModifierKeys.Shift)
         {
-            DiffFindJump(1);
+            DiffFindJump(Keyboard.Modifiers == ModifierKeys.Shift ? -1 : 1);
             e.Handled = true;
         }
         else if (e.Key == Key.Escape)
@@ -1151,6 +1223,7 @@ public partial class DiffDocumentView : UserControl
             {
                 _tab.IsFindBarOpen = false;
             }
+            FocusDiffReadingSurface();
             e.Handled = true;
         }
     }
@@ -1159,55 +1232,145 @@ public partial class DiffDocumentView : UserControl
 
     private void DiffFindNext_Click(object sender, RoutedEventArgs e) => DiffFindJump(1);
 
+    private void OnDiffFindDebounceTick(object? sender, EventArgs e)
+    {
+        if (sender is System.Windows.Threading.DispatcherTimer timer)
+        {
+            timer.Stop();
+        }
+        RefreshDiffFind();
+    }
+
+    private void StopDiffFindDebounce()
+    {
+        _diffFindDebounceTimer?.Stop();
+    }
+
     private void ClearDiffFind()
     {
+        StopDiffFindDebounce();
         _diffFindMatches.Clear();
+        _diffFindSegments.Clear();
+        _oldFindSegments.Clear();
+        _newFindSegments.Clear();
         if (_tab is not null)
         {
             _tab.FindCount = 0;
             _tab.FindIndex = 0;
         }
-        _diffFindRenderer?.Clear();
+        _inlineFindRenderer?.Clear();
+        _oldFindRenderer?.Clear();
+        _newFindRenderer?.Clear();
     }
 
     private void RefreshDiffFind()
     {
+        StopDiffFindDebounce();
         _diffFindMatches.Clear();
+        _diffFindSegments.Clear();
+        _oldFindSegments.Clear();
+        _newFindSegments.Clear();
         var query = _tab?.FindText ?? string.Empty;
-        if (_tab is null || string.IsNullOrEmpty(query) || _inlineLines.Count == 0)
+        if (_tab is null || string.IsNullOrEmpty(query))
         {
-            _diffFindMatches.Clear();
             ClearDiffFind();
             return;
         }
 
-        for (var i = 0; i < _inlineLines.Count; i++)
+        if (EffectiveInline())
         {
-            if (_inlineLines[i].Text.Contains(query, StringComparison.OrdinalIgnoreCase))
+            if (_inlineLines.Count == 0)
             {
-                _diffFindMatches.Add(i);
+                ClearDiffFind();
+                return;
             }
+
+            // 内联模式:统一行模型即 InlineEditor 文档,段按其偏移。
+            var document = InlineEditor.Document;
+            for (var i = 0; i < _inlineLines.Count; i++)
+            {
+                var text = _inlineLines[i].Text;
+                var column = 0;
+                while (column < text.Length
+                    && (column = text.IndexOf(query, column, StringComparison.OrdinalIgnoreCase)) >= 0)
+                {
+                    _diffFindMatches.Add(new DiffFindMatch(DiffFindPane.Inline, i, column, query.Length));
+                    if (document is not null)
+                    {
+                        _diffFindSegments.Add((document.GetLineByNumber(i + 1).Offset + column, query.Length));
+                    }
+                    if (_diffFindMatches.Count >= 10_000)
+                    {
+                        break;
+                    }
+
+                    column += Math.Max(1, query.Length);
+                }
+
+                if (_diffFindMatches.Count >= 10_000)
+                {
+                    break;
+                }
+            }
+
+            _oldFindRenderer?.Clear();
+            _newFindRenderer?.Clear();
+            var inlineRenderer = _inlineFindRenderer ??= new DiffFindRenderer(this, InlineEditor);
+            inlineRenderer.SetSegments(_diffFindSegments, -1);
+        }
+        else
+        {
+            // 并排模式:InlineEditor 文档为空,直接扫描两侧可见行模型;两侧按行对齐,
+            // 匹配按(行号,旧在前)合并,F3 才能自上而下推进。旧/新编辑器同步显示段高亮。
+            List<DiffFindMatch> oldMatches = [], newMatches = [];
+            ScanSideFind(query, _oldLines, OldEditor, oldMatches, _oldFindSegments);
+            ScanSideFind(query, _newLines, NewEditor, newMatches, _newFindSegments);
+            var (oldIndex, newIndex) = (0, 0);
+            while ((oldIndex < oldMatches.Count || newIndex < newMatches.Count)
+                && _diffFindMatches.Count < 10_000)
+            {
+                var takeOld = newIndex >= newMatches.Count
+                    || (oldIndex < oldMatches.Count
+                        && oldMatches[oldIndex].LineIndex <= newMatches[newIndex].LineIndex);
+                _diffFindMatches.Add(takeOld ? oldMatches[oldIndex++] : newMatches[newIndex++]);
+            }
+
+            _inlineFindRenderer?.Clear();
+            var oldRenderer = _oldFindRenderer ??= new DiffFindRenderer(this, OldEditor);
+            var newRenderer = _newFindRenderer ??= new DiffFindRenderer(this, NewEditor);
+            oldRenderer.SetSegments(_oldFindSegments, -1);
+            newRenderer.SetSegments(_newFindSegments, -1);
         }
 
         _tab.FindCount = _diffFindMatches.Count;
         _tab.FindIndex = -1;
-        var segments = new List<(int Start, int Length)>();
-        var document = InlineEditor.Document;
-        foreach (var index in _diffFindMatches)
+    }
+
+    private void ScanSideFind(string query, IReadOnlyList<DiffRenderLine> lines, TextEditor editor,
+        List<DiffFindMatch> matches, List<(int Start, int Length)> segments)
+    {
+        var document = editor.Document;
+        for (var i = 0; i < lines.Count && matches.Count < 10_000; i++)
         {
-            var text = _inlineLines[index].Text;
-            var column = text.IndexOf(query, StringComparison.OrdinalIgnoreCase);
-            if (column < 0)
+            var text = lines[i].Text;
+            var column = 0;
+            while (column < text.Length
+                && (column = text.IndexOf(query, column, StringComparison.OrdinalIgnoreCase)) >= 0)
             {
-                continue;
+                matches.Add(new DiffFindMatch(lines == _oldLines ? DiffFindPane.Old : DiffFindPane.New,
+                    i, column, query.Length));
+                if (document is not null)
+                {
+                    segments.Add((document.GetLineByNumber(i + 1).Offset + column, query.Length));
+                }
+                if (matches.Count >= 10_000)
+                {
+                    return;
+                }
+
+                column += Math.Max(1, query.Length);
             }
-
-            var offset = document.GetLineByNumber(index + 1).Offset + column;
-            segments.Add((offset, Math.Min(query.Length, Math.Max(0, text.Length - column))));
         }
-
-        var renderer = _diffFindRenderer ??= new DiffFindRenderer(this);
-        renderer.SetSegments(segments, -1);
     }
 
     private void DiffFindJump(int step)
@@ -1217,51 +1380,60 @@ public partial class DiffDocumentView : UserControl
             return;
         }
 
-        var index = (_tab.FindIndex + step + _diffFindMatches.Count) % _diffFindMatches.Count;
+        var index = _tab.FindIndex < 0
+            ? step < 0 ? _diffFindMatches.Count - 1 : 0
+            : (_tab.FindIndex + step + _diffFindMatches.Count) % _diffFindMatches.Count;
         _tab.FindIndex = index;
-        var matchIndex = _diffFindMatches[index];
-        var text = _inlineLines[matchIndex].Text;
-        var column = text.IndexOf(_tab.FindText ?? string.Empty, StringComparison.OrdinalIgnoreCase);
-        if (column < 0)
+        var match = _diffFindMatches[index];
+        var lineNumber = match.LineIndex + 1;
+
+        TextEditor editor;
+        TextEditor? counterpart = null;
+        List<(int Start, int Length)> segments;
+        DiffFindRenderer? renderer;
+        switch (match.Pane)
         {
-            column = 0;
+            case DiffFindPane.Old:
+                editor = OldEditor;
+                counterpart = NewEditor;
+                segments = _oldFindSegments;
+                renderer = _oldFindRenderer;
+                break;
+            case DiffFindPane.New:
+                editor = NewEditor;
+                counterpart = OldEditor;
+                segments = _newFindSegments;
+                renderer = _newFindRenderer;
+                break;
+            default:
+                editor = InlineEditor;
+                segments = _diffFindSegments;
+                renderer = _inlineFindRenderer;
+                break;
         }
 
-        var lineNumber = matchIndex + 1;
+        var document = editor.Document;
+        if (document is null)
+        {
+            return;
+        }
+
         // 查找跳转(上一处/下一处匹配按钮点击):目标行居中显示。
-        CenterLine(InlineEditor, lineNumber);
-        InlineEditor.CaretOffset = InlineEditor.Document.GetLineByNumber(lineNumber).Offset + column;
-        InlineEditor.SelectionStart = InlineEditor.CaretOffset;
-        InlineEditor.SelectionLength = Math.Min(_tab.FindText?.Length ?? 0, Math.Max(0, text.Length - column));
+        CenterLine(editor, lineNumber);
+        editor.CaretOffset = document.GetLineByNumber(lineNumber).Offset + match.Column;
+        editor.SelectionStart = editor.CaretOffset;
+        editor.SelectionLength = match.Length;
 
-        // 并排模式:同步把对应旧/新行号带进两侧视图(旧/新列号由统一行长行号映射)。
-        var line = _inlineLines[matchIndex];
-        if (line.OldLineNumber is { } oldLine && OldEditor.Document is { } oldDoc && oldLine <= oldDoc.LineCount)
+        if (counterpart is not null && counterpart.Document is { } counterpartDoc
+            && match.LineIndex < counterpartDoc.LineCount)
         {
-            CenterLine(OldEditor, oldLine);
-        }
-        if (line.NewLineNumber is { } newLine && NewEditor.Document is { } newDoc && newLine <= newDoc.LineCount)
-        {
-            CenterLine(NewEditor, newLine);
+            // 并排模式:两侧按行对齐,同步把对侧滚到同一行。
+            CenterLine(counterpart, lineNumber);
         }
 
-        var segments = new List<(int Start, int Length)>();
-        var document = InlineEditor.Document;
-        var query = _tab.FindText ?? string.Empty;
-        foreach (var matchLine in _diffFindMatches)
-        {
-            var matchText = _inlineLines[matchLine].Text;
-            var matchColumn = matchText.IndexOf(query, StringComparison.OrdinalIgnoreCase);
-            if (matchColumn < 0)
-            {
-                continue;
-            }
-
-            var offset = document.GetLineByNumber(matchLine + 1).Offset + matchColumn;
-            segments.Add((offset, Math.Min(query.Length, Math.Max(0, matchText.Length - matchColumn))));
-        }
-
-        _diffFindRenderer?.SetSegments(segments, segments.Count > index ? _diffFindMatches[index] : -1);
+        // 段集合已在 RefreshDiffFind 建好,这里只需更新"当前匹配"高亮。
+        var currentOffset = document.GetLineByNumber(lineNumber).Offset + match.Column;
+        renderer?.SetSegments(segments, currentOffset);
     }
 
     private void OnChangeNavigationRequested(object? sender, int blockIndex) => JumpToChange(blockIndex);
@@ -1337,6 +1509,8 @@ public partial class DiffDocumentView : UserControl
         }
 
         _sideChangeMask = DiffDocumentBuilders.BuildSideBySideChangeMask(_oldLines, _newLines);
+        _stickyHeaderCache = null; // 行模型已重建,hunk 头索引缓存失效
+        _stickyVisualInvalid = true;
 
         // Only the visible layout owns a populated AvalonEdit document. Keeping all three
         // projections materialized made a 100k-line diff pay for three TextDocument instances,
@@ -1589,7 +1763,10 @@ public partial class DiffDocumentView : UserControl
         _inlineBackground?.RefreshTheme();
         _oldBackground?.RefreshTheme();
         _newBackground?.RefreshTheme();
-        _diffFindRenderer?.RefreshBrushes();
+        _inlineFindRenderer?.RefreshBrushes();
+        _oldFindRenderer?.RefreshBrushes();
+        _newFindRenderer?.RefreshBrushes();
+        _stickyVisualInvalid = true; // sticky 行的画刷在构建时解析,主题变化后需重建
         RedrawOverview();
         RedrawSideOverviews();
         UpdateDiffSticky();
@@ -1834,7 +2011,6 @@ public partial class DiffDocumentView : UserControl
     /// 顶部,点击跳转;仅内联模式(并排双编辑器暂不吸顶)。</summary>
     private void UpdateDiffSticky()
     {
-        DiffStickyRows.Children.Clear();
         if (_tab is null || !_tab.IsInlineDiff || _inlineLines.Count == 0 || _inlineScroll is null)
         {
             DiffStickyHost.Visibility = Visibility.Collapsed;
@@ -1843,14 +2019,11 @@ public partial class DiffDocumentView : UserControl
 
         var lineHeight = Math.Max(1, InlineEditor.TextArea.TextView.DefaultLineHeight);
         var topLine = Math.Max(1, 1 + (int)(_inlineScroll.VerticalOffset / lineHeight));
-        var headers = new List<int>();
-        for (var i = 0; i < _inlineLines.Count; i++)
-        {
-            if (_inlineLines[i].Kind == GitDiffLineKind.HunkHeader)
-            {
-                headers.Add(i);
-            }
-        }
+
+        // hunk 头索引按 _inlineLines 缓存(RebuildDocuments 失效),滚动事件不再逐行全表扫描。
+        _stickyHeaderCache ??= Enumerable.Range(0, _inlineLines.Count)
+            .Where(i => _inlineLines[i].Kind == GitDiffLineKind.HunkHeader).ToList();
+        var headers = _stickyHeaderCache;
         if (headers.Count == 0)
         {
             DiffStickyHost.Visibility = Visibility.Collapsed;
@@ -1888,7 +2061,17 @@ public partial class DiffDocumentView : UserControl
             return;
         }
 
+        // 段未变、可见、主题/字号未变时直接复用上一帧的 UI 行,避免每滚动事件重建元素。
+        if (!_stickyVisualInvalid && _lastStickyVisual == (ordinal, headerStart)
+            && DiffStickyHost.Visibility == Visibility.Visible)
+        {
+            return;
+        }
+
         DiffStickyHost.Visibility = Visibility.Visible;
+        _lastStickyVisual = (ordinal, headerStart);
+        _stickyVisualInvalid = false;
+        DiffStickyRows.Children.Clear();
         var bright = Brush("BrightTextBrush") ?? Brushes.White;
         var muted = Brush("MutedTextBrush") ?? Brushes.Gray;
         var hover = Brush("HoverBrush") ?? Brushes.Transparent;
@@ -2145,12 +2328,10 @@ public partial class DiffDocumentView : UserControl
             }
 
             var fontSize = _owner._tab?.EditorFontSize ?? 14;
-            var typeface = new Typeface(_owner.InlineEditor.FontFamily.Source);
-            var iconFamily = _owner.TryFindResource("IconFontFamily") as FontFamily
-                ?? Application.Current?.TryFindResource("IconFontFamily") as FontFamily;
-            var iconTypeface = iconFamily is null
-                ? typeface
-                : new Typeface(iconFamily, FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);
+            // DPI/Typeface 每帧只解析一次并按 (字体源, 字号, DPI) 缓存(原实现每行每帧都 new)。
+            var dpi = VisualTreeHelper.GetDpi(this).PixelsPerDip;
+            var typeface = GetOrCreateTypeface(fontSize, dpi);
+            var iconTypeface = GetOrCreateIconTypeface(typeface, fontSize, dpi);
             var visualLines = GetValidVisualLines(view);
             if (visualLines is null)
             {
@@ -2179,7 +2360,6 @@ public partial class DiffDocumentView : UserControl
                         _ => _numberBrush,
                     };
 
-                var dip = VisualTreeHelper.GetDpi(this).PixelsPerDip;
                 var oldText = line.OldLineNumber?.ToString() ?? string.Empty;
                 var newText = line.NewLineNumber?.ToString() ?? string.Empty;
                 if (line.IsCollapsedContext)
@@ -2191,79 +2371,132 @@ public partial class DiffDocumentView : UserControl
                     {
                         var split = HunkActionGutterWidth + (ActualWidth - HunkActionGutterWidth) / 2;
                         DrawNumberIcon(drawingContext, Codicons.Ellipsis, split - 8, y,
-                            _collapsedContextBrush, iconTypeface, fontSize, dip);
+                            _collapsedContextBrush, iconTypeface, fontSize, dpi);
                         drawingContext.DrawRectangle(
                             _owner.Brush("DiffEditorBorderBrush") ?? Brushes.Transparent,
                             null,
                             new Rect(split, y + 2, 1, Math.Max(1, visualLine.Height - 4)));
                         DrawNumberIcon(drawingContext, Codicons.Ellipsis, ActualWidth - 6, y,
-                            _collapsedContextBrush, iconTypeface, fontSize, dip);
+                            _collapsedContextBrush, iconTypeface, fontSize, dpi);
                     }
                     else
                     {
                         DrawNumberIcon(drawingContext, Codicons.Ellipsis, ActualWidth - 6, y,
-                            _collapsedContextBrush, iconTypeface, fontSize, dip);
+                            _collapsedContextBrush, iconTypeface, fontSize, dpi);
                     }
                 }
                 else if (_mode == DiffNumberMode.Both)
                 {
                     var split = HunkActionGutterWidth + (ActualWidth - HunkActionGutterWidth) / 2;
-                    DrawNumber(drawingContext, oldText, split - 8, y, brush, typeface, fontSize, dip);
+                    DrawNumber(drawingContext, oldText, split - 8, y, brush, typeface, fontSize, dpi);
                     drawingContext.DrawRectangle(
                         _owner.Brush("DiffEditorBorderBrush") ?? Brushes.Transparent,
                         null,
                         new Rect(split, y + 2, 1, Math.Max(1, visualLine.Height - 4)));
-                    DrawNumber(drawingContext, newText, ActualWidth - 6, y, brush, typeface, fontSize, dip);
+                    DrawNumber(drawingContext, newText, ActualWidth - 6, y, brush, typeface, fontSize, dpi);
                 }
                 else
                 {
                     DrawNumber(drawingContext, _mode == DiffNumberMode.OldOnly ? oldText : newText,
-                        ActualWidth - 6, y, brush, typeface, fontSize, dip);
+                        ActualWidth - 6, y, brush, typeface, fontSize, dpi);
                 }
 
                 // ± change symbol column (VS Code diff gutter): + for added, − for removed.
                 if (line.Kind is GitDiffLineKind.Added or GitDiffLineKind.Removed)
                 {
                     var glyph = line.Kind == GitDiffLineKind.Added ? "+" : "−";
-                    var glyphFormatted = new FormattedText(
-                        glyph,
-                        System.Globalization.CultureInfo.CurrentUICulture,
-                        FlowDirection.LeftToRight,
-                        typeface,
-                        fontSize,
-                        line.Kind == GitDiffLineKind.Added ? _addedGutterBrush : _removedGutterBrush,
-                        VisualTreeHelper.GetDpi(this).PixelsPerDip);
+                    var glyphFormatted = GetOrCreateFormattedText(glyph, fontSize, dpi, typeface);
+                    glyphFormatted.SetForegroundBrush(
+                        line.Kind == GitDiffLineKind.Added ? _addedGutterBrush : _removedGutterBrush);
                     drawingContext.DrawText(glyphFormatted, new Point(HunkActionGutterWidth + 4, y));
                 }
             }
         }
 
-        private static void DrawNumberIcon(DrawingContext drawingContext, string glyph, double right,
+        // FormattedText 缓存上限:行号文本基数不大(位数 × 10)且并排列号有限,超限整体清空。
+        private const int MaxFormattedTextCache = 4096;
+        private readonly Dictionary<(string Text, double FontSize, double Dpi), FormattedText> _formattedTextCache = new();
+        private Typeface? _typeface;
+        private string? _typefaceFontSource;
+        private double _typefaceFontSize;
+        private double _typefaceDpi;
+        private Typeface? _iconTypeface;
+        private string? _iconTypefaceFontSource;
+        private double _iconTypefaceFontSize;
+        private double _iconTypefaceDpi;
+
+        private Typeface GetOrCreateTypeface(double fontSize, double dpi)
+        {
+            var fontSource = _owner.InlineEditor.FontFamily.Source;
+            if (_typeface is null || _typefaceFontSource != fontSource
+                || _typefaceFontSize != fontSize || _typefaceDpi != dpi)
+            {
+                _typeface = new Typeface(fontSource);
+                _typefaceFontSource = fontSource;
+                _typefaceFontSize = fontSize;
+                _typefaceDpi = dpi;
+            }
+
+            return _typeface;
+        }
+
+        private Typeface GetOrCreateIconTypeface(Typeface fallback, double fontSize, double dpi)
+        {
+            var iconFamily = _owner.TryFindResource("IconFontFamily") as FontFamily
+                ?? Application.Current?.TryFindResource("IconFontFamily") as FontFamily;
+            var fontSource = iconFamily?.Source;
+            if (_iconTypeface is null || _iconTypefaceFontSource != fontSource
+                || _iconTypefaceFontSize != fontSize || _iconTypefaceDpi != dpi)
+            {
+                _iconTypeface = iconFamily is null
+                    ? fallback
+                    : new Typeface(iconFamily, FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);
+                _iconTypefaceFontSource = fontSource;
+                _iconTypefaceFontSize = fontSize;
+                _iconTypefaceDpi = dpi;
+            }
+
+            return _iconTypeface;
+        }
+
+        /// <summary>按 (文本, 字号, DPI) 复用 FormattedText;前景刷子每次绘制前设置。</summary>
+        private FormattedText GetOrCreateFormattedText(string text, double fontSize, double dpi, Typeface typeface)
+        {
+            if (!_formattedTextCache.TryGetValue((text, fontSize, dpi), out var formatted))
+            {
+                if (_formattedTextCache.Count > MaxFormattedTextCache)
+                {
+                    _formattedTextCache.Clear();
+                }
+
+                formatted = new FormattedText(
+                    text,
+                    System.Globalization.CultureInfo.CurrentUICulture,
+                    FlowDirection.LeftToRight,
+                    typeface,
+                    fontSize,
+                    Brushes.Gray,
+                    dpi);
+                _formattedTextCache[(text, fontSize, dpi)] = formatted;
+            }
+
+            return formatted;
+        }
+
+        private void DrawNumberIcon(DrawingContext drawingContext, string glyph, double right,
             double y, Brush brush, Typeface typeface, double fontSize, double pixelsPerDip)
         {
-            var formatted = new FormattedText(
-                glyph,
-                System.Globalization.CultureInfo.CurrentUICulture,
-                FlowDirection.LeftToRight,
-                typeface,
-                fontSize,
-                brush,
-                pixelsPerDip);
+            var formatted = GetOrCreateFormattedText(glyph, fontSize, pixelsPerDip, typeface);
+            formatted.SetForegroundBrush(brush);
             drawingContext.DrawText(formatted, new Point(Math.Max(0, right - formatted.Width), y));
         }
 
-        private static void DrawNumber(DrawingContext drawingContext, string text, double right,
+        private void DrawNumber(DrawingContext drawingContext, string text, double right,
             double y, Brush brush, Typeface typeface, double fontSize, double pixelsPerDip)
         {
             if (string.IsNullOrEmpty(text)) return;
-            var formatted = new FormattedText(
-                text,
-                System.Globalization.CultureInfo.CurrentUICulture,
-                FlowDirection.LeftToRight,
-                typeface,
-                fontSize,
-                brush,
-                pixelsPerDip);
+            var formatted = GetOrCreateFormattedText(text, fontSize, pixelsPerDip, typeface);
+            formatted.SetForegroundBrush(brush);
             drawingContext.DrawText(formatted, new Point(Math.Max(0, right - formatted.Width), y));
         }
     }
@@ -2407,15 +2640,18 @@ public partial class DiffDocumentView : UserControl
     private sealed class DiffFindRenderer : IBackgroundRenderer
     {
         private readonly DiffDocumentView _owner;
+        private readonly TextEditor _target;
         private TextSegmentCollection<TextSegment>? _segments;
-        private int _currentLine = -1;
+        private int _currentOffset = -1;
         private Brush _allBrush = Brushes.Transparent;
         private Brush _currentBrush = Brushes.Transparent;
 
-        public DiffFindRenderer(DiffDocumentView owner)
+        /// <summary>查找高亮挂到指定编辑器(内联模式为 InlineEditor,并排模式为旧/新编辑器)。</summary>
+        public DiffFindRenderer(DiffDocumentView owner, TextEditor target)
         {
             _owner = owner;
-            owner.InlineEditor.TextArea.TextView.BackgroundRenderers.Add(this);
+            _target = target;
+            target.TextArea.TextView.BackgroundRenderers.Add(this);
             RefreshBrushes();
         }
 
@@ -2431,16 +2667,16 @@ public partial class DiffDocumentView : UserControl
         private Brush OwnerBrush(string key) =>
             _owner.TryFindResource(key) as Brush ?? Application.Current?.TryFindResource(key) as Brush ?? Brushes.Transparent;
 
-        private void Invalidate() => _owner.InlineEditor.TextArea.TextView.InvalidateLayer(Layer);
+        private void Invalidate() => _target.TextArea.TextView.InvalidateLayer(Layer);
 
-        public void SetSegments(IReadOnlyList<(int Start, int Length)> segments, int currentLine)
+        public void SetSegments(IReadOnlyList<(int Start, int Length)> segments, int currentOffset)
         {
-            _currentLine = currentLine;
-            _segments ??= new TextSegmentCollection<TextSegment>(_owner.InlineEditor.Document);
+            _currentOffset = currentOffset;
+            _segments ??= new TextSegmentCollection<TextSegment>(_target.Document);
             _segments.Clear();
             foreach (var (start, length) in segments)
             {
-                if (start >= 0 && start + length <= _owner.InlineEditor.Document.TextLength)
+                if (start >= 0 && start + length <= _target.Document.TextLength)
                 {
                     _segments.Add(new TextSegment { StartOffset = start, Length = length });
                 }
@@ -2452,7 +2688,7 @@ public partial class DiffDocumentView : UserControl
         public void Clear()
         {
             _segments?.Clear();
-            _currentLine = -1;
+            _currentOffset = -1;
             Invalidate();
         }
 
@@ -2476,9 +2712,7 @@ public partial class DiffDocumentView : UserControl
             var current = new BackgroundGeometryBuilder { AlignToWholePixels = true, CornerRadius = 2 };
             foreach (var segment in relevant)
             {
-                var isCurrent = _currentLine >= 0
-                    && segment.StartOffset >= _owner.InlineEditor.Document.GetLineByNumber(_currentLine + 1).Offset
-                    && segment.StartOffset < _owner.InlineEditor.Document.GetLineByNumber(Math.Min(_currentLine + 1, _owner.InlineEditor.Document.LineCount)).EndOffset;
+                var isCurrent = _currentOffset >= 0 && segment.StartOffset == _currentOffset;
                 (isCurrent ? current : all).AddSegment(textView, segment);
             }
 
