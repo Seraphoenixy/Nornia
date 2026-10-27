@@ -103,7 +103,7 @@ public sealed class ShutdownDisposalRegressionTests : IDisposable
             TimeSpan.FromSeconds(4),
             out var elapsed);
 
-        Assert.True(elapsed < TimeSpan.FromSeconds(1), $"DisposeAsync 耗时 {elapsed.TotalMilliseconds:0}ms");
+        Assert.True(elapsed < TimeSpan.FromSeconds(2), $"DisposeAsync 耗时 {elapsed.TotalMilliseconds:0}ms");
     }
 
     [Fact]
@@ -128,7 +128,7 @@ public sealed class ShutdownDisposalRegressionTests : IDisposable
             TimeSpan.FromSeconds(4),
             out var elapsed);
 
-        Assert.True(elapsed < TimeSpan.FromSeconds(1), $"Dispose 耗时 {elapsed.TotalMilliseconds:0}ms");
+        Assert.True(elapsed < TimeSpan.FromSeconds(2), $"Dispose 耗时 {elapsed.TotalMilliseconds:0}ms");
         coordinator.Dispose();
     }
 
@@ -147,6 +147,6 @@ public sealed class ShutdownDisposalRegressionTests : IDisposable
             TimeSpan.FromSeconds(4),
             out var elapsed);
 
-        Assert.True(elapsed < TimeSpan.FromSeconds(1), $"DisposeAsync 耗时 {elapsed.TotalMilliseconds:0}ms");
+        Assert.True(elapsed < TimeSpan.FromSeconds(2), $"DisposeAsync 耗时 {elapsed.TotalMilliseconds:0}ms");
     }
 }

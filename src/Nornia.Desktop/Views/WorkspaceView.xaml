@@ -94,6 +94,7 @@
             <ContextMenu DataContext="{Binding Value, Source={StaticResource WorkspaceVm}}">
               <MenuItem Header="打开文件" Command="{Binding OpenNodeCommand}" CommandParameter="{Binding PlacementTarget.DataContext.Node, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
               <MenuItem Header="查看更改" Command="{Binding RequestDiffCommand}" CommandParameter="{Binding PlacementTarget.DataContext.Node, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+              <MenuItem Header="文件历史" Command="{Binding RequestFileHistoryCommand}" CommandParameter="{Binding PlacementTarget.DataContext.Node, RelativeSource={RelativeSource AncestorType=ContextMenu}}" ToolTip="在 Git 页查看该文件的提交历史（跨重命名跟随）" />
               <Separator />
               <MenuItem Header="复制路径" Command="{Binding CopyPathCommand}" CommandParameter="{Binding PlacementTarget.DataContext.Node, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
               <MenuItem Header="复制相对路径" Command="{Binding CopyRelativePathCommand}" CommandParameter="{Binding PlacementTarget.DataContext.Node, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />

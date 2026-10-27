@@ -47,7 +47,11 @@ public interface IRuntimePackageResolver
 
 public interface IEnvironmentRepairExecutor
 {
-    Task ExecuteAsync(
+    /// <summary>执行一批修复步骤，并返回该批次的 <c>correlation_id</c>。
+    /// 该 id 是回滚的唯一定位键：调用方应把它呈现给用户（如打印/日志），
+    /// 用户随后可用 <see cref="IEnvironmentRollbackService.BuildPlanAsync"/> 找回并撤销这一批。
+    /// 存在失败步骤时抛 <see cref="EnvironmentRepairException"/>，异常同样携带该 id。</summary>
+    Task<Guid> ExecuteAsync(
         IReadOnlyCollection<RuntimePackageOperation> operations,
         IProgress<ProcessOutput>? progress = null,
         CancellationToken cancellationToken = default);

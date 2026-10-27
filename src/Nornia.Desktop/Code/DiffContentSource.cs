@@ -43,18 +43,23 @@ public sealed class SpoolingDiffContentSource : IDiffContentSource
     private readonly List<(int Line, long Offset)> _checkpoints;
     private readonly int _totalLines;
     private readonly bool _outputLimitReached;
+    private readonly ReadOnlyContentLimits _limits;
     private bool _disposed;
 
-    private SpoolingDiffContentSource(string spoolPath, List<DiffHunkIndexEntry> hunks, List<(int, long)> checkpoints, int totalLines, bool outputLimitReached)
+    private SpoolingDiffContentSource(string spoolPath, List<DiffHunkIndexEntry> hunks, List<(int, long)> checkpoints, int totalLines, bool outputLimitReached, ReadOnlyContentLimits limits)
     {
         _spoolPath = spoolPath;
         _hunks = hunks;
         _checkpoints = checkpoints;
         _totalLines = totalLines;
         _outputLimitReached = outputLimitReached;
+        _limits = limits;
     }
 
-    public static async Task<SpoolingDiffContentSource> CreateAsync(IAsyncEnumerable<GitDiffEvent> events, CancellationToken cancellationToken = default)
+    public static Task<SpoolingDiffContentSource> CreateAsync(IAsyncEnumerable<GitDiffEvent> events, CancellationToken cancellationToken = default) =>
+        CreateAsync(events, ReadOnlyContentLimits.Default, cancellationToken);
+
+    public static async Task<SpoolingDiffContentSource> CreateAsync(IAsyncEnumerable<GitDiffEvent> events, ReadOnlyContentLimits limits, CancellationToken cancellationToken = default)
     {
         var path = Path.Combine(Path.GetTempPath(), $"nornia-diff-{Guid.NewGuid():N}.spool");
         var hunks = new List<DiffHunkIndexEntry>();
@@ -106,13 +111,13 @@ public sealed class SpoolingDiffContentSource : IDiffContentSource
             ArrayPool<byte>.Shared.Return(buffer);
         }
 
-        return new SpoolingDiffContentSource(path, hunks, checkpoints, line, outputLimitReached);
+        return new SpoolingDiffContentSource(path, hunks, checkpoints, line, outputLimitReached, limits);
     }
 
     public ValueTask<DiffContentMetadata> GetMetadataAsync(CancellationToken cancellationToken = default)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
-        var tier = _outputLimitReached ? ReadOnlyContentTier.Summary : ReadOnlyContentCapacity.ForDiff(_totalLines);
+        var tier = _outputLimitReached ? ReadOnlyContentTier.Summary : _limits.ForDiff(_totalLines);
         return ValueTask.FromResult(new DiffContentMetadata(_totalLines, tier, _hunks, !_outputLimitReached));
     }
 

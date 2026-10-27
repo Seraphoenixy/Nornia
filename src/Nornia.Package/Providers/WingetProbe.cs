@@ -23,22 +23,53 @@ public sealed class WingetProbe(IProcessRunner processRunner)
 {
     private static readonly Regex VersionRegex = new(@"v?(\d+)\.(\d+)\.(\d+)", RegexOptions.Compiled);
 
+    private readonly object _sync = new();
+
     private WingetCapabilities? _cached;
-    private int _probesRun;
+    private Task<WingetCapabilities>? _probeTask;
 
     public async Task<WingetCapabilities> GetCapabilitiesAsync(CancellationToken cancellationToken = default)
     {
-        if (Volatile.Read(ref _probesRun) == 0)
+        Task<WingetCapabilities> probe;
+        lock (_sync)
         {
-            var versionTask = ProbeVersionAsync(cancellationToken);
-            var structuredTask = ProbeStructuredOutputAsync(cancellationToken);
-            var version = await versionTask;
-            var hasStructuredOutput = await structuredTask;
-            Update(current => new WingetCapabilities(version, hasStructuredOutput, current.OutputLanguage, current.NoMatchObservedCodes));
-            Volatile.Write(ref _probesRun, 1);
+            // 探测任务只创建一次并共享:并发首调不会各自派生 winget 进程。
+            probe = _probeTask ??= RunProbeAsync();
         }
 
-        return _cached ?? WingetCapabilities.Default;
+        // WaitAsync 只放弃等待,不会取消正在跑的探测任务 —— 后续调用者仍能复用它的结果。
+        if (cancellationToken.CanBeCanceled)
+        {
+            await probe.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            await probe.ConfigureAwait(false);
+        }
+
+        // 返回当前快照,而不是探测任务的结果:探测完成与本次调用之间存在时间差,
+        // 期间由 Provider 并发上报的 Observe* 观测不能被丢掉。
+        return Snapshot();
+    }
+
+    private async Task<WingetCapabilities> RunProbeAsync()
+    {
+        // 探测归 probe 自身所有,因此不受任一调用方的 CancellationToken 影响;
+        // 否则首个调用者取消会让所有后续调用者拿到同一个已取消的任务。
+        var versionTask = ProbeVersionAsync(CancellationToken.None);
+        var structuredTask = ProbeStructuredOutputAsync(CancellationToken.None);
+        await Task.WhenAll(versionTask, structuredTask).ConfigureAwait(false);
+
+        lock (_sync)
+        {
+            _cached = (_cached ?? WingetCapabilities.Default) with
+            {
+                Version = versionTask.Result,
+                HasStructuredOutput = structuredTask.Result
+            };
+        }
+
+        return Snapshot();
     }
 
     /// <summary>Records the header language observed in a real list/search output.</summary>
@@ -61,10 +92,21 @@ public sealed class WingetProbe(IProcessRunner processRunner)
             : current with { NoMatchObservedCodes = new HashSet<int>(current.NoMatchObservedCodes) { exitCode } });
     }
 
+    private WingetCapabilities Snapshot()
+    {
+        lock (_sync)
+        {
+            return _cached ?? WingetCapabilities.Default;
+        }
+    }
+
     private void Update(Func<WingetCapabilities, WingetCapabilities> update)
     {
-        var current = _cached ?? WingetCapabilities.Default;
-        Volatile.Write(ref _cached, update(current));
+        // 与 Snapshot / RunProbeAsync 共用同一把锁:并发观测不会再互相覆盖。
+        lock (_sync)
+        {
+            _cached = update(_cached ?? WingetCapabilities.Default);
+        }
     }
 
     private async Task<Version?> ProbeVersionAsync(CancellationToken cancellationToken)

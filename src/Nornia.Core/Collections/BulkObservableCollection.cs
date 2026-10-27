@@ -11,12 +11,19 @@ namespace Nornia.Core.Collections;
 /// </summary>
 public sealed class BulkObservableCollection<T> : ObservableCollection<T>
 {
-    public void ReplaceRange(IEnumerable<T> items)
+    public void ReplaceRange(IEnumerable<T> items) => ReplaceRange(items, checkEquality: true);
+
+    /// <summary>Publishes <paramref name="items"/> as one snapshot.
+    /// <paramref name="checkEquality"/> keeps the redundant full-sequence comparison for callers that
+    /// hand over a freshly built list; callers that already differenced current against desired (and
+    /// therefore know the sequence changed) pass <see langword="false"/> — comparing 10k records twice
+    /// per refresh is exactly the churn this snapshot path exists to avoid.</summary>
+    public void ReplaceRange(IEnumerable<T> items, bool checkEquality)
     {
         ArgumentNullException.ThrowIfNull(items);
 
         var snapshot = items as IReadOnlyList<T> ?? items.ToArray();
-        if (this.SequenceEqual(snapshot))
+        if (checkEquality && this.SequenceEqual(snapshot))
         {
             return;
         }

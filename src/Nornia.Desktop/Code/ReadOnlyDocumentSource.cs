@@ -38,15 +38,19 @@ public sealed class FileReadOnlyDocumentSource : IReadOnlyDocumentSource
     public const int MaximumWindowCharacters = 2 * 1024 * 1024;
     private const int IndexStride = 256;
     private readonly string _path;
+    private readonly ReadOnlyContentLimits _limits;
+    private readonly Encoding? _forcedEncoding;
     private readonly SemaphoreSlim _metadataGate = new(1, 1);
     private ReadOnlyDocumentMetadata? _metadata;
     private List<LineCheckpoint>? _checkpoints;
     private bool _disposed;
 
-    public FileReadOnlyDocumentSource(string path)
+    public FileReadOnlyDocumentSource(string path, ReadOnlyContentLimits? limits = null, Encoding? forcedEncoding = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
         _path = Path.GetFullPath(path);
+        _limits = limits ?? ReadOnlyContentLimits.Default;
+        _forcedEncoding = forcedEncoding;
     }
 
     public async ValueTask<ReadOnlyDocumentMetadata> GetMetadataAsync(CancellationToken cancellationToken = default)
@@ -199,8 +203,9 @@ public sealed class FileReadOnlyDocumentSource : IReadOnlyDocumentSource
         await using var stream = OpenStream();
         var probe = new byte[(int)Math.Min(4096, stream.Length)];
         _ = await stream.ReadAsync(probe, cancellationToken).ConfigureAwait(false);
-        var isBinary = probe.AsSpan().IndexOf((byte)0) >= 0 && !HasUnicodeBom(probe);
-        var encoding = DetectEncoding(probe);
+        // 强制编码 = 用户明确覆盖:跳过二进制判定与编码探测。
+        var isBinary = _forcedEncoding is null && probe.AsSpan().IndexOf((byte)0) >= 0 && !HasUnicodeBom(probe);
+        var encoding = _forcedEncoding ?? DetectEncoding(probe);
         stream.Position = 0;
         var checkpoints = new List<LineCheckpoint> { new(1, 0) };
         var line = 1;
@@ -232,7 +237,7 @@ public sealed class FileReadOnlyDocumentSource : IReadOnlyDocumentSource
             carry = scanLength == data.Length ? [] : data[scanLength..];
         }
 
-        var metadata = new ReadOnlyDocumentMetadata(stream.Length, encoding, lineEnding.Length == 0 ? Environment.NewLine : lineEnding, line, ReadOnlyContentCapacity.ForSource(stream.Length), isBinary);
+        var metadata = new ReadOnlyDocumentMetadata(stream.Length, encoding, lineEnding.Length == 0 ? Environment.NewLine : lineEnding, line, _limits.ForSource(stream.Length), isBinary);
         return (metadata, checkpoints);
     }
 

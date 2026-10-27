@@ -385,7 +385,13 @@ public sealed class AnsiParser
                 break;
             case 'h':
             case 'l':
-                // Unimplemented standard modes: ignore.
+                // 非 SM/RM:Windows 控制台/ConPTY 以不带 '?' 的 CSI 25 h/l 表示显隐光标
+                // (PSReadLine 流中高频出现,xterm 私有语义是 CSI ?25 h/l,两者都要支持)。
+                if (ValueAt(parameters, 0) == 25)
+                {
+                    _screen.SetCursorVisible(character == 'h');
+                }
+
                 break;
             default:
                 // Unsupported CSI (device status, window ops...): ignore.

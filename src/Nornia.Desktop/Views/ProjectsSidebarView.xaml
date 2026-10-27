@@ -56,7 +56,8 @@
                      b:MultiSelectorBinding.SelectedItems="{Binding SelectedProjects}"
                      b:ListSelectionBehavior.SelectOnRightClick="True"
                      ItemContainerStyle="{StaticResource ProjectRowStyle}"
-                     Background="Transparent" BorderThickness="0">
+                     Background="Transparent" BorderThickness="0"
+                     ScrollViewer.HorizontalScrollBarVisibility="Disabled">
               <ListBox.ItemTemplate>
                 <DataTemplate>
                   <Grid>

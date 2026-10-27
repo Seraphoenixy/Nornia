@@ -1,4 +1,4 @@
-using Nornia.Desktop.Behaviors;
+﻿using Nornia.Desktop.Behaviors;
 using Nornia.Desktop.Commands;
 using Nornia.Desktop.Configuration;
 using Nornia.Desktop.Services;
@@ -184,30 +184,25 @@ public partial class MainWindow : Window
             ConverterParameter = parameter,
         };
 
-        FrameworkElement? view = null;
-        if (page is EnvironmentManagementViewModel env) view = Build<EnvironmentSidebarView>(env, MakeBinding(typeof(EnvironmentManagementViewModel)));
-        else if (page is ExplorerPageViewModel explorer) view = Build<ExplorerSidebarView>(explorer, MakeBinding(typeof(ExplorerPageViewModel)));
-        else if (page is SearchViewModel search) view = Build<SearchSidebarView>(search, MakeBinding(typeof(SearchViewModel)));
-        else if (page is GitViewModel git) view = Build<GitView>(git, MakeBinding(typeof(GitViewModel)));
-        else if (page is ProjectsViewModel projects) view = Build<ProjectsSidebarView>(projects, MakeBinding(typeof(ProjectsViewModel)));
-        else if (page is SettingsEditorViewModel settings) view = Build<SettingsSidebarView>(settings, MakeBinding(typeof(SettingsEditorViewModel)));
-
-        if (view is null)
+        // 视图类型来自按页 VM 类型注册的隐式 DataTemplate(App.xaml),不再是一串类型判断:
+        // 新增一个带侧栏的页面 = 加一个模板,而不是回来改这个 if-else 链。
+        // 没有模板的页型(任务中心/运行库/软件包等)不占位,允许后续阶段重试。
+        if (ResolveSidebarTemplate(page.GetType()) is not DataTemplate template
+            || template.LoadContent() is not FrameworkElement view)
         {
-            // 无侧栏的页面(或未知页型):不占位,允许后续阶段重试。
             _sidebarsMaterialized.Remove(page);
             return;
         }
 
+        view.DataContext = page;
+        view.SetBinding(VisibilityProperty, MakeBinding(page.GetType()));
         SidebarHost.Children.Add(view);
-
-        static T Build<T>(object dataContext, Binding binding) where T : FrameworkElement, new()
-        {
-            var element = new T { DataContext = dataContext };
-            element.SetBinding(VisibilityProperty, binding);
-            return element;
-        }
     }
+
+    // Window resources contain editor-page templates for the same VM types. Sidebar
+    // lookup must bypass that nearer scope and use the application's sidebar catalog.
+    internal static DataTemplate? ResolveSidebarTemplate(Type pageType) =>
+        Application.Current?.TryFindResource(new DataTemplateKey(pageType)) as DataTemplate;
 
     private void MaterializeTerminal()
     {
@@ -925,6 +920,17 @@ public partial class MainWindow : Window
             if (await _keybindings.DispatchAsync(NormalizeKeyStroke(e)))
             {
                 e.Handled = true;
+                return;
+            }
+
+            // Esc 统一退层(窗口级兜底,隧道先于视图):终端拥有自己的 Esc(vim 等),必须放行;
+            // 其余按 QuickInput → 跳转行 → 查找框 顺序关闭最上层。
+            if (e.Key == Key.Escape
+                && Keyboard.Modifiers == ModifierKeys.None
+                && !IsInsideTerminalView(Keyboard.FocusedElement as DependencyObject)
+                && viewModel.DismissTopLayer())
+            {
+                e.Handled = true;
             }
         }
         catch (Exception ex)
@@ -981,10 +987,8 @@ public partial class MainWindow : Window
                 _ = Dispatcher.BeginInvoke(DispatcherPriority.ContextIdle, () => PanelTerminalView?.FocusSurface());
                 break;
             case "refreshActiveView":
-                if (viewModel.CurrentPage is RuntimeViewModel runtime) _ = runtime.ScanCommand.ExecuteAsync(null);
-                else if (viewModel.CurrentPage is ToolsViewModel tools) _ = tools.ScanCommand.ExecuteAsync(null);
-                else if (viewModel.CurrentPage is CacheViewModel cache) _ = cache.ScanCommand.ExecuteAsync(null);
-                else if (viewModel.CurrentPage is ProjectsViewModel projects) _ = projects.CheckCommand.ExecuteAsync(null);
+                // 页面自己决定"刷新"是什么;无数据可刷新的页面是空操作(不再是这里的类型分派)。
+                if (viewModel.CurrentPage is { } activePage) _ = activePage.RefreshActiveViewAsync();
                 break;
             case "theme.dark":
             case "theme.light":

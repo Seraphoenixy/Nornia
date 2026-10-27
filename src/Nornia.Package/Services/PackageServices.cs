@@ -230,7 +230,7 @@ public sealed class EnvironmentRepairExecutor(
     IRuntimeInventoryService runtimeInventoryService,
     PackageProviderSelector? providerSelector = null) : IEnvironmentRepairExecutor
 {
-    public async Task ExecuteAsync(
+    public async Task<Guid> ExecuteAsync(
         IReadOnlyCollection<RuntimePackageOperation> operations,
         IProgress<ProcessOutput>? progress = null,
         CancellationToken cancellationToken = default)
@@ -252,5 +252,9 @@ public sealed class EnvironmentRepairExecutor(
         // both reloads bypass every cache tier so the post-operation list reflects reality.
         await packageInventoryService.RefreshForcedAsync(progress, cancellationToken);
         await runtimeInventoryService.RefreshForcedAsync(cancellationToken);
+
+        // 这个变体不做步骤追踪（不写 repair log），因此没有可用于回滚的批次。
+        // 返回一个新 id 仅为满足接口契约；生产环境注册的是 TrackedEnvironmentRepairExecutor。
+        return Guid.NewGuid();
     }
 }

@@ -1,7 +1,8 @@
 <UserControl x:Class="Nornia.Desktop.Views.FilePreviewView"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-             xmlns:views="clr-namespace:Nornia.Desktop.Views">
+             xmlns:views="clr-namespace:Nornia.Desktop.Views"
+             xmlns:md="clr-namespace:Nornia.Desktop.Markdown">
   <Grid Background="{DynamicResource EditorBrush}">
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto" />
@@ -102,6 +103,18 @@
                 </Style>
               </Button.Style>
             </Button>
+            <Button Content="并排" Padding="4,1" Margin="0,0,2,0"
+                    Command="{Binding ShowMarkdownSideBySideCommand}" ToolTip="源码与渲染预览并排显示">
+              <Button.Style>
+                <Style TargetType="Button" BasedOn="{StaticResource LinkButton}">
+                  <Style.Triggers>
+                    <DataTrigger Binding="{Binding MarkdownMode}" Value="{x:Static md:MarkdownViewMode.SideBySide}">
+                      <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
+                    </DataTrigger>
+                  </Style.Triggers>
+                </Style>
+              </Button.Style>
+            </Button>
           </StackPanel>
           <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconSearch}" FontFamily="{StaticResource IconFontFamily}" Padding="4,2"
                   Command="{Binding OpenFindBarCommand}" ToolTip="查找（Ctrl+F）" AutomationProperties.Name="查找" />
@@ -123,6 +136,17 @@
               <Style TargetType="Button" BasedOn="{StaticResource IconButton}">
                 <Style.Triggers>
                   <DataTrigger Binding="{Binding ShowMinimap}" Value="True"><Setter Property="Foreground" Value="{DynamicResource AccentBrush}" /></DataTrigger>
+                </Style.Triggers>
+              </Style>
+            </Button.Style>
+          </Button>
+          <!-- 行级 Blame 注解(GitLens 式边距):需 Git 仓库;窗口化大文件/二进制不支持 -->
+          <Button Content="{StaticResource CodiconGitCommit}" FontFamily="{StaticResource IconFontFamily}" Padding="4,1" Margin="2,0,0,0"
+                  Command="{Binding ToggleBlameCommand}" ToolTip="Blame 行注解（作者 · 时间 · 提交）" AutomationProperties.Name="切换 Blame 注解">
+            <Button.Style>
+              <Style TargetType="Button" BasedOn="{StaticResource IconButton}">
+                <Style.Triggers>
+                  <DataTrigger Binding="{Binding IsBlameVisible}" Value="True"><Setter Property="Foreground" Value="{DynamicResource AccentBrush}" /></DataTrigger>
                 </Style.Triggers>
               </Style>
             </Button.Style>
@@ -172,9 +196,16 @@
         <ColumnDefinition x:Name="OutlineColumn" Width="0" />
       </Grid.ColumnDefinitions>
       <Grid Grid.Column="0">
+        <!-- 并排模式三列:源码 | 分隔条 | 渲染预览;非并排时预览列宽 0,MarkdownView 跨全列。
+             列宽/ColumnSpan 由 code-behind UpdateMarkdownLayout 随模式驱动(与大纲栏同模式)。 -->
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition x:Name="MarkdownSourceColumn" Width="*" />
+          <ColumnDefinition x:Name="MarkdownSplitterColumn" Width="0" />
+          <ColumnDefinition x:Name="MarkdownPreviewColumn" Width="0" />
+        </Grid.ColumnDefinitions>
         <!-- Markdown 进入渲染模式即隐藏源码面(不等渲染结果就绪):加载/重载期间显示中性空白,
              避免"源码 + 内置语法高亮"闪帧;解析失败/大型文件切回源码模式时自动恢复显示。 -->
-        <Grid x:Name="SourceSurface">
+        <Grid x:Name="SourceSurface" Grid.Column="0">
           <Grid.Style>
             <Style TargetType="Grid">
               <Setter Property="Visibility" Value="Visible" />
@@ -205,8 +236,33 @@
           <views:EmptyStateControl Icon="{StaticResource CodiconFile}" Title="{Binding Notice}"
                                    Description="可使用外部编辑器打开该文件。" />
         </Border>
+        <!-- 大文件逃生门:窗口化/摘要降级时顶部悬浮"仍要全文打开"(本标签临时抬升全文上限)。
+             与上方不可命中的 Notice 覆盖层分离,保证按钮可点击。 -->
+        <Border HorizontalAlignment="Center" VerticalAlignment="Top" Margin="0,10,0,0" Panel.ZIndex="5"
+                Background="{DynamicResource ToolTipBackgroundBrush}" BorderBrush="{DynamicResource BorderBrush}"
+                BorderThickness="1" CornerRadius="{StaticResource RadiusMd}" Padding="4"
+                Visibility="{Binding CanOpenFullAnyway, Converter={StaticResource BooleanToVisibilityConverter}}">
+          <Button Content="仍要尝试全文打开" Command="{Binding OpenFullAnywayCommand}" Style="{StaticResource LinkButton}"
+                  Padding="4,2" ToolTip="把本文件的全文上限临时抬高到窗口化上限（默认 32 MB）并重新加载；更大的文件仍按窗口化阅读" />
+        </Border>
         </Grid>
-        <views:MarkdownPreviewView x:Name="MarkdownView" RenderResult="{Binding MarkdownRenderResult}"
+        <GridSplitter x:Name="MarkdownSplitter" Grid.Column="1" Width="5" HorizontalAlignment="Stretch"
+                      Background="{DynamicResource BorderBrush}" Cursor="SizeWE" Visibility="Collapsed">
+          <GridSplitter.Template>
+            <ControlTemplate TargetType="GridSplitter">
+              <Border Background="{DynamicResource BorderBrush}">
+                <Border x:Name="HoverLine" Width="1" HorizontalAlignment="Center"
+                        Background="{DynamicResource DiffEditorSashBrush}" />
+              </Border>
+              <ControlTemplate.Triggers>
+                <Trigger Property="IsMouseOver" Value="True">
+                  <Setter TargetName="HoverLine" Property="Background" Value="{DynamicResource AccentBrush}" />
+                </Trigger>
+              </ControlTemplate.Triggers>
+            </ControlTemplate>
+          </GridSplitter.Template>
+        </GridSplitter>
+        <views:MarkdownPreviewView x:Name="MarkdownView" Grid.Column="2" RenderResult="{Binding MarkdownRenderResult}"
                                    LinkRequested="MarkdownView_LinkRequested">
           <views:MarkdownPreviewView.Style>
             <Style TargetType="views:MarkdownPreviewView">

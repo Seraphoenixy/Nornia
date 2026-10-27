@@ -162,6 +162,43 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
     private CodeFoldSection[]? _lastStickyChain;
     private FoldingManager? _foldManager;
     private FoldGutterMargin? _foldGutter;
+
+    /// <summary>行级 Blame 注解边距(有数据才创建,插在行号栏左侧;null = 折叠整列)。</summary>
+    private CodeBlameMargin? _blameMargin;
+
+    /// <summary>宿主(FilePreviewView)在标签的 Blame/IsBlameVisible 变化时推送注解;
+    /// 排版计算在 <see cref="BlameAnnotationLayout"/>,本方法只管理边距生命周期。</summary>
+    public void UpdateBlame(IReadOnlyList<BlameAnnotation>? annotations, bool loading, bool truncated)
+    {
+        if (annotations is null && !loading)
+        {
+            if (_blameMargin is not null)
+            {
+                CodeEditor.TextArea.LeftMargins.Remove(_blameMargin);
+                _blameMargin = null;
+            }
+
+            return;
+        }
+
+        if (_blameMargin is null)
+        {
+            _blameMargin = new CodeBlameMargin();
+            var index = CodeEditor.TextArea.LeftMargins.IndexOf(_lineNumberMargin);
+            CodeEditor.TextArea.LeftMargins.Insert(index < 0 ? 0 : index, _blameMargin);
+        }
+
+        var typeface = new Typeface(CodeEditor.FontFamily, FontStyles.Normal, FontWeights.Normal, FontStretches.Normal);
+        _blameMargin.SetAnnotations(
+            annotations,
+            loading,
+            truncated,
+            typeface,
+            CodeEditor.FontSize,
+            TryFindResource("MutedTextBrush") as Brush ?? Brushes.Gray,
+            TryFindResource("WarningBrush") as Brush ?? Brushes.Orange,
+            TryFindResource("ErrorTextBrush") as Brush ?? Brushes.OrangeRed);
+    }
     private readonly FoldBackgroundRenderer _foldBackground;
     private IReadOnlyList<CodeFoldSection> _foldSections = [];
     // 最近发布的语义快照(驱动文本高亮;部分快照只覆盖首屏)。
@@ -898,7 +935,6 @@ public partial class CodeDocumentView : System.Windows.Controls.UserControl
             CodeEditor.TextArea.LeftMargins.Remove(oldGutter);
             _foldGutter = null;
         }
-
         if (_foldManager is not null)
         {
             FoldingManager.Uninstall(_foldManager);

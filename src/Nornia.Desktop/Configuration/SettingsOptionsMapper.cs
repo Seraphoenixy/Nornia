@@ -1,3 +1,4 @@
+using Nornia.Desktop.Code;
 using Nornia.Desktop.Services;
 
 namespace Nornia.Desktop.Configuration;
@@ -50,4 +51,12 @@ public static class SettingsOptionsMapper
         snapshot.Effective(BuiltInSettingsCatalog.DiffSyncScroll),
         snapshot.Effective(BuiltInSettingsCatalog.DiffIgnoreTrimWhitespace),
         snapshot.Effective(BuiltInSettingsCatalog.DiffNarrowInline));
+
+    /// <summary>大文件分层阈值(<c>nornia.reading.*</c>):设置目录已限定取值范围,这里只做
+    /// MB→字节换算;窗口化阈值低于全量阈值时由 <see cref="ReadOnlyContentLimits"/> 自行抬平。</summary>
+    public static ReadOnlyContentLimits ReadingLimits(SettingsSnapshot snapshot) => new(
+        (long)snapshot.Effective(BuiltInSettingsCatalog.ReadingFullSourceMb) * 1024 * 1024,
+        (long)snapshot.Effective(BuiltInSettingsCatalog.ReadingWindowedSourceMb) * 1024 * 1024,
+        snapshot.Effective(BuiltInSettingsCatalog.ReadingFullDiffLines),
+        snapshot.Effective(BuiltInSettingsCatalog.ReadingWindowedDiffLines));
 }

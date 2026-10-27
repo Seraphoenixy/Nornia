@@ -23,6 +23,7 @@ public sealed class CliServices(
     IEnvironmentCheckEngine checkEngine,
     IEnvironmentRepairPlanner repairPlanner,
     IEnvironmentRepairExecutor repairExecutor,
+    IEnvironmentRollbackService rollbackService,
     IProjectCatalogService projectCatalog,
     IProjectLauncher projectLauncher)
 {
@@ -37,6 +38,7 @@ public sealed class CliServices(
     public IEnvironmentCheckEngine CheckEngine { get; } = checkEngine;
     public IEnvironmentRepairPlanner RepairPlanner { get; } = repairPlanner;
     public IEnvironmentRepairExecutor RepairExecutor { get; } = repairExecutor;
+    public IEnvironmentRollbackService RollbackService { get; } = rollbackService;
     public IProjectCatalogService ProjectCatalog { get; } = projectCatalog;
     public IProjectLauncher ProjectLauncher { get; } = projectLauncher;
 
@@ -60,7 +62,7 @@ public sealed class CliServices(
     {
         if (EnvironmentComponentCatalog.Get(component)?.Category != category)
         {
-            throw new ArgumentException(CliText.Format("Error_NotSupportedCategory", component, categoryName));
+            throw new CliUsageException(CliText.Format("Error_NotSupportedCategory", component, categoryName));
         }
     }
 

@@ -233,10 +233,16 @@
       <RowDefinition Height="*" />
     </Grid.RowDefinitions>
 
-    <!-- 唯一一级标签条:页面与文件/Diff 标签均从 Workbench.Tabs 渲染。 -->
+    <!-- 唯一一级标签条:页面与文件/Diff 标签均从 Workbench.Tabs 渲染;
+         右端常驻溢出按钮(⋯)按最近使用列出全部标签,找回被挤出可视区的标签。 -->
     <Border Grid.Row="0" Background="{DynamicResource EditorGroupHeaderTabsBackgroundBrush}"
             BorderBrush="{DynamicResource TabBorderBrush}" BorderThickness="0,0,0,1"
             Visibility="{Binding HasTabs, Converter={StaticResource BooleanToVisibilityConverter}}">
+      <DockPanel>
+        <Button DockPanel.Dock="Right" Content="{StaticResource CodiconMore}" FontFamily="{StaticResource IconFontFamily}"
+                Style="{StaticResource IconButton}" Padding="6,2" Margin="2,0,2,0" VerticalAlignment="Center"
+                Command="{Binding DataContext.ShowAllEditorsCommand, RelativeSource={RelativeSource AncestorType={x:Type Window}}}"
+                ToolTip="显示全部打开的编辑器（按最近使用排序）" AutomationProperties.Name="显示全部编辑器" />
       <ListBox x:Name="EditorTabList" ItemsSource="{Binding Tabs}"
                SelectedItem="{Binding SelectedTab, Mode=TwoWay}" SelectionMode="Single"
                AllowDrop="True" Background="Transparent" BorderThickness="0"
@@ -287,6 +293,7 @@
           </ContextMenu>
         </ListBox.ContextMenu>
       </ListBox>
+      </DockPanel>
     </Border>
 
     <!-- 内容区:选中页面标签 → 页面内容全区域;文档/空选择 → 编辑器组网格。 -->

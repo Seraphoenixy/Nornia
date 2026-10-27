@@ -1,4 +1,4 @@
-using CommunityToolkit.Mvvm.ComponentModel;
+﻿using CommunityToolkit.Mvvm.ComponentModel;
 using Nornia.Desktop.Localization;
 using Nornia.Desktop.Services;
 using Nornia.Core.Models;
@@ -12,12 +12,21 @@ public abstract partial class PageViewModel(string title, IUiLogService logServi
     private bool _activated;
     private readonly SemaphoreSlim _activationGate = new(1, 1);
     private CancellationTokenSource? _operationCancellation;
-    private readonly IUiDispatcher _uiDispatcher = new WpfUiDispatcher();
     private OperationProgressSink? _operationProgress;
     private int _statusToken;
 
+    /// <summary>UI 线程调度抽象。页面 VM 一律经此回到 UI 线程,不要直接读
+    /// <c>Application.Current.Dispatcher</c> —— 那样会脱离 STA 宿主(见架构守卫测试)。</summary>
+    protected IUiDispatcher UiDispatcher { get; } = new WpfUiDispatcher();
+
     public string Title { get; } = title;
     protected IUiLogService LogService { get; } = logService;
+
+    /// <summary>操作失败终态事件(通知中心的接入点):状态栏一行文字容易被忽略,
+    /// MainViewModel 聚合各页的失败为右上角 toast。事件参数即失败摘要。</summary>
+    public event EventHandler<OperationFailedEventArgs>? OperationFailed;
+
+    public sealed record OperationFailedEventArgs(string Operation, string Message, string? NextStep);
 
     /// <summary>VS Code-style secondary left sidebar content. Pages that have a sidebar return
     /// themselves (or a dedicated sidebar view model); null hides the sidebar column.</summary>
@@ -55,7 +64,7 @@ public abstract partial class PageViewModel(string title, IUiLogService logServi
             {
                 _operationProgress = new OperationProgressSink(
                     operation,
-                    _uiDispatcher,
+                    UiDispatcher,
                     LogService.CreateProcessProgress(operation.CorrelationId),
                     ApplyOperationProgress);
             }
@@ -63,6 +72,13 @@ public abstract partial class PageViewModel(string title, IUiLogService logServi
             return _operationProgress;
         }
     }
+
+    /// <summary>刷新当前页的数据(窗口命令 <c>refreshActiveView</c>,Ctrl+R / 命令面板)。
+    ///
+    /// <para>此前这段分派是 MainWindow 里对 4 个具体 VM 类型的 switch —— 每加一个可刷新页面就要
+    /// 回去改视图代码。改成虚方法后,页面自己决定"刷新"意味着什么,视图只负责调用。默认实现为
+    /// 空操作,呼应"这个页面没有可刷新的数据"。</para></summary>
+    public virtual Task RefreshActiveViewAsync() => Task.CompletedTask;
 
     public async Task ActivateAsync()
     {
@@ -161,6 +177,7 @@ public abstract partial class PageViewModel(string title, IUiLogService logServi
             LastOperationResult = new(correlationId, operation, OperationPhase.Failed, StatusMessage, CurrentOperation.RecommendedNextStep);
             LogService.WriteException("ERROR", StatusMessage, ex, correlationId);
             StatusKind = StatusKind.Error;
+            OperationFailed?.Invoke(this, new OperationFailedEventArgs(operation, StatusMessage, CurrentOperation.RecommendedNextStep));
             ScheduleStatusClear();
             return false;
         }

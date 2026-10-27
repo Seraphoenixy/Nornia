@@ -289,6 +289,41 @@ public sealed class TerminalScreenTests
     }
 
     [Fact]
+    public void GetRenderedLine_WideCharacters_NoNulContinuationInText()
+    {
+        // 回归(dotnet build 输出):宽字符的延续格(Char='\0')不得进入文本/复制路径,
+        // 否则从终端复制的中文输出会夹 NUL。
+        var screen = new TerminalScreen(columns: 20, rows: 3);
+        screen.FeedText("正在确定项目… ok");
+
+        var line = screen.GetRenderedLine(screen.Rows - 1) ?? string.Empty;
+        Assert.Equal("正在确定项目… ok", line.TrimEnd());
+        Assert.DoesNotContain('\0', line);
+        Assert.DoesNotContain('\0', screen.ToPlainText());
+    }
+
+    [Fact]
+    public void CursorVisibility_NonPrivateMode25_HidesAndShows()
+    {
+        // 回归:Windows 控制台/ConPTY 以不带 '?' 的 CSI 25 h/l 显隐光标(PSReadLine 场景
+        // 高频出现);此前被忽略导致光标可见性与标准 pwsh 不一致。
+        var screen = new TerminalScreen(columns: 20, rows: 3);
+        Assert.True(screen.CursorVisible);
+
+        screen.FeedText("\x1b[25l");
+        Assert.False(screen.CursorVisible);
+
+        screen.FeedText("\x1b[25h");
+        Assert.True(screen.CursorVisible);
+
+        // 私有 DEC 语义仍有效。
+        screen.FeedText("\x1b[?25l");
+        Assert.False(screen.CursorVisible);
+        screen.FeedText("\x1b[?25h");
+        Assert.True(screen.CursorVisible);
+    }
+
+    [Fact]
     public void SgrState_PersistsAcrossFeedChunks()
     {
         var screen = new TerminalScreen(columns: 20, rows: 3);

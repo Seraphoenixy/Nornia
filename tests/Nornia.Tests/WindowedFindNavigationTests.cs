@@ -98,8 +98,10 @@ public sealed class FileSourceSearchOptionsTests
 /// remapping the visible match subset to window-local coordinates.</summary>
 public sealed class WindowedFindNavigationTests : IDisposable
 {
-    private const string Filler = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do";
-    private const int TotalLines = 150_000; // ≈ 9.5 MB — above the 8 MB full-source threshold
+    private const string Filler = "l";
+    // 行数保持 15 万(跨窗口导航断言依赖第 10000/20000/30000 行的位置);单字符填充把文件
+    // 缩到 ~0.45 MB,配下面注入的小分层上限即可进入窗口化——不再为此写 9.5 MB 临时文件。
+    private const int TotalLines = 150_000;
     private readonly string _tempDir = Path.Combine(Path.GetTempPath(), $"nornia-windowed-find-{Guid.NewGuid():N}");
 
     public WindowedFindNavigationTests() => Directory.CreateDirectory(_tempDir);
@@ -123,7 +125,11 @@ public sealed class WindowedFindNavigationTests : IDisposable
         lines[29999] = "pneedle delta"; // line 30000
         await File.WriteAllLinesAsync(path, lines, new UTF8Encoding(false));
 
-        var tab = new FilePreviewTab(path, TextDocumentDecoder.Instance, CodeFileTypeRegistry.Instance);
+        var tab = new FilePreviewTab(path, TextDocumentDecoder.Instance, CodeFileTypeRegistry.Instance)
+        {
+            // 小上限注入:窗口化行为与生产 8MB/32MB 阈值同路径,测试文件不必真的超过 8MB。
+            ContentLimits = new ReadOnlyContentLimits(64L * 1024, 1024L * 1024, ReadOnlyContentCapacity.FullDiffLines, ReadOnlyContentCapacity.WindowedDiffLines),
+        };
         await tab.LoadAsync();
         Assert.Equal(1, tab.WindowStartLine);
         return tab;
@@ -191,22 +197,38 @@ public sealed class WindowedFindNavigationTests : IDisposable
         Assert.Equal(1, tab.WindowStartLine);
 
         // 第 1 个匹配(100 行)→ 第 2 个(10000 行):目标在当前窗口外,须先加载其窗口。
-        tab.FindNextCommand.Execute(null);
-        await WaitForAsync(() => tab.WindowStartLine != 1);
-
         var expectedStart = 10000 - FileReadOnlyDocumentSource.DefaultWindowLines / 3; // 8334
+        var localLine = 10000 - expectedStart + 1;                                     // 1667
+        tab.FindNextCommand.Execute(null);
+        // 轮询收敛到终态:窗口起点、窗口内匹配子集、当前匹配落位是同一份状态的三张面孔,
+        // 只等其中一张(如先前只等 WindowStartLine 变化)会在另外两张尚未落地时读到旧窗口
+        // 的局部行号(CI 曾读到 1667 当真)。断言终态即可,不依赖内部发布顺序。
+        await WaitForAsync(
+            () => tab.WindowStartLine == expectedStart
+                && tab.SearchMatches.Count == 1
+                && tab.SearchMatches[0].Line == localLine
+                && tab.CurrentMatchViewIndex == 0,
+            () => $"WindowStartLine={tab.WindowStartLine} count={tab.SearchMatches.Count} "
+                + $"lines=[{string.Join(",", tab.SearchMatches.Select(m => m.Line))}] viewIndex={tab.CurrentMatchViewIndex}");
+
         Assert.Equal(expectedStart, tab.WindowStartLine);
         Assert.Equal("2 / 4", tab.CurrentMatchDisplay);
         // 新窗口(8334–13333)内只剩第 10000 行的匹配,行号/偏移已重挂到窗口坐标。
         var match = Assert.Single(tab.SearchMatches);
-        var localLine = 10000 - expectedStart + 1;
         Assert.Equal(localLine, match.Line);
         Assert.Equal((localLine - 1) * (Filler.Length + 1), match.Offset);
         Assert.Equal(0, tab.CurrentMatchViewIndex);
 
         // 返回第 1 个匹配(100 行):首个窗口重新载入,当前匹配落位。
         tab.FindPreviousCommand.Execute(null);
-        await WaitForAsync(() => tab.WindowStartLine == 1);
+        await WaitForAsync(
+            () => tab.WindowStartLine == 1
+                && tab.SearchMatches.Count == 1
+                && tab.SearchMatches[0].Line == 100
+                && tab.CurrentMatchViewIndex == 0,
+            () => $"WindowStartLine={tab.WindowStartLine} count={tab.SearchMatches.Count} "
+                + $"lines=[{string.Join(",", tab.SearchMatches.Select(m => m.Line))}] viewIndex={tab.CurrentMatchViewIndex}");
+
         Assert.Equal("1 / 4", tab.CurrentMatchDisplay);
         var back = Assert.Single(tab.SearchMatches);
         Assert.Equal(100, back.Line);

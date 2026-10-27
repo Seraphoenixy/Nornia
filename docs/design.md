@@ -35,7 +35,7 @@ Nornia.Storage ─┘
 | `Nornia.Package` | 软件包搜索、清单、软件变更与环境修复回滚 | Core |
 | `Nornia.Project` | `Nornia.yaml`、项目环境检查、项目启动 | Core |
 | `Nornia.Git` | git CLI 封装（`-C <repo>`）与状态/diff/日志纯文本解析 | Core |
-| `Nornia.Storage` | SQLite 建库、迁移和仓储实现 | Core |
+| `Nornia.Storage` | SQLite 建库、schema 版本门控、仓储与环境修复日志文件实现 | Core |
 | `Nornia.Composition` | 唯一服务层组合根：`AddNorniaServices()` 注册进程、Git、持久化、Provider、服务 | Core 及功能模块 |
 | `Nornia.Desktop` | WPF、MVVM、设置/命令平台、依赖注入和展示 | Composition 及功能模块 |
 | `Nornia.CLI` | 自动化入口和功能编排（仅追加 CLI 展示层注册） | Composition |
@@ -47,7 +47,12 @@ Nornia.Storage ─┘
 - Core 不引用 WPF、CLI、SQLite 或具体 Provider。
 - Runtime 只回答“本机有什么”，Package 负责“如何获取或移除”。
 - Project 不直接调用 Winget，环境检查与环境修复保持分离。
-- WPF code-behind 仅承担视图初始化，不承载业务逻辑。
+- WPF code-behind 仅承担视图初始化与纯几何/输入处理，不承载业务逻辑；算法落在 `Nornia.Desktop/Code/` 下不依赖 WPF 的类型里（`TextSearchService`、`DiffTextSearch`、`ReadOnlyContentCapacity` 等），因此可脱宿主单测。
+- ViewModel 一律经 `IUiDispatcher`/`IUiTimer` 回到 UI 线程，不直接触达 `Application.Current`/`Dispatcher`/`DispatcherTimer`；模态交互经 `IConfirmationService`/`IFolderPickerService`/`ITextPromptService`/`IMessageService`，不直接引用 `Views.Dialogs.*` 或 `System.Windows.MessageBox`。
+- 版本比较统一走 `Nornia.Core.Models.VersionOrder`，禁止字典序取最新。
+- 页面视图定位由 `App.xaml` 的隐式 `DataTemplate` 承担，窗口 code-behind 不持有「页 VM 类型 → 视图类型」的映射。
+
+这些约束不只是文档条款：其中的结构性几条各由一条**文本守卫测试**强制（见 §10）。
 
 ## 3. 通用进程执行
 
@@ -227,17 +232,25 @@ EnvironmentProfile + IReadOnlyCollection<Runtime>
 
 ### 6.3 修复追踪与回滚
 
-生产执行器是 `TrackedEnvironmentRepairExecutor`：每个修复批次绑定一个 `correlation_id`（操作日志 `BeginOperation("ENV_FIX", …)` 生成），逐步执行时：
+生产执行器是 `TrackedEnvironmentRepairExecutor`。每个修复批次生成一个 `correlation_id`，**它由 `ExecuteAsync` 作为返回值交给调用方**——这是回滚批次的唯一钥匙。逐步执行时：
 
-1. 先探测组件当前版本（`previous_version`），再经 `PackageProviderSelector` 选择 Provider 执行安装；
-2. 每步（无论成功失败）写入 `environment_repair_logs` 一行：组件、previous/target 版本、包 Id/版本、Provider、成功标记、回滚策略、失败原因与回滚提示；同时把步骤进度/成功/失败（含 Provider 错误输出摘录）以 JSON `details` 追加到 `operation_log`（同 `correlation_id`）；
-3. 单步失败不中断批次：失败记入 `EnvironmentRepairFailure`（序号/总数/组件/前后版本/包/Provider/异常类型/原因/诊断输出/退出码/回滚策略），批次结束时汇总；
-4. 取消（`OperationCanceledException`）中断批次并原样上抛，finally 里仍写入“执行被中断”汇总；
-5. 批次结束后若存在失败，抛出 `EnvironmentRepairException`（携带 `correlation_id` 与失败列表），UI 日志经 `UiLogService.WriteException` 渲染为“失败步骤 n（correlation_id=…）+ 逐条原因”。
+1. 先探测组件当前版本（`previous_version`）。同一组件可能有多个 side-by-side 实例（.NET SDK feature band、VC++ 多架构），必须取**数值序最大**的那个作为回滚基点，否则会记录错误的 previous 版本；随后经 `PackageProviderSelector` 选择 Provider 执行安装；
+2. 每步（无论成功失败）向数据目录下的 `environment-repair-logs.jsonl` 追加一行 JSON（`EnvironmentRepairLogStore`，读写经同一信号量串行化）：组件、previous/target 版本、包 Id/版本、Provider、成功标记、回滚策略、失败原因与回滚提示；
+3. 单步失败不中断批次：失败记入 `EnvironmentRepairFailure`（序号/总数/组件/前后版本/包/Provider/异常类型/原因/诊断输出/退出码/回滚策略），批次结束时汇总；诊断输出取自 Provider 的 stderr 与 `WingetException.OutputDetail` 去重合并；
+4. 取消（`OperationCanceledException`）中断批次并原样上抛——**该步不会写入日志**，也不会伪造一条"已中断"记录；
+5. 批次结束后若存在失败，抛出 `EnvironmentRepairException`（携带 `correlation_id` 与失败列表）；Desktop 侧经 `UiLogService.WriteException` 渲染为"失败步骤 n（correlation_id=…）+ 逐条原因"。
 
 回滚策略（`RollbackStrategy`）在写入日志时确定：升级/安装类默认 `Automatic`（可用包管理器撤销）；Winget 明确 `PackageVersion` 的降级与默认黑名单包（VCRedist 2015+、.NET SDK Preview、WindowsAppRuntime）标记为 `Manual`，日志携带手动命令提示（先 `winget uninstall` 再按版本重装，或厂商安装程序）。
 
-`EnvironmentRollbackService.BuildPlanAsync(correlationId)` 读取该批次日志、按 sequence 逆序为成功步骤生成 `EnvironmentRollbackPlan`（撤销最近操作优先）；`RollbackAsync` 逐步执行：`Automatic` 步骤按 previous 版本重装或卸载（previous 为 `0.0.0-uninstalled` 时卸载），`Manual` 步骤跳过并输出提示；重装失败降级为提示不中断后续步骤。
+**回滚执行。** `EnvironmentRollbackService.BuildPlanAsync(correlationId)` 读取该批次日志、按 sequence 逆序为**成功**步骤生成 `EnvironmentRollbackPlan`（撤销最近操作优先）；`RollbackAsync` 逐步执行并返回 `EnvironmentRollbackResult`：`Automatic` 步骤按 previous 版本重装或卸载（previous 为 `0.0.0-uninstalled` 时卸载），`Manual` 步骤跳过并输出提示。单步失败**不再静默**——卸载与重装的异常都记入 `Failures`（含原因与手动提示）后继续后续步骤，只有用户显式取消才抛 `OperationCanceledException`。
+
+**回滚入口。** 批次 id 有三个消费点，闭环不缺环：
+
+- CLI `Nornia env rollback <correlation-id> [--apply]`：默认只打印逆序计划（含 Manual 步骤的手动命令），加 `--apply` 才真正动机器；失败步骤逐条打印到 stderr，退出码为 1。
+- CLI `env fix --apply` 成功后打印批次 id 与可复制的撤销命令；失败时顶层异常处理也会补打同一提示，用户不必从日志里翻 id。
+- Desktop Projects 页「应用修复」成功后把批次 id 与撤销命令写入 Output；失败时按上文渲染 correlation_id。
+
+**已知限制（有意保留）**：批次 id 不记录"已回滚"状态，重复执行同一条回滚命令会再次尝试。对卸载与"重装同一版本"而言这是幂等的，不会造成额外破坏；若要加入去重，需要在日志中引入"回滚事件"记录类型。
 
 ## 7. CLI 设计
 
@@ -260,6 +273,7 @@ Nornia package upgrade <id>
 Nornia env check [path]
 Nornia env plan [path]
 Nornia env fix [path] [--apply]
+Nornia env rollback <correlation-id> [--apply]
 Nornia project init [path] [--name <name>]
 Nornia project export [path] <destination>
 Nornia project import <source> [path]
@@ -272,14 +286,27 @@ Nornia project open [path]
 | --- | --- |
 | `0` | 命令成功，环境检查全部通过 |
 | `1` | 操作失败，或环境存在 FAIL/WARNING |
-| `2` | 未知命令或参数组合 |
+| `2` | 未知命令或参数组合（`CliUsageException`） |
 | `130` | 用户通过 Ctrl+C 取消 |
+
+参数组合不合法一律抛 `CliUsageException`（继承 `ArgumentException`，保持既有捕获链兼容）并映射退出码 2——包括未知选项与多余的位置参数，不再静默忽略。其余异常由顶层统一兜底映射到 1：异常消息写给用户，完整堆栈只在设置环境变量 `NORNIA_CLI_STACKTRACE=1` 时打印，避免正常使用场景被栈追踪淹没。
 
 `project open` 在 CLI 中默认调用 `code <path>`。Desktop 从 `%LOCALAPPDATA%\Nornia\settings.json` 读取编辑器命令，并把项目目录作为唯一参数传入；Settings 页面可填写 PATH 命令或选择具体的 `.exe` 文件。
 
 ## 8. 数据存储
 
-SQLite 是本机环境资产索引，使用 `Microsoft.Data.Sqlite.Core`、Windows SQLite Provider 和 Dapper，位置固定为 `%LOCALAPPDATA%\Nornia\nornia.db`。初始化通过 `schema_migrations` 版本表执行；每个迁移在事务内完成，因此可安全重复启动和升级旧库。数据库包含：
+SQLite 是本机环境资产索引，使用 `Microsoft.Data.Sqlite.Core`、Windows SQLite Provider 和 Dapper，位置固定为 `%LOCALAPPDATA%\Nornia\nornia.db`。这里是**机器本地**数据（已安装 Runtime/软件包快照、项目绝对路径与环境绑定、环境修复记录），因此不放 Roaming——域环境下漫游同步会把 A 机的软件清单带到 B 机，多机共用同一 SQLite 文件也有写冲突与损坏风险。历史版本曾落在 Roaming，`NorniaPaths.MigrateFromRoamingIfNeeded()` 在组合根解析路径前做一次性幂等搬迁（连同 `-wal`/`-shm`）。
+
+**schema 生命周期。** 版本化迁移已移除（`IDatabaseMigration`/`MigrationRunner`/`schema_migrations` 均不再存在）。`NorniaDatabase.CreateSchemaAsync` 是唯一实现，分四步：
+
+1. 建表全部 `IF NOT EXISTS`，重复执行安全；
+2. 一次性升级由 SQLite 的 `PRAGMA user_version` 门控，仅在版本落后时执行——清理旧库残留的 `logs`/`environment_repair_logs`/`schema_migrations` 三张废弃表，并对 `projects` 按 path 去重（保留最近打开的一条）。这里**不用** `schema_migrations` 记录版本，因为那张表本身就是要被清理的对象；
+3. 建唯一索引/普通索引（`ux_projects_path` 等）排在一次性升级之后——旧库可能残留重复 path，先建唯一索引会让整个应用起不来；
+4. 抬升 `user_version`。
+
+版本号常量是 `NorniaDatabase.SchemaVersion`；提高它时在该方法的门控块里追加对应的一次性语句。`SchemaMigrationTests` 断言重复调用安全、废弃表只被清理一次（再次造出同名表必须保留）、重复 path 的旧库能被去重并成功建索引。
+
+数据库包含：
 
 - `runtimes`
 - `packages`
@@ -287,12 +314,10 @@ SQLite 是本机环境资产索引，使用 `Microsoft.Data.Sqlite.Core`、Windo
 - `environment_profiles`
 - `environment_bindings`
 - `scan_state`（清单快照级扫描元数据：kind 主键 `runtimes`/`packages`、scanned_at、duration_ms、环境指纹）
-- `logs`
-- `environment_repair_logs`（环境修复批次步骤：correlation_id、sequence、组件、前后版本、包、Provider、成功标记、回滚策略、失败原因/提示）
 
-所有时间字段存储 Unix Timestamp。Core 定义 `IRuntimeRepository`、`IPackageRepository`、`IProjectRepository`、`IEnvironmentProfileRepository`、`IOperationLogRepository`、`IEnvironmentRepairLogRepository` 和 `IOperationLogWriter`，Storage 提供 SQLite/Dapper 实现，避免领域层依赖 SQLite。
+日志类数据不在数据库中：操作日志整体移除，`logs` 表与 `IOperationLogRepository`/`IOperationLogWriter` 已删除；环境修复明细改为数据目录下的 JSON Lines 文件（见 6.3）。`Nornia.Storage` 同时提供数据库与文件两类实现。
 
-迁移现为三步：`InitialSchemaMigration`（1）、`PackageArchitectureMigration`（2）、`RepairLoggingMigration`（3）——为 `logs` 增列 `correlation_id`/`operation_kind`/`details_json`（按 `pragma_table_info` 幂等增列），并创建 `environment_repair_logs` 及其 `(correlation_id, sequence)`、`timestamp` 索引。
+所有时间字段存储 Unix Timestamp。Core 定义 `IRuntimeRepository`、`IPackageRepository`、`IProjectRepository`、`IEnvironmentProfileRepository`、`IEnvironmentRepairLogRepository` 和 `IDashboardSummaryReader`，Storage 提供 SQLite/Dapper 或文件实现，避免领域层依赖 SQLite。
 
 `EnvironmentInventoryService` 在 Runtime 扫描后替换持久化快照：本次未发现的旧 Runtime 标记为 Missing，不直接删除；`GetAllAsync` 是"在场清单"读取，只返回非 Missing 记录，并把 `RuntimeStatus.Error` 无损推导回 `DetectionStatus.Broken`（持久化不存检测明细）。`PackageInventoryService` 在 Winget 已安装清单和包变更后写入 Package 快照（`status=0` 历史行同理不返回）。Package 使用 `Id + Provider + Architecture` 作为资产键：解析 `x86`、`x64`、`arm64` 标识后保留真实架构变体，只合并完全重复的 Winget 记录；无法识别时显示 `Unknown`。`ProjectCatalogService` 在 `project init`、`env check`、`project open` 与桌面端对应操作中登记项目，保存完整 YAML 内容及检查通过的 Runtime Binding。项目目录不可达时仅更新为 Missing；用户显式移除才删除项目、配置和绑定。
 
@@ -306,7 +331,7 @@ Desktop 是功能模块的组合根，通过依赖注入创建页面 ViewModel�
 
 界面采用 VS Code Dark Modern 工作台风格，并复用其信息层级：顶部自定义标题栏、左侧 Activity Bar（现代半透明高亮 + 徽标）、带分区标题的 Explorer 风格主侧栏、中间编辑器标签条与面包屑 + 内容区域、底部可拖动 Output Panel（标签顶部强调边框），以及深色状态栏（左右分组、可点击项、悬停反馈）。颜色令牌直接对齐 VS Code 官方 Dark Modern / Light Modern / High Contrast 调色板（`#181818`、`#1F1F1F`、`#2B2B2B`、`#0078D4`、`#F85149` 等，见 `Themes/*.xaml`）；列表、表格、输入框和按钮统一采用紧凑尺寸。窗口控制、拖动和缩放属于纯视图行为，可留在 Window code-behind；业务操作仍全部由命令绑定进入 ViewModel。
 
-Desktop 采用统一的 VS Code 外壳（`MainWindow`）：[48px Activity Bar | 二级左侧栏（共享列，可拖动分隔条调整宽度，页面无侧栏时整列收起）| 主内容区]。活动栏提供五个顶层入口：环境管理、资源管理器、源代码管理、项目管理、设置。每个顶层页通过 `PageViewModel.Sidebar` 虚属性提供自己的二级左侧栏视图（侧栏模板放在侧栏 ContentControl 的 Resources 中，内容模板放在主内容区，避免同类型双模板冲突）；设置页无侧栏，内容占满全宽。活动栏徽标：环境管理=问题数、源代码管理=Git 更改数、项目管理=已登记项目数。
+Desktop 采用统一的 VS Code 外壳（`MainWindow`）：[48px Activity Bar | 二级左侧栏（共享列，可拖动分隔条调整宽度，页面无侧栏时整列收起）| 主内容区]。活动栏提供五个顶层入口：环境管理、资源管理器、源代码管理、项目管理、设置。每个顶层页通过 `PageViewModel.Sidebar` 虚属性提供自己的二级左侧栏数据，**侧栏视图由 `App.xaml` 的隐式 `DataTemplate`（`DataType={x:Type vm:XxxPageViewModel}` → `views:XxxSidebarView`）定位**——窗口只按 `page.GetType()` 取模板并把 `DataContext` 设为该页，因此新增一个带侧栏的页面只需加一个模板（1 处改动），不必回头改视图物化代码（此前是手写类型判断链，3 处改动；由 `ArchitectureGuardrailTests` 卡住）。设置页无侧栏，内容占满全宽。「刷新当前页」（Ctrl+R / 命令面板）由 `PageViewModel.RefreshActiveViewAsync()` 虚方法承担，页面各自决定“刷新”的含义，窗口不再对具体 VM 类型做 switch。活动栏徽标：环境管理=问题数、源代码管理=Git 更改数、项目管理=已登记项目数。
 
 **标题栏（命令中心）。** 标题栏自左至右：Logo + 完整菜单条（文件/编辑/选择/查看/转到/运行/终端/帮助，菜单项经命令平台 `Commands[id]` 绑定并显示 `InputGestureText` 快捷键）、居中「返回/前进 + 工作区命令中心」胶囊（`TitleBarCommandCenterBackgroundBrush` 三主题令牌：深/浅为半透明 tint，高对比为实心面）、右侧布局切换（左边栏/底栏按钮，激活态字形高亮）与窗口控制按钮。窗口控制采用紧凑形态：字形 `IconClose`（12）+ `DpiHelper` 系统按钮盒 32×28（DPI 缩放），不再沿用 46×34 的系统尺寸。
 
@@ -314,7 +339,7 @@ Desktop 采用统一的 VS Code 外壳（`MainWindow`）：[48px Activity Bar | 
 
 **响应式侧栏语义。** 窄窗口的自动收起只是「窗口太窄」的临时隐藏：此时显式切换（顶栏按钮或 Ctrl+B）意味着用户要重新打开侧栏——清除自动收起标记并显式显示，避免窗口加宽后侧栏意外复活；再切换一次则是显式隐藏，加宽后同样不复活。
 
-资源管理器页（`ExplorerPageViewModel`，顶层「资源管理器」）是统一的项目状态所有者：二级左侧栏为工作区文件树（`WorkspaceViewModel`/`WorkspaceView`），主内容区为共享编辑器（`EditorAreaView`）。`OpenProjectPathAsync` 是打开项目的唯一入口，一次调用同步四处——资源管理器加载文件树、终端切换工作目录、Git 仓库路径与项目登记并刷新；同时把项目工作流上下文（`Projects.ProjectPath`/`ProjectName`）指向同一目录，保证资源管理器「检查环境」与项目页检查的是同一个项目。资源管理器侧边栏顶部保留「项目」分区展示当前项目与环境状态（✓/⚠），打开工作区时根目录默认展开。Dashboard 的 `NavigationTargets.Projects` 任务携带上下文（check / repair / new / repair:project=…）跳转到「项目管理」并转发给项目工作流；项目目录行的「打开」经 `NavigationTargets.Explorer` 路由回资源管理器页。
+资源管理器页（`ExplorerPageViewModel`，顶层「资源管理器」）是统一的项目状态所有者：二级左侧栏为工作区文件树（`WorkspaceViewModel`/`WorkspaceView`），主内容区为共享编辑器（`EditorAreaView`）。`OpenProjectPathAsync` 是打开项目的唯一入口，一次调用同步四处——资源管理器加载文件树、终端切换工作目录、Git 仓库路径与项目登记并刷新；同时把项目工作流上下文（`Projects.ProjectPath`/`ProjectName`）指向同一目录，保证资源管理器「检查环境」与项目页检查的是同一个项目。资源管理器侧边栏顶部保留「项目」分区展示当前项目与环境状态（✓/⚠），打开工作区时根目录默认展开。上下文经 `ProjectWorkspaceService` 发布给所有页面，**并发**等待每个订阅者（见「超大工作树」一节）：源代码管理读 `git status` 的秒级开销不再排在资源管理器的目录枚举之前。Dashboard 的 `NavigationTargets.Projects` 任务携带上下文（check / repair / new / repair:project=…）跳转到「项目管理」并转发给项目工作流；项目目录行的「打开」经 `NavigationTargets.Explorer` 路由回资源管理器页。
 
 「项目管理」页（`ProjectsViewModel`）的二级左侧栏是 VS Code 风格的项目目录列表：标题栏有「刷新列表」与「登记项目」，每个项目行显示健康徽标/名称/路径/上次检查时间，行内提供「打开」（在资源管理器中打开，同步资源管理器与终端）、「在编辑器中打开」（外部编辑器命令，见设置）与「移除记录」三个动作；列表下方在无项目时显示空状态。主内容区为环境检查/修复工作流（路径框 + 状态驱动的初始化/检查/预览修复/应用修复按钮 + 结果表格 + 修复计划条）。目录缺失的历史项目保留在列表中，但「打开」按钮因目录不存在而禁用。
 
@@ -327,14 +352,28 @@ Desktop 采用统一的 VS Code 外壳（`MainWindow`）：[48px Activity Bar | 
 - **提交与同步**：提交按钮为拆分菜单——提交 / 提交并推送（提交后直接推送，不要求工作区干净）/ 提交并同步（提交后先快进拉取再推送）；独立命令 获取（`fetch`，不动工作树）/ 拉取 / 推送 / 安全同步（拒绝脏工作区，快进拉取成功后才推送）。认证策略：Nornia 永不接受或存储凭据，push/pull 依赖 Git Credential Manager 读取 Windows 凭据管理器。
 - **传入/传出更改**：有上游时，最近提交图以虚线空心节点标出同步范围：「传出的更改 + 当前分支」位于本地 tip；远端独有提交占据独立泳道并先行绘制，「传入的更改 + 上游分支」分界位于远端独有提交之后、共同/本地历史之前，远端泳道在该节点处汇入共同历史。不再将上游线性追加到底部，也不再压缩成顶部计数行。边界行仍可展开并懒加载该范围的**净文件影响**（`git diff --name-status HEAD...upstream` / `upstream...HEAD`——自合并基到上游/本地的净变化，同一文件被多个提交修改只计一次）；提交集合或「上游|ahead|behind」签名变化时重建，静默刷新不清空、不闪烁。
 - **贮藏（Stash）**：侧栏「贮藏」分区列出 `git stash list`，支持贮藏全部更改（含未跟踪）、应用并移除（pop）、丢弃（二次确认）。
-- **自动刷新**：`GitRepositoryWatcher`（递归 `FileSystemWatcher`，200ms 尾部去抖、UI 线程派发）监听工作树变化静默刷新 SCM 状态（受 `git.autorefresh` 设置控制）。`.git` 目录只放行影响可见状态的路径（`index`、`HEAD`、`packed-refs`、`FETCH_HEAD`、`ORIG_HEAD`、`MERGE_HEAD`、`CHERRY_PICK_HEAD`、`refs\`、`rebase-*`），忽略 object/lock/log 抖动；git 读写操作前后打开 250ms 抑制窗口，`.git\index` 事件在窗口内丢弃（git 自身回写 index stat cache 不会触发刷新循环），而外部的 HEAD/refs 切换仍能立即捕获。监视器错误（缓冲区溢出/目录移除）时停止监听并发一次通知，视图进入降级态，目录恢复后下次刷新重新附着。
+- **自动刷新**：`GitRepositoryWatcher`（递归 `FileSystemWatcher`，200ms 尾部去抖、UI 线程派发）监听工作树变化静默刷新 SCM 状态（受 `git.autorefresh` 设置控制）。`.git` 目录只放行影响可见状态的路径（`index`、`HEAD`、`packed-refs`、`FETCH_HEAD`、`ORIG_HEAD`、`MERGE_HEAD`、`CHERRY_PICK_HEAD`、`refs\`、`rebase-*`），忽略 object/lock/log 抖动；git 读写操作前后打开 250ms 抑制窗口，`.git\index` 事件在窗口内丢弃（git 自身回写 index stat cache 不会触发刷新循环），而外部的 HEAD/refs 切换仍能立即捕获。监视器错误（缓冲区溢出/目录移除）时停止监听并发一次通知，视图进入降级态，目录恢复后下次刷新重新附着——这类通知只触发状态读取，不再升级为全量加载（见下）。`git.fsmonitor`（默认关闭）把 `-c core.fsmonitor=true` 传给状态读取：git 会为该仓库常驻一个 `fsmonitor--daemon`，因此必须由用户显式开启。
 - **历史增强**：分页加载（每页 30 条，「加载更多」）、复制变更路径/分支名/提交哈希/提交主题（多选）、复制 git 日志文件路径；选中提交文件在共享编辑器打开提交 diff（`diff:<hash>:<path>` 标签键去重）。
+
+**超大工作树的读取、发布与降级（更改栏不冻结界面的红线）。** 现象是打开工作区时整个界面跟着卡顿、变更越多越明显，根因分散在读取、发布与装饰三层；每条都配了断言（下列测试名即证据）。**注意成本维度有两种**：变更/未跟踪条目数 N（发布、装饰、条目上限）与**跟踪文件数 M**（`git status` 的索引刷新）——后者与"列表里有多少条变更"无关，条目上限和 16 MB 输出上限都管不到它。
+
+- **读取永远不压调用线程**：`git status` 走 `ProcessRunner.RunBoundedAsync`——stdout 保留到 16 MB（`GitService.StatusMaximumOutputBytes`）即终止子进程并把保留前缀标记为部分输出（`ProcessResult.OutputTruncated`），消费者按 `IsSuccess || OutputTruncated`「解析已保留的部分」处理，因此病态仓库的读取成本是固定的，与它本来要输出多少无关。子进程在 `Task.Run` 里启动，解析与建模全链路 `ConfigureAwait(false)`，读并发槽 `ReadSlots = 2`（并发更多只互相抢 IO，不减墙钟）。证据：`GitStatusThreadingTests`（执行子进程启动的线程 ≠ 调用线程，且续延没有排回调用方上下文）、`GitStatusParserTests`、`GitServiceTests`。
+- **一次发布只做一次差分**：`SyncCollection` 用 `CollectionDiffer.Compute` 一次算出「公共前缀不动 + 公共后缀不动 + 中间先删后插」的最小中间操作，快照路径随之传 `ReplaceRange(items, checkEquality: false)`，不再对 10k 条记录补一遍 `SequenceEqual` 全表比较。证据：`CoalescingPrimitivesTests`。
+- **通知形态按区间大小切换**：中间区间 ≤ `CollectionDiffer.SinglePassReplaceThreshold`（128）且不是纯前缀删除时逐条 Remove/Insert——未受影响行的实例、容器、滚动锚点与展开态都活着（展开/折叠、流式追加属于这一类）；否则单次 `Reset` 快照，因为每条通知都要过一遍 `ItemWindow`/`CollectionView`，大区间逐条通知近似二次方。尾部收缩（120 → 100）必须是 20 条 Remove、0 次 Reset 且精确落在目标条数：发布中途被打断会留下「提示说 100、列表是 119」的半状态。证据：`CoalescingPrimitivesTests.SyncCollection_TailShrinkToNewEntryLimit_PublishesRemovesOnly`。
+- **装饰解析只花 O(深度)**：`WorkspaceNode` 持 `_childrenByName` 名字索引（`FindChild(name)`），`WorkspaceViewModel.FindLoadedNode` 逐段查子节点，因此一轮装饰的成本随路径段数而非「路径数 × 深度 × 兄弟数」增长；索引随 `ReconcileChildrenAsync` 的增量对账同步（被驱逐的节点不会残留在索引里）。证据：`WorkspaceDecorationIndexTests` 用 `DecorationSegmentLookups` 计数断言 150 兄弟与 1 兄弟的增量相同且远小于 150。
+- **兜底闸门是可见的降级，不是静默丢条目**：`git.statusLimit`（默认 10 000，合法区间 100–100 000）解析进 `GitViewModel.StatusEntryLimit` 并传给读取端，超出上限的条目在解析阶段就被丢弃；`Truncated` 时页脚显示 `StatusTruncationSummary`（说明「仅列出前 N 项，可在设置 git.statusLimit 中调整」）并写一条 WARNING 日志。树状布局另有单次发布行数预算 `TreeRowRenderLimit`（默认 512，「显示更多」按 `TreeRowRenderChunk` 步进抬高）。上限改变会改变「列表里应当有多少条」，因此设置生效即刻按新上限静默重取状态。预算与间隔都是可注入属性，测试只断言「预算生效」，不做墙钟性能断言。证据：`ScmLargeChangesDegradationTests`、`GitStatusLimitOwnerThreadTests`。
+- **发布只能落在所有权线程**：变更列表与其 `CollectionView` 只能由构造 `GitViewModel` 的那条线程变更，而设置会话的 `Changed` 事件不保证落在这条线程上（会话可能由没有同步上下文的线程打开，watch 续延随之落回线程池）。`GitViewModel.RunOnOwnerThread` 用构造期捕获的同步上下文 + 所有权线程 id 回排（已在所有权线程则内联），静默刷新重试计时器同样经它——否则跨线程发布会被 `NotSupportedException` 从中间打断，整轮刷新被 catch 吞掉。证据：`GitStatusLimitOwnerThreadTests`（自建 STA 宿主复现生产线程形态，并把 `Changed` 重投到线程池线程；断言事件线程 ≠ 发布线程、发布线程 = 所有权线程）。注意：没有 WPF 宿主的普通测试线程证明不了这条红线，这类断言必须自带宿主。
+- **打开工作区时 git 不得挡住目录树（M 维度）**：`git status` 的成本是索引刷新——对每个跟踪文件做一次 stat，stat 与索引不一致（哪怕内容没变，例如构建/解压/拷贝改过 mtime）时还要读内容算哈希，因此它是 Θ(M) 的，与列表里有几条变更无关。三个动作把它从关键路径与重复成本里摘出来：
+  - **发布链并发**：`ProjectWorkspaceService.PublishAsync` 并发等待所有 `ContextChanged` 订阅者（每个订阅者都跑到，失败仍按单个/聚合异常上报并回滚）。此前顺序 await 让资源管理器的目录枚举排在源代码管理的 `git status`（+ `for-each-ref`×2、`log`、`stash list`、range `log`）之后，用户看到的「打开这个目录很慢」就是这条顺序。证据：`ProjectWorkspaceServiceTests`（慢订阅者仍被阻塞时快订阅者必须已跑完；失败订阅者不阻止其余订阅者）。
+  - **前台加载允许 git 写回索引**：`GitStatusReadOptions.AllowIndexWriteBack` 为真时读取端不再注入 `GIT_OPTIONAL_LOCKS=0`，并顺带 `-c core.untrackedCache=true`（索引内缓存，无守护进程）；全量加载（打开工作区、显式刷新）带该标志，静默刷新不带——静默刷新最高每 500ms 一次，若它自己写 `.git/index`，写事件会经 watcher 反过来触发下一轮刷新（前台那一轮已经把 stat/哈希持久化，静默读到的是热路径）。写回只发生在共享读槽内、且同一仓库同时只有一次全量加载（`_repositoryContextGate`），git 自己的 `.git/index.lock` 负责与其它 git 进程串行。证据：`GitServiceTests.GetStatusAsync_AllowIndexWriteBack_OmitsOptionalLocksAndMaintainsUntrackedCache`、`GitServiceTests.GetStatusAsync_WithoutIndexWriteBack_StillDisablesOptionalLocks`、`GitViewModelTests.FullLoad_AllowsIndexWriteBack_SilentRefreshDoesNot`。
+  - **首屏先用 `-unormal`，折叠条目必须补齐**：工作区首次全量加载先发 `--untracked-files=normal`（不遍历未跟踪目录里的每个文件）拿到分支/已跟踪变更/计数；若快照里出现被折叠的未跟踪目录（`GitRepositoryStatus.HasCollapsedUntrackedDirectory`，即 `? dir/`）则不发布该条目（它会渲染成空名文件行，也无法单文件暂存/丢弃），并紧随一次静默 `-uall` 刷新换成逐文件条目；没有任何折叠目录时两种模式逐条等价，因此只有一次读取。证据：`GitViewModelTests.FirstLoad_CollapsedUntrackedDirectory_IsRefinedByAnAllUntrackedRead`、`GitViewModelTests.WatcherDrivenSilentRefresh_ListsEveryUntrackedFileInNewFolders`。
+- **读一个字段不得重算整棵工作树，watcher 溢出不得升级为全量加载（M 维度的重复成本）**：丢弃全部更改只需要未跟踪集合，改走 `ls-files --others --exclude-standard`（不刷新索引）并保留一条 `restore --worktree/--staged --worktree -- .`；推送只需要当前分支名，改走 `rev-parse --abbrev-ref HEAD`（失败路径才补一次 `--is-inside-work-tree` 以区分"分离 HEAD"与"不是仓库"）。此前这三个写操作各自先跑一次完整 `git status`，紧接着视图层刷新又跑一次，一次点击就是两三遍全库扫描。`IsGitRepositoryWatcher` 的缓冲溢出/监视器错误只意味着"丢掉了具体路径"，不再把静默刷新升级成 status + 6 个 git 进程的全量加载——状态读取本身就是权威快照，HEAD 真的移动时仍由 HEAD 签名比较升级。证据：`GitServiceTests.DiscardAll_ReadsUntrackedListWithoutAFullStatus`、`GitServiceTests.DiscardAllUnstaged_ReadsUntrackedListWithoutAFullStatus`、`GitServiceTests.PushAsync_ResolvesBranchWithoutAStatusRead`、`GitServiceTests.PushAsync_DetachedHead_IsRefusedWithoutAStatusRead`、`GitViewModelTests.WatcherOverflow_DoesNotEscalateToFullLoad`（对照：`GitViewModelTests.SilentRefresh_HeadMoved_EscalatesToFullReload`）。
 
 「环境管理」页（`EnvironmentManagementViewModel`）的二级左侧栏是分区列表（概览/运行库/开发工具/软件包/缓存管理），主内容区显示所选分区页——与资源管理器/源代码管理/项目管理共用同一套侧栏机制，实现资源使用统一。
 
 资源管理器与共享编辑器区以 VS Code 工作台的方式整合在一个「编辑器组」内：
 
-- **共享编辑器区**（`EditorAreaViewModel`/`EditorAreaView`）：资源管理器与源代码管理页共用同一单例，资源管理器打开文件 → 只读内容标签（`FilePreviewTab`），源代码管理选中更改/提交文件 → `DiffTab`（行内/分栏布局，容量分层见 13.2，流式加载见 13.5）。diff 标签有明确的「加载中 / 无差异 / 有差异」三态：加载完成后即使为空（二进制、空文件或失败）也会退出「加载 diff 中…」空状态。资源管理器的「查看更改」用 `GitViewModel.RepositoryPath` + `Explorer.GetGitInfo` 构造 `GitDiffRequest` 后同样送入共享编辑器。
+- **共享编辑器区**（`EditorAreaViewModel`/`EditorAreaView`）：资源管理器与源代码管理页共用同一单例，资源管理器打开文件 → 只读内容标签（`FilePreviewTab`），源代码管理选中更改/提交文件 → `DiffTab`（行内/分栏布局，容量分层见 13.2，流式加载见 13.5）。该模块按职责分文件（均为纯移动，类型名与 namespace 未变）：`EditorAreaViewModel.cs`（标签编排、布局持久化、窗口化/重载协调）、`EditorTabModels.cs`（`EditorTabItem` 基类与 `EditorFoldRequest`/`BreadcrumbSegment` 等模型）、`FilePreviewTab.cs`、`DiffTab.cs`（后两者是 `: EditorTabItem` 的独立顶层类型）。diff 标签有明确的「加载中 / 无差异 / 有差异」三态：加载完成后即使为空（二进制、空文件或失败）也会退出「加载 diff 中…」空状态。资源管理器的「查看更改」用 `GitViewModel.RepositoryPath` + `Explorer.GetGitInfo` 构造 `GitDiffRequest` 后同样送入共享编辑器。
 - **资源管理器 Git 装饰**：`WorkspaceViewModel.ApplyGitStatus` 把 `GitRepositoryStatus`（暂存/未暂存/未跟踪）映射为 `relativePath → (字母, staged/untracked)`，`WorkspaceNode` 通过共享的 `WorkspaceStatusSource` 在懒加载树的节点上渲染状态字母（M/A/D/? 等，颜色对齐 diff 配色）与「含更改」文件夹圆点；状态来源为 `GitViewModel.StatusRefreshed`（源代码管理页每次刷新后触发），由 `ExplorerPageViewModel` 接线驱动装饰。相对路径统一使用 `/` 分隔以匹配 git 输出。资源管理器行交互符合 VS Code：单击文件夹行切换展开/折叠（由视图层处理，勾选箭头仍可用），单击文件行在共享编辑器区打开展示标签。
 
 | 页面 | 接入能力 |
@@ -365,20 +404,31 @@ Dashboard 同时承担任务中心职责：根据持久化的项目健康状态�
 - Winget 双语表格解析（golden fixtures：真实中文清单含 spinner/进度条噪声、英文表头、无可用列、截断名、无结果消息、未知表头回退）、结构化 JSON 契约、截断名回查并发/去重性能回归、无匹配退出码语义与本地化消息。
 - `Nornia.yaml` 初始化与读取。
 - 环境检查的 PASS、WARNING、FAIL。
-- 前缀与比较器版本范围、预发布拒绝、无效约束和 Runtime 发行后缀。
+- 前缀与比较器版本范围、预发布拒绝、无效约束和 Runtime 发行后缀（`VersionConstraintTests`）；版本「取最新」的数值序（`VersionOrderTests`：跨 9→10、`MaxByVersion`、空值）。
 - 修复计划、仅手动项和显式执行后库存刷新。
 - Provider 失败时仍可返回其他 Provider 的扫描结果。
 - UTF-8 外部进程输出、取消外部进程、Winget 查询进度转发。
-- SQLite 重复初始化、旧库升级、Runtime/Package 快照状态、日志过期清理，以及项目配置/绑定、路径缺失保留和显式移除。
+- SQLite schema 生命周期（`SchemaMigrationTests`：重复调用 `CreateSchemaAsync` 安全、废弃日志表只在版本落后时清理一次、带重复 path 的旧库能被去重并成功建唯一索引）、Runtime/Package 快照状态，以及项目配置/绑定、路径缺失保留和显式移除。
+- CLI 命令契约（`RuntimeCommandsTests`/`CliCommandContractTests`/`CliRollbackCommandTests`）：`runtime list` 空库首启的输出、参数校验必须发生在服务调用之前、`env rollback` 的预览/执行/失败退出码与手动提示透出。
 - 统一外壳与资源管理器整合：打开项目同步四处（资源管理器/终端/Git 仓库/项目登记）、共享编辑器标签（文件预览与 diff）、资源管理器 Git 状态字母与“含更改”文件夹圆点（`ApplyGitStatus` 由 `GitViewModel.StatusRefreshed` 驱动）。
 - 工作台标签条（`WorkbenchViewModelTests`/`WorkbenchMainViewModelTests`/`WorkbenchTabCapabilitiesTests`）：页面/文档混合标签、重复打开激活不复制、关闭族（其他/右侧/未固定）、固定标签豁免、预览转正、拖拽重排回写共享编辑器顺序、标签键去重。
 - 代码编辑器（`CodeWorkbenchServiceTests`/`CodeFoldingAndViewStateTests`/`CodeOutlineAndOptionsTests`/`CodeFindNavigationTests`/`LanguagePresentationAndDiffTests`）：TextMate 分词与语言目录、快照版本门控与缓存容量、折叠区间（括号/JSON 数组/XML/缩进/Markdown）与折叠态恢复、大纲与选项、搜索匹配/计数器/跳转、行内差异构建的边界与回退、迷你地图几何映射、阅读态（滚动/光标/折叠/搜索词）往返。
+- 编辑器查找引擎（`DiffTextSearchTests`）：按行模型扫描、并排旧/新双栏按（行号，旧在前）合并顺序、1 万条上限、环形步进（无当前命中时向后从头/向前从尾）、空查询与非法上限的早退。
 - 设置系统（`tests/Nornia.Settings.Tests` + `SettingsCenterTests`）：JSONC 解析/补丁保留注释与 BOM/换行、作用域解析优先级与非法作用域诊断、提交（验证失败/文件错误/乐观修订冲突）、重置、外部变更观察与会话键过滤、旧版 `settings.json` 一次性迁移与备份。
 - 命令平台与快捷键（`MainViewModelTests`/`QuickInputViewModelTests` 等）：命令注册/When 表达式解析、快捷键归一化/和弦/冲突检测/三方合并保存、命令面板与快速打开的模糊过滤与文件枚举上限。
 - Git（`GitViewModelTests`/`GitRepositoryWatcherTests`）：树状/平铺布局与多选批量命令、传入/传出净文件影响、贮藏 pop/drop、拉取/推送策略、日志分页与复制、监视器路径过滤/抑制窗口/去抖/错误降级。
-- 修复与回滚（`TrackedEnvironmentRepairExecutorTests`）：correlation_id 批次日志、逐步失败不中断、取消中断与汇总、回滚计划逆序与手动策略提示。
+- 修复与回滚（`TrackedEnvironmentRepairExecutorTests`/`EnvironmentRollbackServiceTests`）：correlation_id 批次日志与返回值一致、逐步失败不中断、取消原样上抛且不写该步日志、回滚计划逆序、自动/手动双策略、单步失败进入 `Failures` 而不中断批次。
+- 接口契约护栏（`FakeContractGuardrailTests`）：反射采集 Nornia 接口中带默认实现的成员，必须恰好等于已登记的集合——新增默认实现必须是有意决定（本项目对 `IProcessRunner`/`IGitService` 的流式方法刻意使用 DIM，见 13.6）。
 - 软件包加固（`WingetProviderHardeningTests`/`RuntimePackageResolverTests`）：`0x8A150016` 多实例按版本逐个卸载回退、无匹配卸载提示、spinner 噪声、Windows App Runtime 包 Id 推导。
 - 设计系统守卫（`DesignSystemResourceTests`）：三主题令牌集合一致、所有 `DynamicResource` 键可解析到令牌、视图无硬编码字号字面量（新增字号令牌须在 App.xaml/`UiFontService`/测试清单三处同步）、菜单与下拉弹出层无白底、文件图标透明底 + 等宽槽位、语法高亮调色板主题化与对比度、标题栏命令中心令牌三主题齐备与窗口控制紧凑字号。
+
+- 架构约束守卫（`ArchitectureGuardrailTests`）：ViewModel 层不得直取 WPF 调度器（去注释后按**词首**正则匹配 `Application.Current`/`Dispatcher.CurrentDispatcher`/`DispatcherTimer`/`DispatcherPriority`，避免命中自家的 `UiDispatcherPriority`）、版本排序必须显式传 `VersionOrder.Comparer`、侧栏视图只能由 `App.xaml` 隐式 DataTemplate 定位（窗口 code-behind 不得再有「页 VM 类型 → 视图类型」判断链）、「刷新当前页」不得退回窗口类型 switch；另有一条自检断言确实枚举到了足量生产源文件，防止守卫因目录/文件名变化而静默空转。
+
+**行为测试与守卫测试要分开看。** 上表中 `DesignSystemResourceTests`（约 88 例 / 近 2000 行纯 XAML 文本断言）、`CompositionTests` 的「逐个 `Assert.NotNull` 解析」、`FakeContractGuardrailTests` 以及 `ArchitectureGuardrailTests` 都属于**守卫测试**：它们断言的是「文本/接线存在」而不是「行为正确」，价值在于把某一类回归变成红灯（例如主题缺令牌会让 `DynamicResource` 崩溃、接口新增默认实现会被静默继承、VM 悄悄回去直取 `Dispatcher`），代价是耦合仓库目录结构与接口形状——移动 XAML 文件或重命名接口成员会使其失效。统计覆盖率时不应把它们与行为测试混为一谈。
+
+对这类守卫有两条硬性要求（已在实践中踩到）：① 源文件必须**按目录聚合读取**而不是逐个硬编码路径（`EditorAreaViewModel` 拆成 4 个文件时，9 处按单文件读取的断言当场失效）；② 必须配一条自检断言确认「确实枚举到了足够多的源文件」，否则目录改名会让守卫静默空转、看起来仍然全绿。
+
+**时序测试不写墙钟断言。** 需要等待异步信号时一律用「截止时间轮询」（`while (!condition && DateTime.UtcNow < deadline)`），而不是「固定 `Thread.Sleep` 后断言」；需要断言节流/去抖性能时把间隔做成可注入参数（如 `GitViewModel.QuietRefreshMinimumIntervalMs`），断言「节流生效」而不是「跑得够快」——后者在负载稍高的 CI 上必然偶发失败。
 
 涉及安装、卸载的测试只验证命令参数，不真实修改开发机。发布前应在隔离 Windows VM 中增加 Winget 集成测试；集成测试断言语言无关（先探测表头语言再断言），并记录探针实测的无匹配退出码与结构化输出支持，供兼容矩阵积累。
 
@@ -387,7 +437,7 @@ Dashboard 同时承担任务中心职责：根据持久化的项目健康状态�
 建议后续按以下顺序推进：
 
 1. 扩展专用 Runtime Provider（如 Go、Rust 工具链）与更多软件包渠道。
-2. 以现有 Core 接口为能力边界实现 MCP Server。
+2. 以现有 Core 接口为能力边界实现 MCP Server。真正的门槛是全仓 TFM `net10.0-windows` 与 Provider 的 Windows 依赖；届时可一并评估是否把 `ProcessRunner`/`BulkObservableCollection`/`RunOnceScheduler` 下沉到独立程序集（本次裁决为推迟，理由见 `docs/refactor-plan.md` §6.0）。
 
 源码阅读侧的全局搜索只作为只读项目观察能力维护：搜索当前工作区、增量展示结果、固定上限并支持取消。暂不扩展为跨文件替换、全文索引、搜索编辑器或完整代码编辑器。
 
@@ -549,6 +599,8 @@ Dashboard 同时承担任务中心职责：根据持久化的项目健康状态�
 
 `QuickInputViewModel` 是纯逻辑 QuickInput（无 WPF 依赖，可单测）：顶居中输入框 + 可过滤列表；过滤 = 子串（标题/详情）或标题模糊子序列（VS Code 风格）；首项预选使 Enter 立即确认。命令面板行 = 注册表命令（标题 · 分类 · Id · 主绑定），快速打开行 = 工作区文件枚举（上限 5000，跳过 `.git`/`bin`/`obj`/`node_modules`/`.vs`/`packages` 与不可读目录），选中即打开预览标签。
 
+**输入框聚焦时的快捷键归属（VS Code 语义）。** 只有与文本编辑**冲突**的按键让位给控件本身：`Ctrl+A`（全选）与 `Ctrl+C`（复制）带 `!inputFocus`，分发器不消费它们，由 TextBox/AvalonEdit/终端各自完成原生行为。其余应用快捷键——关闭活动编辑器（Ctrl+W）、上/下一个编辑器（Ctrl+PgUp/PgDn）、最近编辑器（Ctrl+Tab/Ctrl+Shift+Tab）、拆分（Ctrl+\/Ctrl+Shift+\）、切换编辑器组（Ctrl+K Ctrl+←/→）——在输入框聚焦时**照常分发**，只用 `!terminalFocus` 把终端自己的按键排除在外（终端是按键汇而不是文本输入框，Ctrl+Tab/Ctrl+\ 等必须留给 shell）。此前这些绑定都带 `!inputFocus`，于是"焦点在输入框"会让半套应用快捷键静默失效，且失效名单与冲突与否无关。焦点条件只用于按键分发、不用于命令可用性：命令面板是独立 Popup，窗口的焦点刷新不会在它上面运行，打开面板时 `inputFocus` 保持为真，因此 `copyFocused`/`selectAllFocused` 的 `Enablement` 为空（否则这两个命令在面板里永远灰着；它们的执行体本来就按当前焦点元素决定是否动作）。证据：`CommandShortcutFocusPolicyTests`（用生产注册表 + 生产绑定表断言：输入框聚焦时 Ctrl+W/Ctrl+PgUp/PgDn/Ctrl+Tab/Ctrl+\/Ctrl+K Ctrl+→ 仍被消费且 Ctrl+W 真的关掉活动标签、Ctrl+A/C 不被消费、terminalFocus 时导航与拆分不被劫持、焦点条件不置灰命令）。
+
 ## 16. 源代码阅读标签页与 Diff 标签页（VS Code 阅读体验镜像）
 
 两条阅读标签页以 vscode-main 为蓝本实现 VS Code 的**只读阅读体验**（明确不模仿编辑能力：无光标编辑/撤销/保存/智能感知；阅读器 IsReadOnly + 容量分层见 13.2）。
@@ -584,7 +636,7 @@ Dashboard 同时承担任务中心职责：根据持久化的项目健康状态�
 - **改行 modified 着色**：并排构建时对"old=Removed ∧ new=Added"的同行对标记 `IsModified`，但两侧仍分别以 Removed 红色 / Added 绿色整行渲染（`DiffModifiedBrush` 仅作无具体侧类型时的回退，三主题同步，`DesignSystemResourceTests` 守卫）。行号右侧原有的变更加粗实线（3px，`EditorGutterAddedBrush`/`EditorGutterDeletedBrush`/`DiffModifiedBarBrush`）已按需求移除，变更识别由整行着色 + 行号区 ± 符号列承担（对应令牌保留在主题中，仍受守卫）。
 - diff 右击菜单：复制 / 全选 / 复制全部（统一 Diff）/ 在代码标签页打开文件（`DiffTab.OpenInCodeRequested` → `OpenFileAsync`）；状态条含光标 Ln/Col（聚焦面驱动）。
 - **忽略行尾空白**：diffEditor.ignoreTrimWhitespace 设置 + 工具栏切换（DiffTab.ToggleIgnoreWhitespaceCommand），真实按 --ignore-space-at-eol 重算（IGitService/GitService 流式方法均支持，测试桩默认实现忽略该标记）。
-- **Diff 内查找**：顶部查找栏（IsFindBarOpen 切换）对统一文本搜索（忽略大小写），全部匹配高亮 + 当前行强调（DiffFindRenderer），Enter/F3 下一条、Shift+F3 上一条、Esc 关闭；并排模式下同步滚动两侧到对应旧/新行号。
+- **Diff 内查找**：顶部查找栏（IsFindBarOpen 切换）对统一文本搜索（忽略大小写），全部匹配高亮 + 当前行强调（DiffFindRenderer），Enter/F3 下一条、Shift+F3 上一条、Esc 关闭；并排模式下同步滚动两侧到对应旧/新行号。查找**引擎**在 `Code/DiffTextSearch.cs`（纯字符串逻辑、零 WPF 依赖、可单测）：按行模型扫描（内联统一行模型，并排分旧/新两侧）、并排双栏按（行号，旧在前）合并排序使 F3 自上而下不折返、环形步进；匹配语义复用共享的 `ITextSearchService`，上限由 `SearchLimits.MaximumFindMatches` 唯一定义（此前视图里散落 5 处硬编码 `10_000`、VM 里另有一份）。视图只负责把匹配坐标翻译成 AvalonEdit 文档偏移并渲染。
 - 其余遵循 VS Code `diffEditor` 选项族：错误/警告概览装饰留待文件级诊断数据模型（UiLogEntry 目前无文件/行字段）。
 
 ### 16.6 快速打开前缀模式

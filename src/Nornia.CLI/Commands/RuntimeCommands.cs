@@ -1,4 +1,4 @@
-using Nornia.CLI.Localization;
+﻿using Nornia.CLI.Localization;
 using Nornia.Core.Interfaces;
 using Nornia.Core.Models;
 
@@ -14,20 +14,22 @@ public sealed class RuntimeListCommand(CliServices services) : ICommand
     public async Task<int> ExecuteAsync(IReadOnlyList<string> args, CancellationToken cancellationToken)
     {
         var runtimes = await services.RuntimeInventory.GetPersistedAsync(cancellationToken);
-        var runtimeComponents = runtimes.Where(CliServices.IsRuntime).ToArray();
-        if (runtimeComponents.Length == 0)
+        if (!runtimes.Any(CliServices.IsRuntime))
         {
+            // 持久化快照缺少运行库时回落到强制重扫。过滤必须发生在这次刷新之后,
+            // 否则会用刷新前的旧结果渲染(空库首启时该结果为空)。
             runtimes = await services.RuntimeInventory.RefreshForcedAsync(cancellationToken);
         }
 
-        if (runtimes.Count == 0)
+        var runtimeComponents = runtimes.Where(CliServices.IsRuntime).ToArray();
+        if (runtimeComponents.Length == 0)
         {
             Console.WriteLine(CliText.Get("Runtime_None"));
             return 0;
         }
 
         Console.WriteLine("NAME\tVERSION\tPATH");
-        foreach (var runtime in runtimeComponents.OrderBy(runtime => runtime.Name).ThenBy(runtime => runtime.Version))
+        foreach (var runtime in runtimeComponents.OrderBy(runtime => runtime.Name).ThenBy(runtime => runtime.Version, VersionOrder.Comparer))
         {
             Console.WriteLine($"{runtime.Name}\t{runtime.Version}\t{runtime.InstallPath}");
         }
@@ -76,7 +78,7 @@ public sealed class RuntimeInstallCommand(CliServices services) : ICommand
     {
         if (args.Count < 2)
         {
-            throw new ArgumentException($"Usage: Nornia {CliCommands.Runtime} {CliCommands.Install} <name> <version>");
+            throw new CliUsageException($"Usage: Nornia {CliCommands.Runtime} {CliCommands.Install} <name> <version>");
         }
 
         name = args[0];

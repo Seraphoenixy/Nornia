@@ -30,6 +30,7 @@ public sealed class CompositionTests
         Assert.NotNull(provider.GetRequiredService<IEnvironmentProfileService>());
         Assert.NotNull(provider.GetRequiredService<IEnvironmentRepairPlanner>());
         Assert.NotNull(provider.GetRequiredService<IEnvironmentRepairExecutor>());
+        Assert.NotNull(provider.GetRequiredService<IEnvironmentRollbackService>());
         Assert.NotNull(provider.GetRequiredService<IProjectCatalogService>());
         Assert.NotNull(provider.GetRequiredService<IProjectLauncher>());
         Assert.NotNull(provider.GetRequiredService<IGitService>());
@@ -59,6 +60,7 @@ public sealed class CompositionTests
 
         Assert.NotNull(provider.GetRequiredService<CommandDispatcher>());
         Assert.NotNull(provider.GetRequiredService<CliServices>());
-        Assert.Equal(23, provider.GetServices<ICommand>().Count());
+        // 24 = 23 个原有命令 + env rollback（撤销修复批次的入口）。
+        Assert.Equal(24, provider.GetServices<ICommand>().Count());
     }
 }

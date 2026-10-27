@@ -253,9 +253,13 @@ public sealed class ProjectNavigationContextTests
         var vm = CreateForNavigation();
 
         vm.ApplyNavigationContext(new NavigationContext.RepairProject(@"C:\Code\Match"));
-        // Give the fire-and-forget task a short window so the catalog load and SelectedProject
-        // assignment runs. We never want the test to be slow, so keep it minimal.
-        await Task.Delay(30);
+        // 目录加载与 SelectedProject 赋值是 fire-and-forget 的续延;轮询到它落地(而不是 sleep
+        // 一个"应该够了"的时长,那在负载稍高的 CI 上会误报)。
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (vm.SelectedProject is null && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(15);
+        }
 
         Assert.NotNull(vm.SelectedProject);
         Assert.Equal("Match", vm.SelectedProject.Name);

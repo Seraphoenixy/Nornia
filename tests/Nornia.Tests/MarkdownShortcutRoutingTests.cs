@@ -27,8 +27,11 @@ public sealed class MarkdownShortcutRoutingTests : IDisposable
     }
 
     [Fact]
-    public async Task F3_FromRenderedMarkdown_IsHandledByFilePreview()
+    public async Task F3_FromRenderedMarkdown_ReachesWindowLevelDispatch()
     {
+        // F3/Ctrl+F 的键位归属已上移到命令平台(editor.action.findNext 等,窗口级键绑定分发,
+        // 可在 keybindings.json 重绑)。视图层的新契约是"不得吞键":Markdown 渲染面收到 F3 时
+        // 保持 Handled=false,事件才能继续隧道到 MainWindow 的分发器。
         var path = Path.Combine(_directory, "shortcut.md");
         await File.WriteAllTextAsync(path, "# Root\n\nsearchable text");
         var tab = new FilePreviewTab(path, TextDocumentDecoder.Instance, CodeFileTypeRegistry.Instance);
@@ -55,7 +58,7 @@ public sealed class MarkdownShortcutRoutingTests : IDisposable
             handled = args.Handled;
         });
 
-        Assert.True(handled);
+        Assert.False(handled);
     }
 
     public void Dispose()

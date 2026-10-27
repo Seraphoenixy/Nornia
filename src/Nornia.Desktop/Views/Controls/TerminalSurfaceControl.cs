@@ -307,8 +307,15 @@ public sealed class TerminalSurfaceControl : FrameworkElement
 
             // T2: 行视觉内容与 y 坐标解耦 —— 缓存回放与重排都经平移变换定位,滚动只改
             // y 映射,不再整行缓存失效(旧实现滚轮每格 _layoutEpoch++ 全屏重排)。
+            // 原子读取:line/text/version 同源(见 TerminalScreen.GetLineWithText),避免
+            // 输出泵在三次独立加锁之间写入导致的 cells 与字符错位(终端乱码根因)。
             var y = visualRow * _cellHeight;
-            var version = screen.GetLineVersion(lineIndex);
+            var (line, text, version) = screen.GetLineWithText(lineIndex);
+            if (line is null)
+            {
+                continue;
+            }
+
             if (_rowRenderCache.TryGetValue(lineIndex, out var cache) &&
                 cache.Version == version &&
                 cache.TypefaceEpoch == _typefaceEpoch &&
@@ -332,13 +339,6 @@ public sealed class TerminalSurfaceControl : FrameworkElement
                 continue;
             }
 
-            var line = screen.GetLine(lineIndex);
-            if (line is null)
-            {
-                continue;
-            }
-
-            var text = screen.GetRenderedLine(lineIndex) ?? string.Empty;
             var visual = RenderLine(line, text);
             if (_rowRenderCache.Count >= MaxRowRenderCache)
             {
@@ -447,10 +447,9 @@ public sealed class TerminalSurfaceControl : FrameworkElement
                     if (cell.Char == '\0')
                     {
                         // Internal NULs are real empty cells (or the continuation cell of a wide
-                        // character). The latter is consumed together with its head below.
+                        // character): neither produces text. Consume the column only.
                         FlushTextSegment(column, textIndex);
                         column++;
-                        textIndex++;
                         continue;
                     }
 
@@ -461,10 +460,8 @@ public sealed class TerminalSurfaceControl : FrameworkElement
                         var brush = cell.Foreground != 0 ? ColorBrush(cell.Foreground) : foreground;
                         DrawTextRun(context, cell.Char.ToString(), column, typeface, brush, dpi);
                         column += 2;
-                        // GetRenderedLine retains the internal NUL continuation when another
-                        // character follows the wide glyph, but trims it when this is the last
-                        // visible cell.
-                        textIndex = Math.Min(text.Length, textIndex + 2);
+                        // 宽字符在文本中只占一个码位(延续格已由 LineToText 跳过)。
+                        textIndex++;
                         continue;
                     }
 
@@ -826,12 +823,15 @@ public sealed class TerminalSurfaceControl : FrameworkElement
         var maxOffset = Math.Max(0, screen.TotalLines - visibleRows);
         // 标准滚轮一格 delta=120 → 3 行(与 Windows Terminal/VS Code 惯例一致);
         // 触控板小 delta 按比例缩放,非零 delta 至少滚 1 行。
+        // 方向约定(与 WPF ScrollViewer / MarkdownPreviewView 一致):delta>0 = 滚轮向上 =
+        // 显示更旧(更高索引)的历史行 ⇒ _scrollOffset 增大;delta<0 = 滚轮向下 ⇒ 减小。
+        // 旧实现写成 _scrollOffset - wheelLines,导致滚动方向与滚轮相反,已修正为正号。
         var wheelLines = (int)Math.Round(e.Delta * 3.0 / 120.0, MidpointRounding.AwayFromZero);
         if (wheelLines == 0)
         {
             wheelLines = Math.Sign(e.Delta);
         }
-        var newOffset = Math.Clamp(_scrollOffset - wheelLines, 0, maxOffset);
+        var newOffset = Math.Clamp(_scrollOffset + wheelLines, 0, maxOffset);
         if (newOffset != _scrollOffset)
         {
             _scrollOffset = newOffset;
@@ -896,7 +896,9 @@ public sealed class TerminalSurfaceControl : FrameworkElement
         // Visual top (max) to bottom (min)
         for (var lineIndex = maxIndex; lineIndex >= minIndex; lineIndex--)
         {
-            if (screen.GetLine(lineIndex) is not { } line)
+            // 原子读取:line 与 text 同源,避免 cells 与字符错位(与 OnRender 共用 GetLineWithText)。
+            var (line, renderedText, _) = screen.GetLineWithText(lineIndex);
+            if (line is null)
             {
                 continue;
             }
@@ -931,8 +933,7 @@ public sealed class TerminalSurfaceControl : FrameworkElement
             if (start == 0 && endCol == line.Length)
             {
                 // T8: 整行选择复用屏幕行文本缓存(渲染与复制共用),不再逐行物化字符数组。
-                var cached = screen.GetRenderedLine(lineIndex)?.TrimEnd() ?? string.Empty;
-                builder.Append(cached);
+                builder.Append(renderedText.TrimEnd());
                 continue;
             }
 

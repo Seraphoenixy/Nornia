@@ -73,6 +73,43 @@ public sealed class FilePreviewReloadTests : IDisposable
         }
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FileChange_RefreshesSourceAndDiffSharingTheSameFile(bool permanent)
+    {
+        var watcher = new FakeFileContentWatcher();
+        var git = new FakeGitService
+        {
+            DiffResult = new GitFileDiff("a.txt", null, false, false, false,
+                [new GitDiffHunk(1, 1, 1, 1, "@@ -1 +1 @@",
+                    [new GitDiffLine(GitDiffLineKind.Added, null, 1, "v1")])])
+        };
+        var editor = new EditorAreaViewModel(git, new FakeUiLogService(), watcher);
+        var file = Write("a.txt", "v1");
+        await editor.OpenFileAsync(file, permanent: true);
+        var source = Assert.IsType<FilePreviewTab>(editor.SelectedTab);
+        await editor.OpenDiffAsync(new GitDiffRequest(_tempDir, "a.txt", false, false, IsPreview: !permanent));
+        var diff = Assert.IsType<DiffTab>(editor.SelectedTab);
+        Assert.Contains(file, watcher.Watched);
+        var initial = git.DiffRequests.Count;
+        git.DiffResult = git.DiffResult with
+        {
+            Hunks = [new GitDiffHunk(1, 1, 1, 1, "@@ -1 +1 @@",
+                [new GitDiffLine(GitDiffLineKind.Added, null, 1, "v2")])]
+        };
+        git.DiffRevision = "revision-2";
+        File.WriteAllText(file, "v2");
+        watcher.Raise(file);
+        await WaitUntilAsync(() => source.Content == "v2" && diff.DiffLines.Any(x => x.Text == "v2"),
+            "文件变更未同时刷新源码与 Diff");
+        Assert.Equal(initial + 1, git.DiffRequests.Count);
+        editor.CloseTab(source);
+        Assert.DoesNotContain(file, watcher.Unwatched);
+        editor.CloseTab(diff);
+        Assert.Contains(file, watcher.Unwatched);
+    }
+
     [Fact]
     public async Task ExternalWrite_ReloadsOpenTabContent()
     {

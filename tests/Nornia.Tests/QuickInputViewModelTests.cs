@@ -68,6 +68,70 @@ public sealed class QuickInputViewModelTests
     }
 
     [Fact]
+    public void ModePrefix_LeadingGuideCharacterIsStrippedBeforeScoring()
+    {
+        var vm = Create(
+            new QuickPickItem("转到行…", "输入行号", Codicons.GoToFile, () => { }),
+            new QuickPickItem("文件B", "", Codicons.File, () => { }));
+
+        vm.ModePrefix = ':';
+        vm.FilterText = ":转到行";
+
+        // 引导字符 ':' 不参与匹配——此前 ":转到行" 永远过滤不出行项目。
+        Assert.Single(vm.View.Cast<QuickPickItem>());
+        Assert.Equal("转到行…", vm.View.Cast<QuickPickItem>().Single().Title);
+
+        // 无前缀输入时 ModePrefix 不影响普通过滤。
+        vm.FilterText = "文件B";
+        Assert.Single(vm.View.Cast<QuickPickItem>());
+        Assert.Equal("文件B", vm.View.Cast<QuickPickItem>().Single().Title);
+    }
+
+    [Fact]
+    public void Filter_SingleActionItemSurvivesMismatchedQuery()
+    {
+        var vm = Create(new QuickPickItem("转到行…", "输入行号", Codicons.GoToFile, () => { }));
+
+        // ':' 行模式的单动作兜底:行号 ":42" 与标题无关,唯一项保持可见可回车。
+        vm.ModePrefix = ':';
+        vm.FilterText = ":42";
+        Assert.Single(vm.View.Cast<QuickPickItem>());
+
+        // 多行面板不启用兜底(避免错误命中)。
+        var multi = Create(
+            new QuickPickItem("A", "", "", () => { }),
+            new QuickPickItem("B", "", "", () => { }));
+        multi.FilterText = "zzz";
+        Assert.Empty(multi.View.Cast<QuickPickItem>());
+    }
+
+    [Fact]
+    public void Filter_DetailFuzzyMatchesLatinCommandIds()
+    {
+        var vm = Create(new QuickPickItem("快速打开文件", "文件 · workbench.action.quickOpen · ctrl+p", "", () => { }));
+
+        // 拉丁关键字对中文标题只能走详情模糊档(命令 id 兜底),'>quick' 剥离前缀后 'quick' 命中 id。
+        vm.ModePrefix = '>';
+        vm.FilterText = ">quick";
+        Assert.Single(vm.View.Cast<QuickPickItem>());
+    }
+
+    [Fact]
+    public void ReplaceItems_ReFiltersAgainstCurrentQuery()
+    {
+        var vm = Create(new QuickPickItem("文件A", "", Codicons.File, () => { }));
+        vm.FilterText = "文件";
+
+        // 前缀模式切换到命令列表:换行集合后必须立即按当前查询重过滤,可见列表不得滞后一次击键。
+        vm.ReplaceItems([new QuickPickItem("命令X", "", Codicons.Menu, () => { })]);
+        Assert.Empty(vm.View.Cast<QuickPickItem>());
+
+        vm.FilterText = "命令";
+        Assert.Single(vm.View.Cast<QuickPickItem>());
+        Assert.Equal("命令X", vm.View.Cast<QuickPickItem>().Single().Title);
+    }
+
+    [Fact]
     public void Confirm_ExecutesSelectedAndCloses()
     {
         var executed = false;

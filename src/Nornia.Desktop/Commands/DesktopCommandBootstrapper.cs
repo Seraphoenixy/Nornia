@@ -32,28 +32,31 @@ public sealed class DesktopCommandBootstrapper(ICommandRegistry registry, IKeybi
         Add("workbench.action.toggleSidebarVisibility", "切换侧栏可见性", "视图", Codicons.LayoutSidebarLeft, "ctrl+b");
         Add("workbench.action.togglePanel", "切换面板", "视图", Codicons.LayoutPanel, "ctrl+j");
         Add("workbench.action.toggleMaximizedPanel", "最大化/恢复面板", "视图", Codicons.ChromeMaximize);
+        // 输入框(TextBox)只让出与文本编辑冲突的按键:全选/复制留给控件本身(原生 Ctrl+A/C),
+        // 其余应用快捷键在输入框聚焦时照常生效(VS Code 语义)——关闭标签、切换标签、最近标签、
+        // 拆分、切换编辑器组都不得因为"焦点在输入框"而静默失效;终端自己拥有键盘,故排除 terminalFocus。
         Add("workbench.action.splitEditorRight", "向右拆分编辑器", "视图", Codicons.SplitHorizontal, "ctrl+\\",
-            "!inputFocus || editorTextFocus");
+            "!terminalFocus");
         Add("workbench.action.splitEditorDown", "向下拆分编辑器", "视图", Codicons.SplitVertical, "ctrl+shift+\\",
-            "!inputFocus || editorTextFocus");
+            "!terminalFocus");
         Add("workbench.action.focusNextEditorGroup", "聚焦下一个编辑器组", "视图", Codicons.ChevronRight, "ctrl+k ctrl+right",
-            "!inputFocus");
+            "!terminalFocus");
         Add("workbench.action.focusPreviousEditorGroup", "聚焦上一个编辑器组", "视图", Codicons.ChevronLeft, "ctrl+k ctrl+left",
-            "!inputFocus");
-        Add("workbench.action.closeActiveEditor", "关闭活动编辑器", "视图", Codicons.Close, "ctrl+w",
-            "!inputFocus || editorTextFocus || terminalFocus");
-        Add("workbench.action.nextEditor", "下一个编辑器", "视图", Codicons.ChevronRight, "ctrl+pagedown",
-            "!inputFocus || editorTextFocus || terminalFocus");
-        Add("workbench.action.previousEditor", "上一个编辑器", "视图", Codicons.ChevronLeft, "ctrl+pageup",
-            "!inputFocus || editorTextFocus || terminalFocus");
+            "!terminalFocus");
+        Add("workbench.action.closeActiveEditor", "关闭活动编辑器", "视图", Codicons.Close, "ctrl+w");
+        Add("workbench.action.reopenClosedEditor", "重新打开已关闭的编辑器", "视图", Codicons.History, "ctrl+shift+t", "!terminalFocus");
+        Add("workbench.action.nextEditor", "下一个编辑器", "视图", Codicons.ChevronRight, "ctrl+pagedown");
+        Add("workbench.action.previousEditor", "上一个编辑器", "视图", Codicons.ChevronLeft, "ctrl+pageup");
         Add("workbench.action.openNextRecentlyUsedEditor", "下一个最近使用的编辑器", "视图", Codicons.History, "ctrl+tab",
-            "!inputFocus");
+            "!terminalFocus");
         Add("workbench.action.openPreviousRecentlyUsedEditor", "上一个最近使用的编辑器", "视图", Codicons.History, "ctrl+shift+tab",
-            "!inputFocus");
+            "!terminalFocus");
         Add("workbench.action.terminal.toggleTerminal", "切换终端", "终端", Codicons.Terminal, "ctrl+`");
         Add("workbench.action.terminal.new", "新建终端", "终端", Codicons.Terminal, "ctrl+shift+`");
-        Add("nornia.action.copyFocused", "复制所选内容", "编辑", Codicons.Copy, "ctrl+c", "!inputFocus && !terminalFocus");
-        Add("nornia.action.selectAllFocused", "全选当前列表", "编辑", Codicons.CheckAll, "ctrl+a", "!inputFocus");
+        Add("nornia.action.copyFocused", "复制所选内容", "编辑", Codicons.Copy, "ctrl+c", "!inputFocus && !terminalFocus",
+            dispatchOnly: true);
+        Add("nornia.action.selectAllFocused", "全选当前列表", "编辑", Codicons.CheckAll, "ctrl+a", "!inputFocus",
+            dispatchOnly: true);
         Add("workbench.action.terminal.clear", "清除终端", "终端", Codicons.ClearAll, "ctrl+shift+k", "terminalFocus");
         Add("workbench.action.terminal.focus", "聚焦终端", "终端", Codicons.Terminal, "ctrl+/");
         Add("workbench.action.terminal.kill", "关闭当前终端", "终端", Codicons.Close);
@@ -71,16 +74,34 @@ public sealed class DesktopCommandBootstrapper(ICommandRegistry registry, IKeybi
         for (var level = 1; level <= 6; level++)
             Add($"editor.foldLevel{level}", $"折叠到层级 {level}", "编辑", Codicons.CollapseAll, $"ctrl+k ctrl+{level}", "activeEditor == code && !markdownPreviewFocus");
         Add("editor.toggleStickyScroll", "切换吸顶滚动（Sticky Scroll）", "编辑", Codicons.Pin, "", "activeEditor == code && !markdownPreviewFocus");
+        Add("nornia.editor.changeEncoding", "为当前文件选择编码", "编辑", Codicons.Eye, "", "activeEditor == code");
+        Add("nornia.editor.toggleBlame", "切换 Blame 行注解", "编辑", Codicons.GitCommit, "", "activeEditor == code");
+        Add("nornia.git.showActiveFileHistory", "查看当前文件的提交历史", "源代码管理", Codicons.History);
+        Add("workbench.action.showAllEditors", "显示全部打开的编辑器…", "视图", Codicons.More);
         Add("workbench.action.gotoSymbol", "转到文件中的符号…", "文件", Codicons.SymbolFile, "ctrl+shift+o", "activeEditor == code && !markdownPreviewFocus");
-        Add("workbench.action.gotoLine", "转到行 / 列…", "文件", Codicons.GoToFile, "", "activeEditor == code && !markdownPreviewFocus");
+        Add("workbench.action.gotoLine", "转到行 / 列…", "文件", Codicons.GoToFile, "ctrl+g", "activeEditor == code && !markdownPreviewFocus");
+        // 查找三键此前硬编码在视图 code-behind(FilePreviewView/DiffDocumentView),用户无法重绑;
+        // 现在作为默认键位进命令平台,执行体路由到活动标签的同名命令。
+        Add("editor.action.startFind", "查找", "编辑", Codicons.Search, "ctrl+f",
+            "(activeEditor == code || activeEditor == diff) && !terminalFocus");
+        Add("editor.action.findNext", "查找下一个", "编辑", Codicons.ArrowDown, "f3",
+            "(activeEditor == code || activeEditor == diff) && !terminalFocus");
+        Add("editor.action.findPrevious", "查找上一个", "编辑", Codicons.ArrowUp, "shift+f3",
+            "(activeEditor == code || activeEditor == diff) && !terminalFocus");
 
         viewModel.AttachCommandPlatform(registry, keybindings);
     }
 
-    private void Add(string id, string title, string category, string glyph, string key = "", string? when = null) =>
+    /// <summary>注册一条默认快捷键命令。<paramref name="dispatchOnly"/> 用于"焦点条件只决定按键
+    /// 归属、不决定命令可用性"的绑定:把它写进 <c>Enablement</c> 会让命令在命令面板/菜单里被焦点
+    /// 上下文置灰——而命令面板自己的输入框也会让 <c>inputFocus</c> 为真(面板是独立 Popup,窗口的
+    /// 焦点刷新不会在它上面跑),那两个命令就会在面板里永远灰着。copyFocused/selectAllFocused 的
+    /// 焦点判断只在分发时做:执行体本身就是按当前焦点元素决定要不要动作的。</summary>
+    private void Add(string id, string title, string category, string glyph, string key = "", string? when = null,
+        bool dispatchOnly = false) =>
         registry.Register(new(id, title, category, glyph,
             string.IsNullOrWhiteSpace(key) ? [] : [new(key, id, when, IsDefault: true)],
-            execution => ExecuteAsync(id, execution), Enablement: when,
+            execution => ExecuteAsync(id, execution), Enablement: dispatchOnly ? null : when,
             MenuPlacements: [new("commandPalette", category)]));
 
     private async Task ExecuteAsync(string id, CommandExecutionContext execution)
@@ -105,6 +126,7 @@ public sealed class DesktopCommandBootstrapper(ICommandRegistry registry, IKeybi
             case "workbench.action.focusNextEditorGroup": viewModel.FocusNextEditorGroup(); break;
             case "workbench.action.focusPreviousEditorGroup": viewModel.FocusPreviousEditorGroup(); break;
             case "workbench.action.closeActiveEditor": viewModel.RouteCloseShortcut(terminalFocus); break;
+            case "workbench.action.reopenClosedEditor": await RunAsync(viewModel.Workbench?.Editor.ReopenClosedTabCommand); break;
             case "workbench.action.nextEditor": viewModel.RouteAdjacentTabShortcut(terminalFocus, 1); break;
             case "workbench.action.previousEditor": viewModel.RouteAdjacentTabShortcut(terminalFocus, -1); break;
             case "workbench.action.openNextRecentlyUsedEditor": viewModel.ShowEditorMruSwitcher(true); break;
@@ -127,10 +149,38 @@ public sealed class DesktopCommandBootstrapper(ICommandRegistry registry, IKeybi
                 if (viewModel.Workbench?.Editor.SelectedTab is FilePreviewTab stickyTab)
                     stickyTab.ShowStickyScroll = !stickyTab.ShowStickyScroll;
                 break;
+            case "nornia.editor.changeEncoding":
+                viewModel.OpenEncodingPicker(viewModel.Workbench?.Editor.SelectedTab); break;
+            case "nornia.editor.toggleBlame":
+                Run((viewModel.Workbench?.Editor.SelectedTab as FilePreviewTab)?.ToggleBlameCommand); break;
+            case "nornia.git.showActiveFileHistory":
+                Run(viewModel.ShowActiveFileHistoryCommand); break;
+            case "workbench.action.showAllEditors":
+                Run(viewModel.ShowAllEditorsCommand); break;
             case "workbench.action.gotoSymbol":
                 viewModel.OpenSymbolPicker(viewModel.Workbench?.Editor.SelectedTab); break;
             case "workbench.action.gotoLine":
                 Run((viewModel.Workbench?.Editor.SelectedTab as FilePreviewTab)?.OpenGoToLineBarCommand); break;
+            case "editor.action.startFind":
+                switch (viewModel.Workbench?.Editor.SelectedTab)
+                {
+                    case FilePreviewTab file: Run(file.OpenFindBarCommand); break;
+                    case DiffTab diff: Run(diff.OpenDiffFindBarCommand); break;
+                }
+                break;
+            case "editor.action.findNext":
+            case "editor.action.findPrevious":
+                var findDirection = id == "editor.action.findNext" ? 1 : -1;
+                switch (viewModel.Workbench?.Editor.SelectedTab)
+                {
+                    case FilePreviewTab file:
+                        Run(findDirection > 0 ? file.FindNextCommand : file.FindPreviousCommand);
+                        break;
+                    case DiffTab diff:
+                        Run(findDirection > 0 ? diff.FindNextCommand : diff.FindPreviousCommand);
+                        break;
+                }
+                break;
             default:
                 if (id.StartsWith("editor.foldLevel", StringComparison.Ordinal) &&
                     int.TryParse(id.AsSpan(id.LastIndexOf('.') + 1), out var foldLevel))

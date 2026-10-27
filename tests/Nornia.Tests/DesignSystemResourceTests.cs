@@ -1,4 +1,4 @@
-using System.Runtime.CompilerServices;
+﻿using System.Runtime.CompilerServices;
 using System.Text.RegularExpressions;
 
 namespace Nornia.Tests;
@@ -22,6 +22,32 @@ namespace Nornia.Tests;
 public sealed class DesignSystemResourceTests
 {
     private static readonly string RepoRoot = ResolveRepoRoot();
+    // 源文件读取缓存:本类 88+ 个用例各自整读多个大文件(MainWindow.xaml/视图后置数千行),
+    // 重复 IO 占了类耗时的大头——按绝对路径缓存一次即可(测试进程内文件不变)。
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> SourceCache = new(StringComparer.OrdinalIgnoreCase);
+
+    private static string ReadCachedFile(string path) =>
+        SourceCache.GetOrAdd(Path.GetFullPath(path), static p => File.ReadAllText(p));
+
+    private static string ReadSource(string relative) => ReadCachedFile(Path.Combine(RepoRoot, relative));
+
+
+    /// <summary>编辑器视图模型的源码全文。<c>EditorAreaViewModel</c> 已按职责拆成多个 partial 文件
+    /// (EditorAreaViewModel / EditorTabModels / FilePreviewTab / DiffTab),守卫断言必须跨文件,
+    /// 否则一次纯移动就会让断言失效——目录级读取让后续继续拆分不再需要改测试。</summary>
+    private static string EditorViewModelSources()
+    {
+        var directory = Path.Combine(RepoRoot, "src/Nornia.Desktop/ViewModels");
+        return string.Join(
+            "\n",
+            Directory.EnumerateFiles(directory, "*.cs")
+                .Where(path => IsEditorViewModelSource(Path.GetFileName(path)))
+                .OrderBy(path => path, StringComparer.Ordinal)
+                .Select(ReadCachedFile));
+    }
+
+    private static bool IsEditorViewModelSource(string fileName) =>
+        fileName is "EditorAreaViewModel.cs" or "EditorTabModels.cs" or "FilePreviewTab.cs" or "DiffTab.cs";
 
     private static readonly string[] ThemeFiles =
     [
@@ -190,26 +216,26 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void StatusLetterTriggers_BindToTextInsteadOfRowItem()
     {
-        var control = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/Controls/FileChangeStatusIndicator.xaml"));
-        var code = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/Controls/FileChangeStatusIndicator.xaml.cs"));
-        Assert.Contains("FileChangeStatusIndicator", File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml")));
-        Assert.Contains("FileChangeStatusIndicator", File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/WorkspaceView.xaml")));
+        var control = ReadSource("src/Nornia.Desktop/Views/Controls/FileChangeStatusIndicator.xaml");
+        var code = ReadSource("src/Nornia.Desktop/Views/Controls/FileChangeStatusIndicator.xaml.cs");
+        Assert.Contains("FileChangeStatusIndicator", ReadSource("src/Nornia.Desktop/Views/GitView.xaml"));
+        Assert.Contains("FileChangeStatusIndicator", ReadSource("src/Nornia.Desktop/Views/WorkspaceView.xaml"));
         Assert.Contains("SidebarFileStatusKind.Added", control);
         Assert.Contains("SidebarFileStatusKind.Conflict", control);
         Assert.Contains("\"A\" or \"?\"", code);
-        var workspace = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/WorkspaceView.xaml"));
+        var workspace = ReadSource("src/Nornia.Desktop/Views/WorkspaceView.xaml");
         Assert.Contains("WorkspaceFileNameStyle", workspace);
         Assert.Contains("WorkspaceFolderNameStyle", workspace);
         Assert.Contains("Value=\"M\"><Setter Property=\"Foreground\" Value=\"{DynamicResource ScmModifiedBrush}\"", workspace);
         Assert.Contains("Value=\"D\"><Setter Property=\"Foreground\" Value=\"{DynamicResource ScmDeletedBrush}\"", workspace);
         Assert.DoesNotContain("WorkspaceStatusLetterStyle", workspace);
-        Assert.DoesNotContain("ScmStatusLetterStyle", File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml")));
+        Assert.DoesNotContain("ScmStatusLetterStyle", ReadSource("src/Nornia.Desktop/Views/GitView.xaml"));
     }
 
     [Fact]
     public void DiffSummary_AddedAndRemovedCountsAreColoredSeparately()
     {
-        var diff = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/DiffDocumentView.xaml"));
+        var diff = ReadSource("src/Nornia.Desktop/Views/DiffDocumentView.xaml");
         // +N 绿色、−M 红色,不再整体一个颜色
         Assert.Contains("<Run Foreground=\"{DynamicResource DiffAddedTextBrush}\" Text=\"{Binding AddedCount, Mode=OneWay}\"", diff);
         Assert.Contains("<Run Foreground=\"{DynamicResource DiffRemovedTextBrush}\" Text=\"{Binding RemovedCount, Mode=OneWay}\"", diff);
@@ -218,7 +244,7 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void DiffToolbar_DoesNotExposeIgnoreWhitespaceButton()
     {
-        var diff = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/DiffDocumentView.xaml"));
+        var diff = ReadSource("src/Nornia.Desktop/Views/DiffDocumentView.xaml");
         Assert.DoesNotContain("ToggleIgnoreWhitespaceCommand", diff);
         Assert.DoesNotContain("忽略行尾空白（重算 Diff）", diff);
     }
@@ -226,7 +252,7 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void DiffLineNumberMargin_ColorsAddedAndRemovedByKind()
     {
-        var code = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/DiffDocumentView.xaml.cs"));
+        var code = ReadSource("src/Nornia.Desktop/Views/DiffDocumentView.xaml.cs");
         Assert.Contains("GitDiffLineKind.Added => _addedNumberBrush", code);
         Assert.Contains("GitDiffLineKind.Removed => _removedNumberBrush", code);
         Assert.Contains("_addedNumberBrush = _owner.Brush(\"SuccessBrush\")", code);
@@ -237,7 +263,7 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void DiffIntralineHighlight_UsesExactFillWithoutOutline()
     {
-        var code = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/DiffDocumentView.xaml.cs"));
+        var code = ReadSource("src/Nornia.Desktop/Views/DiffDocumentView.xaml.cs");
         Assert.Contains("DiffIntralineBackgroundRenderer", code);
         Assert.Contains("BackgroundGeometryBuilder.GetRectsForSegment", code);
         Assert.Contains("geometryBuilder.AddRectangle(textView, rect)", code);
@@ -250,12 +276,12 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void DiffEditors_DoNotAddSelectionPadding()
     {
-        var diff = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/DiffDocumentView.xaml"));
+        var diff = ReadSource("src/Nornia.Desktop/Views/DiffDocumentView.xaml");
         Assert.Equal(3, Regex.Matches(diff, "<av:TextEditor ").Count);
         Assert.Equal(3, Regex.Matches(diff, "Padding=\"0\"").Count);
         Assert.DoesNotContain("Padding=\"8,4,8,4\"", diff);
 
-        var code = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/DiffDocumentView.xaml.cs"));
+        var code = ReadSource("src/Nornia.Desktop/Views/DiffDocumentView.xaml.cs");
         Assert.Contains("editor.TextArea.SelectionBorder = null", code);
         Assert.Contains("editor.TextArea.SelectionCornerRadius = 0", code);
     }
@@ -265,14 +291,14 @@ public sealed class DesignSystemResourceTests
     {
         // 提交图形泳道的六色调色板必须来自三主题共有的 GraphLane*Brush 令牌,
         // 不得回退到语义状态刷(蓝×2、深红在暗色侧栏不可见等旧问题)。
-        var cell = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/Controls/GitGraphCell.cs"));
+        var cell = ReadSource("src/Nornia.Desktop/Views/Controls/GitGraphCell.cs");
         foreach (var key in new[] { "GraphLane1Brush", "GraphLane2Brush", "GraphLane3Brush", "GraphLane4Brush", "GraphLane5Brush", "GraphLane6Brush" })
         {
             Assert.Contains(key, cell);
         }
 
         // 泳道几何与视图列宽同源:模板列宽注释引用 GitGraphLayout.CellWidth,二者不得漂移。
-        var gitView = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
+        var gitView = ReadSource("src/Nornia.Desktop/Views/GitView.xaml");
         Assert.Contains("GitGraphLayout.CellWidth", gitView);
         Assert.Contains("row.DotDashed ? DashStyles.Dash : DashStyles.Solid", cell);
         Assert.Contains("<Run Text=\"{Binding SyncTarget, Mode=OneWay}\"", gitView);
@@ -282,8 +308,8 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void ButtonOpenedContextMenus_ToggleClosedOnSecondClick()
     {
-        var code = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml.cs"));
-        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
+        var code = ReadSource("src/Nornia.Desktop/Views/GitView.xaml.cs");
+        var view = ReadSource("src/Nornia.Desktop/Views/GitView.xaml");
 
         Assert.Equal(2, Regex.Matches(code, "ToggleButtonContextMenu\\(button, menu\\);").Count);
         // Toggle 必须在 Preview 阶段完成:下压时菜单仍开着,此刻关闭并吞掉事件。若放行到
@@ -308,7 +334,7 @@ public sealed class DesignSystemResourceTests
         var keyRegex = new Regex(@"x:Key=""(?<key>CodeTokenCommentBrush|DiffAddedBrush|DiffRemovedBrush)"" Color=""#(?<hex>[0-9A-Fa-f]{6}(?:[0-9A-Fa-f]{2})?)""", RegexOptions.Compiled);
         foreach (var path in ThemeFiles.Take(2))
         {
-            var text = File.ReadAllText(Path.Combine(RepoRoot, path));
+            var text = ReadSource(path);
             var colors = new Dictionary<string, (double R, double G, double B, double A)>(StringComparer.Ordinal);
             foreach (Match match in keyRegex.Matches(text))
             {
@@ -335,7 +361,7 @@ public sealed class DesignSystemResourceTests
         // 代码源视图与 Diff 视图的全部 TextEditor 共用隐式样式:Display 格式化 + ClearType
         // 渲染消除像素模糊、UseLayoutRounding 对齐物理像素、Padding 给代码区呼吸空间;
         // 等宽字体令牌主推 Cascadia Code(Win11 内建连字),兜底 Consolas。
-        var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
+        var app = ReadSource("src/Nornia.Desktop/App.xaml");
         Assert.Contains("<FontFamily x:Key=\"MonoFontFamily\">Cascadia Code", app);
         Assert.Contains("<Style TargetType=\"av:TextEditor\">", app);
         Assert.Contains("Property=\"TextOptions.TextFormattingMode\" Value=\"Display\"", app);
@@ -349,7 +375,7 @@ public sealed class DesignSystemResourceTests
     {
         // Diff 视图使用与资源管理器相同的 TextMate token 快照和 CodeToken* 调色板；
         // hunk header/notice 行由 meta 转换器弱化,主题切换经 ApplyHighlightingTheme 即时重着色。
-        var source = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/DiffDocumentView.xaml.cs"));
+        var source = ReadSource("src/Nornia.Desktop/Views/DiffDocumentView.xaml.cs");
         Assert.Contains("CodePresentationService.Instance", source);
         Assert.Contains("CodeFileTypeRegistry.Instance.FromPath", source);
         Assert.Contains("CodeTokenColorizer", source);
@@ -367,8 +393,8 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void DiffDocumentView_ExposesHunkActionsInBothLayouts()
     {
-        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/DiffDocumentView.xaml"));
-        var code = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/DiffDocumentView.xaml.cs"));
+        var view = ReadSource("src/Nornia.Desktop/Views/DiffDocumentView.xaml");
+        var code = ReadSource("src/Nornia.Desktop/Views/DiffDocumentView.xaml.cs");
         Assert.Contains("InlineHunkActionBar", view);
         Assert.Contains("SideHunkActionBar", view);
         Assert.Contains("DiffHunkActionButtonStyle", view);
@@ -394,7 +420,7 @@ public sealed class DesignSystemResourceTests
     {
         // 侧栏/面板标题栏图标按钮统一用 AutomationProperties.Name 提供语义,不挂 ToolTip
         // (悬停弹窗会在点击瞬间拦截按钮事件,造成偶发点击失效)。
-        var git = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
+        var git = ReadSource("src/Nornia.Desktop/Views/GitView.xaml");
         var titleBar = "视图切换：平铺 ↔ 树状分组（VS Code SCM 标题栏布局切换）";
         var block = git[git.IndexOf(titleBar, StringComparison.Ordinal)..git.IndexOf("</StackPanel>", git.IndexOf(titleBar, StringComparison.Ordinal))];
         Assert.Contains("AutomationProperties.Name=\"切换为树状分组视图\"", block);
@@ -402,10 +428,10 @@ public sealed class DesignSystemResourceTests
         Assert.Contains("AutomationProperties.Name=\"打开或更换仓库目录\"", block);
         Assert.DoesNotContain("ToolTip=", block);
 
-        var workspace = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/WorkspaceView.xaml"));
+        var workspace = ReadSource("src/Nornia.Desktop/Views/WorkspaceView.xaml");
         Assert.Contains("AutomationProperties.Name=\"打开项目目录\"", workspace);
 
-        var main = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/MainWindow.xaml"));
+        var main = ReadSource("src/Nornia.Desktop/Views/MainWindow.xaml");
         Assert.Contains("AutomationProperties.Name=\"{loc:StringLoc Key=ClearOutput}\"", main);
         Assert.Contains("AutomationProperties.Name=\"{loc:StringLoc Key=CollapsePanel}\"", main);
         Assert.DoesNotContain("ToolTip=\"{loc:StringLoc Key=ClearOutput}\"", main);
@@ -415,7 +441,7 @@ public sealed class DesignSystemResourceTests
     public void ImplicitListBoxItemStyle_HasFourInteractionStates()
     {
         // 数据页(Runtime/Tools/Packages/Cache/Projects)的行交互统一来自 App 级隐式 ListBoxItem 样式。
-        var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
+        var app = ReadSource("src/Nornia.Desktop/App.xaml");
         var block = StyleBlock(app, "<Style TargetType=\"ListBoxItem\">");
         Assert.Contains("IsMouseOver", block);
         Assert.Contains("IsSelected", block);
@@ -476,7 +502,7 @@ public sealed class DesignSystemResourceTests
     {
         // 角色语义守卫:小字阶全部并入 body 档(13),图标按钮字形走行内档(12),
         // 防止回退到 10/11/14 多档并存。
-        var gitView = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
+        var gitView = ReadSource("src/Nornia.Desktop/Views/GitView.xaml");
         var styleStart = gitView.IndexOf("x:Key=\"ScmFileNameTextStyle\"", StringComparison.Ordinal);
         var styleEnd = gitView.IndexOf("</Style>", styleStart, StringComparison.Ordinal);
         var styleBlock = gitView.Substring(styleStart, styleEnd - styleStart);
@@ -484,7 +510,7 @@ public sealed class DesignSystemResourceTests
         // 分支行“图标+文字”垂直中线对齐抽查
         Assert.Contains("Text=\"{StaticResource CodiconSourceControl}\" FontFamily=\"{StaticResource IconFontFamily}\" FontSize=\"{DynamicResource IconInline}\" Foreground=\"{DynamicResource MutedTextBrush}\" VerticalAlignment=\"Center\"", gitView);
 
-        var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
+        var app = ReadSource("src/Nornia.Desktop/App.xaml");
         var buttonStyleStart = app.IndexOf("<Style TargetType=\"Button\">", StringComparison.Ordinal);
         var buttonStyleEnd = app.IndexOf("</Style>", buttonStyleStart, StringComparison.Ordinal);
         var buttonStyle = app.Substring(buttonStyleStart, buttonStyleEnd - buttonStyleStart);
@@ -614,7 +640,7 @@ public sealed class DesignSystemResourceTests
     {
         // 动效时长令牌:Storyboard.Duration 的单一来源。DurationInstant(0) 供 MotionService 在系统
         // 关闭"显示动画"时把全部时长置零;视图不得硬编码动画毫秒数。
-        var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
+        var app = ReadSource("src/Nornia.Desktop/App.xaml");
         foreach (var key in new[] { "DurationInstant", "DurationFast", "DurationNormal", "DurationSlow" })
         {
             Assert.Contains($"x:Key=\"{key}\"", app);
@@ -631,7 +657,7 @@ public sealed class DesignSystemResourceTests
     {
         // 高程阴影资源:黑色阴影在 Dark 底上柔和、Light 上明显、HighContrast 黑底自动隐去,
         // 因此是 App 级资源而非主题令牌;视图只能经样式引用,不得直接在视图里放置效果。
-        var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
+        var app = ReadSource("src/Nornia.Desktop/App.xaml");
         Assert.Matches(@"<DropShadowEffect x:Key=""ShadowCardEffect""", app);
         Assert.Matches(@"<DropShadowEffect x:Key=""ShadowPopupEffect""", app);
         Assert.Matches(@"<DropShadowEffect x:Key=""ShadowOverlayEffect""", app);
@@ -645,7 +671,7 @@ public sealed class DesignSystemResourceTests
         // 弹出层(菜单/下拉/子菜单)与工具提示消费阴影令牌(卡片档 / Popup 档),防止令牌空转。
         // 卡片样式与列表行按钮不再挂 DropShadowEffect:Effect 会把承载元素的整棵子树
         // (文字/数字)栅格化再合成,导致任务中心指标卡与设置页卡片文字发糊;卡片层次由边框线承担。
-        var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
+        var app = ReadSource("src/Nornia.Desktop/App.xaml");
         Assert.DoesNotContain("ShadowCardEffect", StyleBlock(app, "x:Key=\"CardStyle\""));
         Assert.DoesNotContain("ShadowCardEffect", StyleBlock(app, "x:Key=\"ListItemButtonStyle\""));
         Assert.Contains("Value=\"{StaticResource ShadowCardEffect}\"", StyleBlock(app, "<Style TargetType=\"ToolTip\">"));
@@ -659,7 +685,7 @@ public sealed class DesignSystemResourceTests
     {
         // 窗口控制按钮(最小化/最大化/关闭)必须用 Codicon 字形,经 IconFontFamily 令牌(不得
         // 硬编码字体族),不再回退到 ─ □ × 文本字符及其逐字形的光学 Padding 补偿。
-        var main = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/MainWindow.xaml"));
+        var main = ReadSource("src/Nornia.Desktop/Views/MainWindow.xaml");
         Assert.Contains("Text=\"{StaticResource CodiconChromeMinimize}\"", main); // minimize
         Assert.Contains("Text=\"{StaticResource CodiconChromeMaximize}\"", main); // maximize
         Assert.Contains("Text=\"{StaticResource CodiconChromeClose}\"", main); // close
@@ -669,7 +695,7 @@ public sealed class DesignSystemResourceTests
         Assert.Contains("Style=\"{StaticResource WindowControlButtonStyle}\"", main);
         Assert.Contains("Style=\"{StaticResource CloseWindowButton}\"", main);
 
-        var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
+        var app = ReadSource("src/Nornia.Desktop/App.xaml");
         var style = StyleBlock(app, "x:Key=\"WindowControlButtonStyle\"");
         Assert.Contains("Value=\"{StaticResource IconFontFamily}\"", style);
         Assert.Contains("Value=\"{DynamicResource IconClose}\"", style);
@@ -682,14 +708,14 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void CodiconFont_IsEmbeddedAndOldMdl2GlyphsAreGone()
     {
-        var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
-        var csproj = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Nornia.Desktop.csproj"));
+        var app = ReadSource("src/Nornia.Desktop/App.xaml");
+        var csproj = ReadSource("src/Nornia.Desktop/Nornia.Desktop.csproj");
         var fontPath = Path.Combine(RepoRoot, "src/Nornia.Desktop/Assets/codicon.ttf");
 
         Assert.True(File.Exists(fontPath));
         Assert.True(new FileInfo(fontPath).Length > 100_000);
         Assert.Contains("<icons:CodiconFontFamilyExtension x:Key=\"IconFontFamily\" />", app);
-        Assert.Contains("./Assets/#codicon", File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/CodiconFontFamilyExtension.cs")));
+        Assert.Contains("./Assets/#codicon", ReadSource("src/Nornia.Desktop/CodiconFontFamilyExtension.cs"));
         Assert.Contains("Assets\\codicon.ttf", csproj);
 
         foreach (var file in Directory.EnumerateFiles(Path.Combine(RepoRoot, "src/Nornia.Desktop"), "*.*", SearchOption.AllDirectories)
@@ -709,12 +735,12 @@ public sealed class DesignSystemResourceTests
     public void DesktopProject_DeclaresApplicationAndWindowIcon()
     {
         // exe 图标(ApplicationIcon)与窗口图标(Window.Icon)共用同一品牌瓦片,且资产确实存在。
-        var csproj = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Nornia.Desktop.csproj"));
+        var csproj = ReadSource("src/Nornia.Desktop/Nornia.Desktop.csproj");
         Assert.Contains("<RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>", csproj);
         Assert.Contains("<NorniaAppIcon>Assets\\app.ico</NorniaAppIcon>", csproj);
         Assert.Contains("<ApplicationIcon>$(NorniaAppIcon)</ApplicationIcon>", csproj);
         Assert.Contains("<Resource Include=\"$(NorniaAppIcon)\" />", csproj);
-        var main = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/MainWindow.xaml"));
+        var main = ReadSource("src/Nornia.Desktop/Views/MainWindow.xaml");
         Assert.Contains("Icon=\"/Nornia.Desktop;component/Assets/app.ico\"", main);
         Assert.Contains("Source=\"/Nornia.Desktop;component/Assets/app.ico\"", main);
         Assert.True(File.Exists(Path.Combine(RepoRoot, "src/Nornia.Desktop/Assets/app.ico")), "缺少应用图标资产 app.ico");
@@ -725,7 +751,7 @@ public sealed class DesignSystemResourceTests
     {
         // Light 状态栏必须为中性浅面(与 Dark 深条的视觉权重一致),不能再用强调色蓝条;
         // 错误/警告/成功反馈色也已按浅底重调。
-        var light = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Themes/Light.xaml"));
+        var light = ReadSource("src/Nornia.Desktop/Themes/Light.xaml");
         string HexOf(string key) => Regex.Match(light, $@"x:Key=""{key}"" Color=""#(?<hex>[0-9A-Fa-f]{{6}})""").Groups["hex"].Value;
 
         var bg = HexOf("StatusBarBackgroundBrush");
@@ -741,9 +767,9 @@ public sealed class DesignSystemResourceTests
     public void NewTypeStyles_AreConsumedByRepresentativeViews()
     {
         // 中间档字阶样式必须被代表视图消费,防止令牌空转。
-        Assert.Contains("SubtitleTextStyle", File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/SettingsView.xaml")));
-        Assert.Contains("SectionTitleStyle", File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/EmptyStateControl.xaml")));
-        Assert.Contains("TypeHeading", File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/DashboardView.xaml")));
+        Assert.Contains("SubtitleTextStyle", ReadSource("src/Nornia.Desktop/Views/SettingsView.xaml"));
+        Assert.Contains("SectionTitleStyle", ReadSource("src/Nornia.Desktop/Views/EmptyStateControl.xaml"));
+        Assert.Contains("TypeHeading", ReadSource("src/Nornia.Desktop/Views/DashboardView.xaml"));
     }
 
     [Fact]
@@ -751,7 +777,7 @@ public sealed class DesignSystemResourceTests
     {
         // 令牌不只定义在 App.xaml：共享控件、顶层页与嵌入页都要使用它们，避免同一视觉角色
         // 随着页面增加重新散落为 4/8/12/16 的字面量。
-        var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
+        var app = ReadSource("src/Nornia.Desktop/App.xaml");
         Assert.Contains("{StaticResource InsetToolbar}", app);
         Assert.Contains("{StaticResource InsetCard}", app);
         Assert.Contains("{StaticResource InsetStatusItem}", app);
@@ -769,7 +795,7 @@ public sealed class DesignSystemResourceTests
 
         foreach (var (fileName, tokens) in expected)
         {
-            var text = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views", fileName));
+            var text = ReadCachedFile(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views", fileName));
             foreach (var token in tokens)
             {
                 Assert.Contains(token, text);
@@ -783,7 +809,7 @@ public sealed class DesignSystemResourceTests
         // 关键壳层(标题栏/侧栏标题/标签栏/状态栏/活动栏/分节头/表格行)的高度必须引用度量令牌,
         // 随全局字号倍率(DynamicResource + UiFontService)同步缩放;硬编码高度会使 85%/130%
         // 档位下文字与行高脱节(裁切或双重留白)。
-        var main = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/MainWindow.xaml"));
+        var main = ReadSource("src/Nornia.Desktop/Views/MainWindow.xaml");
         // 标题栏:Auto 行 + 栏身 Height=SizeTitleBar 令牌(DynamicResource 的 double 无法赋给
         // GridLength 类型的 RowDefinition.Height,令牌必须落在 double 属性上)
         Assert.Contains("Height=\"{DynamicResource SizeTitleBar}\"", main);
@@ -798,14 +824,14 @@ public sealed class DesignSystemResourceTests
         Assert.DoesNotContain("Value=\"48\"", activityItem);
         Assert.DoesNotContain("Value=\"35\"", activityItem);
 
-        var group = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/EditorGroupView.xaml"));
+        var group = ReadSource("src/Nornia.Desktop/Views/EditorGroupView.xaml");
         Assert.Contains("<Grid Height=\"{DynamicResource SizeTabBar}\">", group);
 
-        var collapsible = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/Controls/CollapsibleSection.xaml"));
+        var collapsible = ReadSource("src/Nornia.Desktop/Views/Controls/CollapsibleSection.xaml");
         Assert.Contains("Property=\"MinHeight\" Value=\"{DynamicResource SizeRowSm}\"", collapsible);
 
         // 侧栏标题行 35px 与数据表格紧凑行 22px 走 App.xaml 令牌
-        var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
+        var app = ReadSource("src/Nornia.Desktop/App.xaml");
         var sidebarTitle = StyleBlock(app, "x:Key=\"SideBarTitleBarStyle\"");
         Assert.Contains("Property=\"Height\" Value=\"{DynamicResource SizeTitleBar}\"", sidebarTitle);
         Assert.Contains("Property=\"RowHeight\" Value=\"{DynamicResource SizeTableRow}\"", app);
@@ -819,7 +845,7 @@ public sealed class DesignSystemResourceTests
         // 命令面板/快速打开的全窗口遮罩必须覆盖整个壳层:标题栏与状态栏也要压暗(VS Code 行为)。
         // 结构约束(防回归):遮罩层与承载面板都是根 Grid 的最后子元素(RowSpan=3、状态栏之后),
         // 承载面板声明在遮罩之后(Z 序:后者在上,调色板才可见)。
-        var main = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/MainWindow.xaml"));
+        var main = ReadSource("src/Nornia.Desktop/Views/MainWindow.xaml");
         var backdrop = main.IndexOf("Grid.RowSpan=\"3\" Background=\"{DynamicResource QuickInputBackdropBrush}\"", StringComparison.Ordinal);
         var overlay = main.IndexOf("Grid.RowSpan=\"3\" x:Name=\"QuickInputOverlay\"", StringComparison.Ordinal);
         Assert.True(backdrop >= 0, "缺少全窗口遮罩层");
@@ -834,7 +860,7 @@ public sealed class DesignSystemResourceTests
     {
         // Windows 中文环境后备链:Segoe WPC(VS Code 微软雅黑锯齿修复)→ Segoe UI → Microsoft YaHei;
         // 代码字体保持独立的 MonoFontFamily 策略,不并入界面后备链。
-        var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
+        var app = ReadSource("src/Nornia.Desktop/App.xaml");
         Assert.Contains("<FontFamily x:Key=\"UiFontFamily\">Segoe WPC, Segoe UI, Microsoft YaHei</FontFamily>", app);
         Assert.Contains("<FontFamily x:Key=\"MonoFontFamily\">Cascadia Code", app);
     }
@@ -842,7 +868,7 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void Dashboard_MetricCardsReflowInsteadOfFixedColumns()
     {
-        var text = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/DashboardView.xaml"));
+        var text = ReadSource("src/Nornia.Desktop/Views/DashboardView.xaml");
         Assert.DoesNotContain("<UniformGrid", text);
         Assert.Contains("WrapPanel", text);
     }
@@ -852,7 +878,7 @@ public sealed class DesignSystemResourceTests
     {
         foreach (var name in new[] { "RuntimeView", "ToolsView", "PackagesView" })
         {
-            var text = File.ReadAllText(Path.Combine(RepoRoot, $"src/Nornia.Desktop/Views/{name}.xaml"));
+            var text = ReadSource($"src/Nornia.Desktop/Views/{name}.xaml");
             Assert.Contains("ToolbarActionsStyle", text);
         }
     }
@@ -860,8 +886,8 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void DataPages_ExposeBottomSelectionSummary()
     {
-        var runtime = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/RuntimeView.xaml"));
-        var tools = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/ToolsView.xaml"));
+        var runtime = ReadSource("src/Nornia.Desktop/Views/RuntimeView.xaml");
+        var tools = ReadSource("src/Nornia.Desktop/Views/ToolsView.xaml");
         Assert.Contains("SelectedRuntimeSummary", runtime);
         Assert.Contains("SelectedToolSummary", tools);
     }
@@ -871,7 +897,7 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void GlobalControlStyles_DefineHoverPressedFocusAndDisabledStates()
     {
-        var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
+        var app = ReadSource("src/Nornia.Desktop/App.xaml");
         // hover
         Assert.Contains("IsMouseOver", app);
         // pressed (buttons) + pressed (rows, immediate mouse-down feedback)
@@ -896,7 +922,7 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void ImplicitButtonStyle_DefinesHoverPressedFocusAndDisabled()
     {
-        var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
+        var app = ReadSource("src/Nornia.Desktop/App.xaml");
         var block = StyleBlock(app, "<Style TargetType=\"Button\">");
         Assert.Contains("IsMouseOver", block);
         Assert.Contains("IsPressed", block);
@@ -911,7 +937,7 @@ public sealed class DesignSystemResourceTests
     {
         // 深色模式下右键/下拉弹出层白底的根因是默认模板钉死 SystemColors,修复靠显式模板:
         // 弹出表面/图标栏/分隔线全部走主题令牌,且不得再引入 SystemColors 造成白底回归。
-        var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
+        var app = ReadSource("src/Nornia.Desktop/App.xaml");
         Assert.DoesNotContain("SystemColors", app);
 
         var contextMenu = StyleBlock(app, "<Style TargetType=\"ContextMenu\">");
@@ -956,8 +982,8 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void SettingsBooleanEditor_UsesThemedCheckBoxStyle()
     {
-        var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
-        var settings = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/SettingsView.xaml"));
+        var app = ReadSource("src/Nornia.Desktop/App.xaml");
+        var settings = ReadSource("src/Nornia.Desktop/Views/SettingsView.xaml");
         var checkBox = StyleBlock(app, "<Style TargetType=\"CheckBox\">");
 
         Assert.Contains("Background=\"{DynamicResource InputBrush}\"", checkBox);
@@ -972,14 +998,14 @@ public sealed class DesignSystemResourceTests
         // 文件类型图标统一为“透明底 + 语言色相的 Monogram 缩写”:共享 FileTypeMonogramTextStyle
         // (App.xaml) 提供等宽居中槽位与 MonoFontFamily;字号走 IconMonogram 令牌(随全局
         // 字号倍率缩放),不硬编码字号字面量;文字颜色经转换器走既有 FileTypeIcon*Brush(不新增令牌)。
-        var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
+        var app = ReadSource("src/Nornia.Desktop/App.xaml");
         var monogramStyle = StyleBlock(app, "x:Key=\"FileTypeMonogramTextStyle\"");
         Assert.Contains("MonoFontFamily", monogramStyle);
         Assert.Contains("IconMonogram", monogramStyle); // 缩写字号走令牌
         Assert.Contains("Property=\"Width\"", monogramStyle); // 图标槽位等宽固定(不随缩写长度变化)
         Assert.Contains("TextAlignment", monogramStyle); // 文字居中 —— 同列表内各文件图标等宽、后续文件名纵向对齐
 
-        var sidebarBadge = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/Controls/SidebarFileTypeBadge.xaml"));
+        var sidebarBadge = ReadSource("src/Nornia.Desktop/Views/Controls/SidebarFileTypeBadge.xaml");
         Assert.Contains("Width=\"{DynamicResource IconMonogramSlot}\"", sidebarBadge);
         Assert.Contains("Height=\"{DynamicResource IconMonogramCell}\"", sidebarBadge);
         Assert.Contains("ClipToBounds=\"False\"", sidebarBadge); // 共享徽标不得把缩写裁在侧栏图标槽位边缘
@@ -988,22 +1014,22 @@ public sealed class DesignSystemResourceTests
         // 编辑区标签徽标直接消费共享样式，侧栏通过共享文件类型徽标间接消费。
         // (FilePreviewView 面包屑行的文件类型 Monogram 已移除:类型改由标签徽标 +
         //  主状态栏"当前文档状态"段承载,见 FileIcons_BreadcrumbBarNoLongerShowsFileType。)
-        var groupView = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/EditorGroupView.xaml"));
+        var groupView = ReadSource("src/Nornia.Desktop/Views/EditorGroupView.xaml");
         Assert.Contains("FileTypeMonogramTextStyle", groupView);
 
-        var git = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
+        var git = ReadSource("src/Nornia.Desktop/Views/GitView.xaml");
         Assert.Contains("SidebarFileTypeBadge", git);
         // 不再使用彩色底块:语言色相只用于文字前景,不得回退到 Background 底色。
         Assert.DoesNotContain("Background=\"{Binding Path, Converter={StaticResource PathToIconBrushConverter}}\"", git);
         Assert.DoesNotContain("Background=\"{Binding Change.Path, Converter={StaticResource PathToIconBrushConverter}}\"", git);
-        var workspace = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/WorkspaceView.xaml"));
+        var workspace = ReadSource("src/Nornia.Desktop/Views/WorkspaceView.xaml");
         Assert.Contains("SidebarFileTypeBadge", workspace);
         Assert.DoesNotContain("Background=\"{Binding Path, Converter={StaticResource PathToIconBrushConverter}}\"", workspace);
-        var preview = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/FilePreviewView.xaml"));
+        var preview = ReadSource("src/Nornia.Desktop/Views/FilePreviewView.xaml");
         Assert.DoesNotContain("{Binding FileType.IconMonogram}", preview); // 面包屑行文件类型 Monogram 已移除
         Assert.DoesNotContain("FileTypeToBrushConverter", preview);
         Assert.DoesNotContain("Background=\"{Binding FileType, Converter={StaticResource FileTypeToBrushConverter}}\"", preview);
-        var groupTab = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/EditorGroupView.xaml"));
+        var groupTab = ReadSource("src/Nornia.Desktop/Views/EditorGroupView.xaml");
         Assert.Contains("TabBadge", groupTab);
         Assert.Contains("FileTypeToBrushConverter", groupTab);
         Assert.DoesNotContain("Background=\"{Binding FileType, Converter={StaticResource FileTypeToBrushConverter}}\"", groupTab);
@@ -1014,7 +1040,7 @@ public sealed class DesignSystemResourceTests
     {
         // 面包屑行只显示路径 + 符号链 + 编辑器操作:文件类型 Monogram 与语言名均已移除,
         // 文件类型由编辑区标签徽标与主状态栏"当前文档状态"段(可点击语言项)承载。
-        var preview = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/FilePreviewView.xaml"));
+        var preview = ReadSource("src/Nornia.Desktop/Views/FilePreviewView.xaml");
         Assert.DoesNotContain("FileTypeMonogramTextStyle", preview);
         Assert.DoesNotContain("IconMonogramSlot", preview);
         Assert.DoesNotContain("{Binding LanguageName}", preview);
@@ -1026,7 +1052,7 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void PrimaryDangerAndCloseButtons_DefinePressedStates()
     {
-        var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
+        var app = ReadSource("src/Nornia.Desktop/App.xaml");
         var primary = StyleBlock(app, "x:Key=\"PrimaryButton\"");
         Assert.Contains("ButtonPressedBrush", primary);
         var danger = StyleBlock(app, "x:Key=\"DangerButton\"");
@@ -1040,7 +1066,7 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void StatusBarItemTemplate_HasPressedAndKeyboardFocusStates()
     {
-        var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
+        var app = ReadSource("src/Nornia.Desktop/App.xaml");
         var block = StyleBlock(app, "x:Key=\"StatusBarItem\"");
         Assert.Contains("IsMouseOver", block);
         Assert.Contains("StatusBarItemPressedBackgroundBrush", block);
@@ -1053,13 +1079,13 @@ public sealed class DesignSystemResourceTests
     {
         // 视图内独立底栏已移除:文档状态(位置/只读/语言/Diff 模式/编码/行尾/行数/大小/
         // 自动换行/diff 行数)并入窗口主状态栏的"当前文档状态"段,只在选中文档类标签时显示。
-        var main = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/MainWindow.xaml"));
-        var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
-        var tabModel = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/ViewModels/EditorAreaViewModel.cs"));
-        var preview = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/FilePreviewView.xaml"));
-        var previewCode = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/FilePreviewView.xaml.cs"));
-        var diffView = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/DiffDocumentView.xaml"));
-        var diffCode = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/DiffDocumentView.xaml.cs"));
+        var main = ReadSource("src/Nornia.Desktop/Views/MainWindow.xaml");
+        var app = ReadSource("src/Nornia.Desktop/App.xaml");
+        var tabModel = EditorViewModelSources();
+        var preview = ReadSource("src/Nornia.Desktop/Views/FilePreviewView.xaml");
+        var previewCode = ReadSource("src/Nornia.Desktop/Views/FilePreviewView.xaml.cs");
+        var diffView = ReadSource("src/Nornia.Desktop/Views/DiffDocumentView.xaml");
+        var diffCode = ReadSource("src/Nornia.Desktop/Views/DiffDocumentView.xaml.cs");
 
         // 主状态栏消费选中标签的文档状态(位置文本由标签承载,语言命令走 EditorAreaViewModel)。
         Assert.Contains("Workbench.SelectedEditorTab.EditorTab.CaretPositionText", main);
@@ -1084,7 +1110,7 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void ActivityBarTemplate_HasPressedAndFocusStates()
     {
-        var text = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/MainWindow.xaml"));
+        var text = ReadSource("src/Nornia.Desktop/Views/MainWindow.xaml");
         var block = StyleBlock(text, "x:Key=\"ActivityItemStyle\"");
         Assert.Contains("IsMouseOver", block);
         Assert.Contains("IsSelected", block);
@@ -1095,8 +1121,8 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void WorkspaceTreeTemplate_HasRowAndExpanderInteractionStates()
     {
-        var text = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/WorkspaceView.xaml"));
-        var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
+        var text = ReadSource("src/Nornia.Desktop/Views/WorkspaceView.xaml");
+        var app = ReadSource("src/Nornia.Desktop/App.xaml");
         var tree = StyleBlock(app, "x:Key=\"SidebarRowItemStyle\"");
         Assert.Contains("MinHeight", tree);
         Assert.Contains("HorizontalContentAlignment", tree);
@@ -1109,7 +1135,7 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void CollapsibleSectionTemplate_HasPressedAndFocusStates()
     {
-        var text = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/Controls/CollapsibleSection.xaml"));
+        var text = ReadSource("src/Nornia.Desktop/Views/Controls/CollapsibleSection.xaml");
         var block = StyleBlock(text, "x:Key=\"CollapsibleHeaderButtonStyle\"");
         Assert.Contains("IsMouseOver", block);
         Assert.Contains("IsPressed", block);
@@ -1120,8 +1146,8 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void SidebarCountBadges_UseBlueSurfaceAndWhiteText()
     {
-        var section = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/Controls/CollapsibleSection.xaml"));
-        var search = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/SearchSidebarView.xaml"));
+        var section = ReadSource("src/Nornia.Desktop/Views/Controls/CollapsibleSection.xaml");
+        var search = ReadSource("src/Nornia.Desktop/Views/SearchSidebarView.xaml");
 
         foreach (var text in new[] { section, search })
         {
@@ -1130,7 +1156,7 @@ public sealed class DesignSystemResourceTests
         }
         Assert.Contains("Grid.Column=\"2\"", section);
         Assert.Contains("HorizontalAlignment=\"Right\"", section);
-        var git = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
+        var git = ReadSource("src/Nornia.Desktop/Views/GitView.xaml");
         Assert.Contains("SidebarReferenceBadgeStyle", git);
         Assert.Contains("ScmRefBadgeTemplate", git);
         Assert.Contains("分支/远端分支/标签", git);
@@ -1142,7 +1168,7 @@ public sealed class DesignSystemResourceTests
         Assert.Contains("Title=\"已暂存的更改\" BadgeCount=\"{Binding StagedChanges.Count}\" AlwaysShowBadge=\"True\"", git);
         Assert.Contains("Title=\"未暂存的更改\" BadgeCount=\"{Binding UnstagedChanges.Count}\" AlwaysShowBadge=\"True\"", git);
 
-        var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
+        var app = ReadSource("src/Nornia.Desktop/App.xaml");
         var countStyle = StyleBlock(app, "x:Key=\"SidebarCountBadgeStyle\"");
         Assert.Contains("SizeSidebarBadge", countStyle);
         Assert.Contains("RadiusPill", countStyle);
@@ -1152,7 +1178,7 @@ public sealed class DesignSystemResourceTests
         var referenceStyle = StyleBlock(app, "x:Key=\"SidebarReferenceBadgeStyle\"");
         Assert.Contains("RadiusLg", referenceStyle);
         Assert.Contains("SizeSidebarBadge", referenceStyle);
-        var sectionControl = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/Controls/CollapsibleSection.xaml"));
+        var sectionControl = ReadSource("src/Nornia.Desktop/Views/Controls/CollapsibleSection.xaml");
         Assert.Contains("BadgeCountVisibilityConverter", sectionControl);
         Assert.Contains("AlwaysShowBadge", sectionControl);
     }
@@ -1160,7 +1186,7 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void CommitHover_UsesContentWidthUpToFiveHundredFiftyWithoutHeightCap()
     {
-        var git = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
+        var git = ReadSource("src/Nornia.Desktop/Views/GitView.xaml");
         var start = git.IndexOf("<ToolTip Style=\"{StaticResource ScmCommitToolTipStyle}\">", StringComparison.Ordinal);
         var end = git.IndexOf("<!-- 变更统计", start, StringComparison.Ordinal);
         var hover = git[start..end];
@@ -1174,8 +1200,8 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void GitGraph_UsesTopBranchSelectorInsteadOfBranchCollapsibleSection()
     {
-        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
-        var code = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml.cs"));
+        var view = ReadSource("src/Nornia.Desktop/Views/GitView.xaml");
+        var code = ReadSource("src/Nornia.Desktop/Views/GitView.xaml.cs");
 
         Assert.Contains("Click=\"CurrentBranchSelector_Click\"", view);
         Assert.Contains("ItemsSource=\"{Binding Branches}\"", view);
@@ -1188,7 +1214,7 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void GitChangeRowInlineActions_OpenFilesInFlatAndTreeLayouts()
     {
-        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
+        var view = ReadSource("src/Nornia.Desktop/Views/GitView.xaml");
 
         Assert.Equal(2, CountOccurrences(view, "ToolTip=\"打开文件\""));
         Assert.Equal(2, CountOccurrences(view, "Content=\"{StaticResource CodiconGoToFile}\""));
@@ -1200,7 +1226,7 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void GitFlatChangeRows_PlaceDirectoryImmediatelyAfterFileName()
     {
-        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
+        var view = ReadSource("src/Nornia.Desktop/Views/GitView.xaml");
         var start = view.IndexOf("<TextBlock x:Name=\"FlatNameAndPath\"", StringComparison.Ordinal);
         var end = view.IndexOf("</TextBlock>", start, StringComparison.Ordinal);
         var flatText = view[start..end];
@@ -1216,8 +1242,8 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void GitFlatChangeRows_ReopenDiffWhenTheSelectedRowIsClickedAgain()
     {
-        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
-        var code = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml.cs"));
+        var view = ReadSource("src/Nornia.Desktop/Views/GitView.xaml");
+        var code = ReadSource("src/Nornia.Desktop/Views/GitView.xaml.cs");
 
         Assert.Equal(2, CountOccurrences(view, "PreviewMouseLeftButtonDown=\"FlatChangeList_PreviewMouseLeftButtonDown\""));
         Assert.Equal(2, CountOccurrences(view, "PreviewMouseLeftButtonUp=\"FlatChangeList_PreviewMouseLeftButtonUp\""));
@@ -1233,8 +1259,8 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void SearchRows_UseSingleLineLocationColumnAndPathToolTip()
     {
-        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/SearchSidebarView.xaml"));
-        var model = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/ViewModels/SearchViewModel.cs"));
+        var view = ReadSource("src/Nornia.Desktop/Views/SearchSidebarView.xaml");
+        var model = ReadSource("src/Nornia.Desktop/ViewModels/SearchViewModel.cs");
 
         Assert.Contains("MinHeight=\"{DynamicResource SizeRowSm}\"", view);
         Assert.Contains("<ColumnDefinition Width=\"56\" />", view);
@@ -1251,7 +1277,7 @@ public sealed class DesignSystemResourceTests
         Assert.Contains("<Grid MinWidth=\"0\" MinHeight=\"{DynamicResource SizeRowSm}\" Margin=\"0,0,8,0\" ToolTip=\"{Binding ToolTipText}\">", view);
         Assert.DoesNotContain("{Binding Detail}", view);
         // 引导线层改为纯代码元素(单元素 OnRender),TreeGuideBrush 令牌断言移到代码文件。
-        Assert.Contains("TreeGuideBrush", File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/Controls/SidebarTreeGuideLayer.xaml.cs")));
+        Assert.Contains("TreeGuideBrush", ReadSource("src/Nornia.Desktop/Views/Controls/SidebarTreeGuideLayer.xaml.cs"));
         Assert.Contains("public string LocationLabel =>", model);
         Assert.Contains("$\"{Match.Line}:{Match.Column}\"", model);
         Assert.Contains("public string ToolTipText =>", model);
@@ -1261,7 +1287,7 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void WorkbenchTabTemplate_HasSelectedPressedFocusAndDangerClose()
     {
-        var text = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/EditorGroupView.xaml"));
+        var text = ReadSource("src/Nornia.Desktop/Views/EditorGroupView.xaml");
         var tab = StyleBlock(text, "x:Key=\"GroupTabItemStyle\"");
         Assert.Contains("IsMouseOver", tab);
         Assert.Contains("IsSelected", tab);
@@ -1279,7 +1305,7 @@ public sealed class DesignSystemResourceTests
         // 回归:统一标签条重构时预览标签的斜体渲染丢失(只剩 ViewModel 里的 IsPreview 镜像)。
         // 预览标签标题必须轻微倾斜(VS Code 预览标签语义,数据源为 EditorWorkbenchTab.IsPreview);
         // 用 SkewTransform 实现——字体真斜体斜度太陡,视觉上不可接受。
-        var text = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/EditorGroupsView.xaml"));
+        var text = ReadSource("src/Nornia.Desktop/Views/EditorGroupsView.xaml");
         var tab = StyleBlock(text, "x:Key=\"UnifiedTabItemStyle\"");
         Assert.Contains("Binding IsPreview", tab);
         Assert.Contains("SkewTransform", tab);
@@ -1289,7 +1315,7 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void TerminalPanel_HasSurfaceSessionSidebarAndProfileSelector_NoSendBox()
     {
-        var terminal = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/TerminalView.xaml"));
+        var terminal = ReadSource("src/Nornia.Desktop/Views/TerminalView.xaml");
         // 单一交互式终端表面:唯一的命令输入入口,绑定当前会话。
         Assert.Contains("controls:TerminalSurfaceControl", terminal);
         Assert.Contains("Session=\"{Binding SelectedSession.Session}\"", terminal);
@@ -1310,7 +1336,7 @@ public sealed class DesignSystemResourceTests
         Assert.DoesNotContain("WorkingDirectory", terminal);
         Assert.DoesNotContain("CustomShellPath", terminal);
 
-        var mainWindow = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/MainWindow.xaml"));
+        var mainWindow = ReadSource("src/Nornia.Desktop/Views/MainWindow.xaml");
         // 终端专属工具在面板标题栏右侧:新建终端 / 配置文件下拉 / 清屏 / 关闭当前终端。
         Assert.Contains("workbench.action.terminal.new", mainWindow);
         Assert.Contains("{Binding Terminal.Profiles}", mainWindow);
@@ -1319,7 +1345,7 @@ public sealed class DesignSystemResourceTests
         // "终端：新建终端"命令通过命令注册表访问。
         Assert.Contains("IsTerminalSelected", mainWindow);
 
-        var mainCode = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/MainWindow.xaml.cs"));
+        var mainCode = ReadSource("src/Nornia.Desktop/Views/MainWindow.xaml.cs");
         // Ctrl+` 新建终端;焦点交给终端表面而非发送框。
         Assert.Contains("Key.OemTilde", mainCode);
         Assert.Contains("FocusSurface", mainCode);
@@ -1340,13 +1366,13 @@ public sealed class DesignSystemResourceTests
             "src/Nornia.Desktop/Views/MainWindow.xaml", // output / problems lists
         })
         {
-            var text = File.ReadAllText(Path.Combine(RepoRoot, path));
+            var text = ReadSource(path);
             Assert.Contains("IsMouseCaptured", text);
             Assert.Contains("FocusVisualStyle", text);
         }
 
         var scm = StyleBlock(
-            File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml")),
+            ReadSource("src/Nornia.Desktop/Views/GitView.xaml"),
             "x:Key=\"ScmRowStyle\"");
         Assert.Contains("IsMouseCaptured", scm);
         Assert.Contains("FocusVisualStyle", scm);
@@ -1356,9 +1382,9 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void CodeWorkbench_PreviewRendersThroughCodeDocumentView()
     {
-        var editorArea = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/EditorAreaView.xaml"));
-        var preview = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/FilePreviewView.xaml"));
-        var document = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/CodeDocumentView.xaml"));
+        var editorArea = ReadSource("src/Nornia.Desktop/Views/EditorAreaView.xaml");
+        var preview = ReadSource("src/Nornia.Desktop/Views/FilePreviewView.xaml");
+        var document = ReadSource("src/Nornia.Desktop/Views/CodeDocumentView.xaml");
 
         Assert.Contains("x:Name=\"PersistentFilePreview\"", editorArea);
         Assert.Contains("DataContext=\"{Binding SelectedFileTab}\"", editorArea);
@@ -1376,8 +1402,8 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void CodeWorkbench_MarkdownSourceSurfaceIsHiddenByMode_NotByRenderResult()
     {
-        var preview = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/FilePreviewView.xaml"));
-        var tabModel = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/ViewModels/EditorAreaViewModel.cs"));
+        var preview = ReadSource("src/Nornia.Desktop/Views/FilePreviewView.xaml");
+        var tabModel = EditorViewModelSources();
 
         // 闪帧修复:源码面可见性跟随"模式"(Markdown 进入渲染模式即隐藏,不等渲染结果就绪),
         // 加载/重载窗口不得渲染出"源码 + 内置语法高亮"帧;预览面仍等结果对象就绪才显示。
@@ -1391,9 +1417,9 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void CodeWorkbench_PresentationPublishesFirstViewportBatch()
     {
-        var lang = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Code/LanguagePresentation.cs"));
-        var tabModel = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/ViewModels/EditorAreaViewModel.cs"));
-        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/CodeDocumentView.xaml.cs"));
+        var lang = ReadSource("src/Nornia.Desktop/Code/LanguagePresentation.cs");
+        var tabModel = EditorViewModelSources();
+        var view = ReadSource("src/Nornia.Desktop/Views/CodeDocumentView.xaml.cs");
 
         // 闪帧修复:grammar 每 scope 进程级只编译一次(存储);分词推进到首屏行数时先发布部分
         // 快照(IsComplete=false),让首屏 1~2 帧内拿到最终配色;内置兜底只在完整快照到达后关闭。
@@ -1407,11 +1433,11 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void CodeWorkbench_FindAndNavigationChromeIsWired()
     {
-        var preview = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/FilePreviewView.xaml"));
-        var previewCode = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/FilePreviewView.xaml.cs"));
-        var documentCode = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/CodeDocumentView.xaml.cs"));
-        var mainWindow = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/MainWindow.xaml.cs"));
-        var tabModel = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/ViewModels/EditorAreaViewModel.cs"));
+        var preview = ReadSource("src/Nornia.Desktop/Views/FilePreviewView.xaml");
+        var previewCode = ReadSource("src/Nornia.Desktop/Views/FilePreviewView.xaml.cs");
+        var documentCode = ReadSource("src/Nornia.Desktop/Views/CodeDocumentView.xaml.cs");
+        var mainWindow = ReadSource("src/Nornia.Desktop/Views/MainWindow.xaml.cs");
+        var tabModel = EditorViewModelSources();
 
         Assert.Contains("{Binding SearchText, UpdateSourceTrigger=PropertyChanged}", preview);
         Assert.Contains("{Binding IsFindBarOpen", preview);
@@ -1432,18 +1458,21 @@ public sealed class DesignSystemResourceTests
         var keybindingDispatch = mainWindow.IndexOf("await _keybindings.DispatchAsync", StringComparison.Ordinal);
         Assert.True(focusRefresh >= 0 && keybindingDispatch > focusRefresh,
             "PreviewKeyDown must refresh focus context before dispatching keybindings.");
-        // Ctrl+F with a selection in the document auto-fills the find box; the prev/next
-        // buttons re-evaluate their enabled state when the match count changes.
-        Assert.Contains("_tab.Content[segment.Offset..(segment.Offset + segment.Length)]", previewCode);
+        // Ctrl+F auto-fills the find box from the editor selection — the seeding now lives in the
+        // tab model (OpenFindBar reads SelectionRangeProvider) instead of view code-behind, so the
+        // key is remappable via the command platform; the prev/next buttons re-evaluate their
+        // enabled state when the match count changes.
+        Assert.Contains("SearchText = Content[range.Start..range.End]", tabModel);
+        Assert.DoesNotContain("Key.F3", previewCode);
         Assert.Contains("FindNextCommand.NotifyCanExecuteChanged", tabModel);
     }
 
     [Fact]
     public void CodeWorkbench_OutlinePanelIsWired()
     {
-        var preview = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/FilePreviewView.xaml"));
-        var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
-        var tabModel = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/ViewModels/EditorAreaViewModel.cs"));
+        var preview = ReadSource("src/Nornia.Desktop/Views/FilePreviewView.xaml");
+        var app = ReadSource("src/Nornia.Desktop/App.xaml");
+        var tabModel = EditorViewModelSources();
 
         // Right-hand symbol list: only shown when the file has an outline; filter + jump wired.
         Assert.Contains("{Binding HasOutline, Converter={StaticResource BooleanToVisibilityConverter}}", preview);
@@ -1457,7 +1486,7 @@ public sealed class DesignSystemResourceTests
         Assert.Contains("OutlineFilterText", preview);
         Assert.Contains("JumpToOutlineCommand", preview);
         Assert.Contains("OutlineIndentConverter", app);
-        var previewCode = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/FilePreviewView.xaml.cs"));
+        var previewCode = ReadSource("src/Nornia.Desktop/Views/FilePreviewView.xaml.cs");
         Assert.Contains("Math.Clamp(_outlineWidth, 190, 320)", previewCode);
         Assert.Contains("OutlineColumn.ActualWidth", previewCode);
         Assert.Contains("OutlineColumn.ActualWidth - e.HorizontalChange", previewCode);
@@ -1471,9 +1500,9 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void CodeWorkbench_DiffDocumentIsWired()
     {
-        var editorArea = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/EditorAreaView.xaml"));
-        var diffView = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/DiffDocumentView.xaml"));
-        var diffCode = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/DiffDocumentView.xaml.cs"));
+        var editorArea = ReadSource("src/Nornia.Desktop/Views/EditorAreaView.xaml");
+        var diffView = ReadSource("src/Nornia.Desktop/Views/DiffDocumentView.xaml");
+        var diffCode = ReadSource("src/Nornia.Desktop/Views/DiffDocumentView.xaml.cs");
 
         Assert.Contains("DataType=\"{x:Type vm:DiffTab}\"", editorArea);
         Assert.Contains("<views:DiffDocumentView", editorArea);
@@ -1500,7 +1529,7 @@ public sealed class DesignSystemResourceTests
         Assert.Contains("BlockAtIndex", diffCode);
         // diff editors render at the persisted reading font size (aligned with the code preview,
         // independent of the global UI font scale)
-        var tabModel = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/ViewModels/EditorAreaViewModel.cs"));
+        var tabModel = EditorViewModelSources();
         Assert.Contains("EditorFontSize = options.FontSize > 0 ? options.FontSize : 14", tabModel);
         Assert.Equal(3, diffView.Split("FontSize=\"{Binding EditorFontSize}\"").Length - 1);
     }
@@ -1508,13 +1537,13 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void CodeWorkbench_UsesAvalonEditAndExposesVsCodeStyleTabState()
     {
-        var project = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Nornia.Desktop.csproj"));
-        var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
-        var tabs = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/EditorGroupView.xaml"));
-        var unifiedTabs = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/EditorGroupsView.xaml"));
-        var codeReader = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/CodeDocumentView.xaml.cs"));
-        var tabModel = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/ViewModels/WorkbenchTabViewModel.cs"));
-        var editorModel = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/ViewModels/EditorAreaViewModel.cs"));
+        var project = ReadSource("src/Nornia.Desktop/Nornia.Desktop.csproj");
+        var app = ReadSource("src/Nornia.Desktop/App.xaml");
+        var tabs = ReadSource("src/Nornia.Desktop/Views/EditorGroupView.xaml");
+        var unifiedTabs = ReadSource("src/Nornia.Desktop/Views/EditorGroupsView.xaml");
+        var codeReader = ReadSource("src/Nornia.Desktop/Views/CodeDocumentView.xaml.cs");
+        var tabModel = ReadSource("src/Nornia.Desktop/ViewModels/WorkbenchTabViewModel.cs");
+        var editorModel = EditorViewModelSources();
 
         Assert.Contains("PackageReference Include=\"AvalonEdit\" Version=\"6.3.1.120\"", project);
         Assert.DoesNotContain("ActiproSoftware", project);
@@ -1537,9 +1566,9 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void CodeWorkbench_MinimapAndPreviewStateAreWired()
     {
-        var document = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/CodeDocumentView.xaml"));
-        var documentCode = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/CodeDocumentView.xaml.cs"));
-        var preview = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/FilePreviewView.xaml"));
+        var document = ReadSource("src/Nornia.Desktop/Views/CodeDocumentView.xaml");
+        var documentCode = ReadSource("src/Nornia.Desktop/Views/CodeDocumentView.xaml.cs");
+        var preview = ReadSource("src/Nornia.Desktop/Views/FilePreviewView.xaml");
 
         Assert.Contains("MinimapHost", document);
         Assert.Contains("ShowMinimapProperty", documentCode);
@@ -1555,7 +1584,7 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void EditorTabs_ReleaseResourcesOnClose()
     {
-        var tabModel = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/ViewModels/EditorAreaViewModel.cs"));
+        var tabModel = EditorViewModelSources();
 
         Assert.Contains("public virtual void ReleaseResources()", tabModel);
         Assert.Contains("tab.ReleaseResources();", tabModel);
@@ -1567,9 +1596,9 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void CodeWorkbench_FoldingAndViewStateAreWired()
     {
-        var code = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/CodeDocumentView.xaml.cs"));
-        var previewCode = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/FilePreviewView.xaml.cs"));
-        var tabModel = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/ViewModels/EditorAreaViewModel.cs"));
+        var code = ReadSource("src/Nornia.Desktop/Views/CodeDocumentView.xaml.cs");
+        var previewCode = ReadSource("src/Nornia.Desktop/Views/FilePreviewView.xaml.cs");
+        var tabModel = EditorViewModelSources();
 
         // VS Code 风格折叠栏(FoldGutterMargin chevron 列)替代被隐藏的 AvalonEdit FoldingMargin;
         // FoldingManager.Install 会自动插入默认 FoldingMargin,必须移除,否则旧折叠栏仍可见。
@@ -1596,8 +1625,8 @@ public sealed class DesignSystemResourceTests
     public void CodeWorkbench_VSCodeParityFeatures()
     {
         // 贴近 VS Code 观感的代码阅读器特性(逐项随实施推进增补)。
-        var code = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/CodeDocumentView.xaml.cs"));
-        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/CodeDocumentView.xaml"));
+        var code = ReadSource("src/Nornia.Desktop/Views/CodeDocumentView.xaml.cs");
+        var view = ReadSource("src/Nornia.Desktop/Views/CodeDocumentView.xaml");
 
         // A1: 当前行高亮是淡 tint,无 1px 边框(HS 主题仍实心,边框已移除)。
         Assert.Contains("CurrentLineBorder = null", code);
@@ -1607,9 +1636,9 @@ public sealed class DesignSystemResourceTests
         Assert.Contains("SelectionBorder = null", code);
         Assert.Contains("SelectionCornerRadius = 3", code);
 
-        var dark = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Themes/Dark.xaml"));
-        var light = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Themes/Light.xaml"));
-        var highContrast = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Themes/HighContrast.xaml"));
+        var dark = ReadSource("src/Nornia.Desktop/Themes/Dark.xaml");
+        var light = ReadSource("src/Nornia.Desktop/Themes/Light.xaml");
+        var highContrast = ReadSource("src/Nornia.Desktop/Themes/HighContrast.xaml");
         Assert.Contains("x:Key=\"EditorBrush\" Color=\"#121314\"", dark);
         Assert.Contains("x:Key=\"SideBarBrush\" Color=\"#191A1B\"", dark);
         Assert.Contains("x:Key=\"AccentBrush\" Color=\"#297AA0\"", dark);
@@ -1647,8 +1676,8 @@ public sealed class DesignSystemResourceTests
     public void DiffView_VSCodeParityFeatures()
     {
         // 贴近 VS Code 观感的 diff 视图特性(逐项随实施推进增补)。
-        var code = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/DiffDocumentView.xaml.cs"));
-        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/DiffDocumentView.xaml"));
+        var code = ReadSource("src/Nornia.Desktop/Views/DiffDocumentView.xaml.cs");
+        var view = ReadSource("src/Nornia.Desktop/Views/DiffDocumentView.xaml");
 
         // B1: 折叠未变更区块可点击展开(命中检测 + 持久投影的 ExpandAtDisplayIndex)。
         Assert.Contains("ExpandAtDisplayIndex", code);
@@ -1672,8 +1701,8 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void DiffView_UsesVSCodeSurfaceAndLayoutTokens()
     {
-        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/DiffDocumentView.xaml"));
-        var code = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/DiffDocumentView.xaml.cs"));
+        var view = ReadSource("src/Nornia.Desktop/Views/DiffDocumentView.xaml");
+        var code = ReadSource("src/Nornia.Desktop/Views/DiffDocumentView.xaml.cs");
 
         Assert.Contains("ShadowPopupEffect", view);
         Assert.Contains("DiffToolbarSeparatorBrush", view);
@@ -1690,7 +1719,7 @@ public sealed class DesignSystemResourceTests
     {
         foreach (var path in ThemeFiles)
         {
-            var theme = File.ReadAllText(Path.Combine(RepoRoot, path));
+            var theme = ReadSource(path);
             foreach (var key in new[]
             {
                 "DiffEditorBorderBrush", "DiffEditorSashBrush", "DiffOverviewRailBrush",
@@ -1708,7 +1737,7 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void WorkspaceTree_HasContextMenuWithPathRevealAndRefreshActions()
     {
-        var text = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/WorkspaceView.xaml"));
+        var text = ReadSource("src/Nornia.Desktop/Views/WorkspaceView.xaml");
         Assert.Contains("SidebarRowChrome.ContextMenu", text);
         Assert.Contains("CopyPathCommand", text);
         Assert.Contains("CopyRelativePathCommand", text);
@@ -1723,7 +1752,7 @@ public sealed class DesignSystemResourceTests
     {
         // The interactive ConPTY surface never displays a context menu: a right click copies an
         // active selection, otherwise it pastes, matching common terminal behavior.
-        var text = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/Controls/TerminalSurfaceControl.cs"));
+        var text = ReadSource("src/Nornia.Desktop/Views/Controls/TerminalSurfaceControl.cs");
         Assert.Contains("MouseButton.Right", text);
         Assert.Contains("CopySelection", text);
         Assert.Contains("PasteClipboard", text);
@@ -1733,8 +1762,8 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void CommitGraphRows_HandleExpansionAfterListSelectionHasSettled()
     {
-        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
-        var code = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml.cs"));
+        var view = ReadSource("src/Nornia.Desktop/Views/GitView.xaml");
+        var code = ReadSource("src/Nornia.Desktop/Views/GitView.xaml.cs");
 
         Assert.Contains("MouseLeftButtonUp=\"CommitBar_MouseLeftButtonUp\"", view);
         Assert.DoesNotContain("Gesture=\"LeftClick\"\n                          Command=\"{Binding DataContext.ToggleLogRowCommand", view);
@@ -1745,8 +1774,8 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void GitTagContextMenu_ActionsCarryTagNameAndInheritThemedMenuItemStyle()
     {
-        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
-        var model = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/ViewModels/GitViewModel.cs"));
+        var view = ReadSource("src/Nornia.Desktop/Views/GitView.xaml");
+        var model = ReadSource("src/Nornia.Desktop/ViewModels/GitViewModel.cs");
 
         // 操作项参数必须取条目自带 TagName:操作项位于标签 MenuItem 的嵌套弹出层内,
         // RelativeSource AncestorType 不跨 Popup 边界,祖先查找恒为 null → 删除/推送/检出
@@ -1764,7 +1793,7 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void CommitGraphRows_KeepSelectionBehaviorWithoutPaintingBlueSelection()
     {
-        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/GitView.xaml"));
+        var view = ReadSource("src/Nornia.Desktop/Views/GitView.xaml");
         var start = view.IndexOf("<Style x:Key=\"ScmGraphRowStyle\"", StringComparison.Ordinal);
         var end = view.IndexOf("</Style>", start, StringComparison.Ordinal) + "</Style>".Length;
         var graphRowStyle = view[start..end];
@@ -1778,12 +1807,12 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void EnvironmentManagementTables_VerticallyCenterCellContent()
     {
-        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/EnvironmentManagementView.xaml"));
-        var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
-        var runtime = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/RuntimeView.xaml"));
-        var tools = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/ToolsView.xaml"));
-        var packages = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/PackagesView.xaml"));
-        var cache = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/CacheView.xaml"));
+        var view = ReadSource("src/Nornia.Desktop/Views/EnvironmentManagementView.xaml");
+        var app = ReadSource("src/Nornia.Desktop/App.xaml");
+        var runtime = ReadSource("src/Nornia.Desktop/Views/RuntimeView.xaml");
+        var tools = ReadSource("src/Nornia.Desktop/Views/ToolsView.xaml");
+        var packages = ReadSource("src/Nornia.Desktop/Views/PackagesView.xaml");
+        var cache = ReadSource("src/Nornia.Desktop/Views/CacheView.xaml");
 
         Assert.Contains("TargetType=\"DataGridCell\"", view);
         Assert.Contains("Property=\"VerticalContentAlignment\" Value=\"Center\"", view);
@@ -1798,7 +1827,7 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void SearchOptionToggles_UseThemeAwareToolbarStyle()
     {
-        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/SearchSidebarView.xaml"));
+        var view = ReadSource("src/Nornia.Desktop/Views/SearchSidebarView.xaml");
 
         Assert.Contains("x:Key=\"SearchOptionToggleStyle\"", view);
         Assert.Equal(4, Regex.Matches(view, "Style=\"\\{StaticResource SearchOptionToggleStyle\\}\"").Count);
@@ -1812,7 +1841,7 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void CachePage_UsesResizableSummaryAndDetailTables()
     {
-        var cache = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/CacheView.xaml"));
+        var cache = ReadSource("src/Nornia.Desktop/Views/CacheView.xaml");
 
         Assert.Contains("Height=\"2*\" MinHeight=\"120\"", cache);
         Assert.Contains("Height=\"3*\" MinHeight=\"160\"", cache);
@@ -1836,9 +1865,9 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void MainWorkbench_UsesStableThreeSlotPanelHeaderAndResponsiveFrame()
     {
-        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/MainWindow.xaml"));
-        var app = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml"));
-        var startup = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/App.xaml.cs"));
+        var view = ReadSource("src/Nornia.Desktop/Views/MainWindow.xaml");
+        var app = ReadSource("src/Nornia.Desktop/App.xaml");
+        var startup = ReadSource("src/Nornia.Desktop/App.xaml.cs");
 
         Assert.Contains("MinWidth=\"960\"", view);
         Assert.Contains("ShowActivated=\"True\"", view);
@@ -1855,9 +1884,9 @@ public sealed class DesignSystemResourceTests
     [Fact]
     public void SettingsPage_HasAccentConfiguration()
     {
-        var view = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Views/SettingsView.xaml"));
+        var view = ReadSource("src/Nornia.Desktop/Views/SettingsView.xaml");
         Assert.Contains("ItemsSource=\"{Binding Editor.View}\"", view);
-        var catalog = File.ReadAllText(Path.Combine(RepoRoot, "src/Nornia.Desktop/Configuration/BuiltInSettingsCatalog.cs"));
+        var catalog = ReadSource("src/Nornia.Desktop/Configuration/BuiltInSettingsCatalog.cs");
         Assert.Contains("Accent", catalog);
         Assert.Contains("强调色", catalog);
         Assert.Contains("SettingEditorKind.Color", catalog);
@@ -1873,7 +1902,7 @@ public sealed class DesignSystemResourceTests
         var ratioRegex = new Regex(@"x:Key=""(?<key>EditorBrush|Hl[A-Za-z]+Brush)"" Color=""#(?<hex>[0-9A-Fa-f]{6})""", RegexOptions.Compiled);
         foreach (var path in ThemeFiles)
         {
-            var text = File.ReadAllText(Path.Combine(RepoRoot, path));
+            var text = ReadSource(path);
             var colors = new Dictionary<string, (double R, double G, double B)>(StringComparer.Ordinal);
             foreach (Match match in ratioRegex.Matches(text))
             {

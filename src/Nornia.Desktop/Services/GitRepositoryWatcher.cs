@@ -182,8 +182,11 @@ public sealed class GitRepositoryWatcher : IGitRepositoryWatcher
             watcher.Deleted += OnFileSystemEvent;
             watcher.Renamed += OnFileSystemEvent;
             watcher.Error += OnWatcherError;
-            watcher.EnableRaisingEvents = true;
             _watcher = watcher;
+            // 必须在 Attach 返回前同步启用:递归 ReadDirectoryChangesW 句柄一开,之后的写入才不会
+            // 落在空窗里。曾经试过把这一步排到线程池,真实文件写入的测试立刻暴露了后果——
+            // Attach 之后前几次写入没有任何事件,直到下一次静默刷新才被看见。
+            watcher.EnableRaisingEvents = true;
         }
     }
 

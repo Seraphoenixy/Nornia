@@ -233,6 +233,43 @@ public sealed class DiffPresentationTests
     }
 
     [Fact]
+    public void ContentLimits_DefaultMatchesCapacityConstants()
+    {
+        var limits = ReadOnlyContentLimits.Default;
+        Assert.Equal(ReadOnlyContentCapacity.FullSourceBytes, limits.FullSourceBytes);
+        Assert.Equal(ReadOnlyContentCapacity.WindowedSourceBytes, limits.WindowedSourceBytes);
+        Assert.Equal(ReadOnlyContentCapacity.FullDiffLines, limits.FullDiffLines);
+        Assert.Equal(ReadOnlyContentCapacity.WindowedDiffLines, limits.WindowedDiffLines);
+    }
+
+    [Fact]
+    public void ContentLimits_CustomThresholdsTierCustomFiles()
+    {
+        // 设置 nornia.reading.* 收紧后的 1MB/2MB 分层:默认常量下的 Full 文件(2MB)变 Summary。
+        var limits = new ReadOnlyContentLimits(1024 * 1024, 2 * 1024 * 1024, 1_000, 2_000);
+        Assert.Equal(ReadOnlyContentTier.Full, limits.ForSource(1024 * 1024));
+        Assert.Equal(ReadOnlyContentTier.Windowed, limits.ForSource(1024 * 1024 + 1));
+        Assert.Equal(ReadOnlyContentTier.Summary, limits.ForSource(2 * 1024 * 1024 + 1));
+        Assert.Equal(ReadOnlyContentTier.Full, limits.ForDiff(1_000));
+        Assert.Equal(ReadOnlyContentTier.Windowed, limits.ForDiff(1_001));
+        Assert.Equal(ReadOnlyContentTier.Summary, limits.ForDiff(2_001));
+    }
+
+    [Fact]
+    public void ContentLimits_WindowedBelowFullIsRaisedToFull()
+    {
+        // 倒挂配置(窗口化 < 全量)不允许出现"窗口化反而更小"的分层:
+        // 窗口化阈值被抬到全量阈值,窗口化层自然消失。
+        var limits = new ReadOnlyContentLimits(4 * 1024 * 1024, 1024, 50_000, 1_000);
+        Assert.Equal(4 * 1024 * 1024, limits.EffectiveWindowedSourceBytes);
+        Assert.Equal(50_000, limits.EffectiveWindowedDiffLines);
+        Assert.Equal(ReadOnlyContentTier.Full, limits.ForSource(4 * 1024 * 1024));
+        Assert.Equal(ReadOnlyContentTier.Summary, limits.ForSource(4 * 1024 * 1024 + 1));
+        Assert.Equal(ReadOnlyContentTier.Full, limits.ForDiff(50_000));
+        Assert.Equal(ReadOnlyContentTier.Summary, limits.ForDiff(50_001));
+    }
+
+    [Fact]
     public void IntralineDiff_UsesUnicodeTextElementBoundaries()
     {
         var result = IntralineDiffBuilder.Build("a👩‍💻e\u0301z", "a👨‍💻e\u0301z");

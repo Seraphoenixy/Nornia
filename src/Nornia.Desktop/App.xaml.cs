@@ -118,6 +118,8 @@ public partial class App : Application
             .AddSingleton<IFolderPickerService, FolderPickerService>()
             .AddSingleton<IExecutablePickerService, ExecutablePickerService>()
             .AddSingleton<IConfirmationService, ConfirmationService>()
+            .AddSingleton<ITextPromptService, TextPromptService>()
+            .AddSingleton<IMessageService, MessageService>()
             .AddSingleton<IDesktopNavigationService, DesktopNavigationService>()
             .AddSingleton<IProjectWorkspaceService, ProjectWorkspaceService>()
             // Silent SCM auto-refresh: working-tree watcher feeds GitViewModel (VS Code-style).
@@ -164,6 +166,7 @@ public partial class App : Application
                 provider.GetRequiredService<TerminalViewModel>(),
                 provider.GetRequiredService<IUiLogService>(),
                 provider.GetRequiredService<IDesktopNavigationService>(),
+                provider.GetRequiredService<IMessageService>(),
                 provider.GetRequiredService<IClipboardService>(),
                 provider.GetRequiredService<SearchViewModel>()))
             .AddSingleton<MainWindow>()

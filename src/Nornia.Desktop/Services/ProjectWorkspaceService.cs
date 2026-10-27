@@ -210,34 +210,51 @@ public sealed class ProjectWorkspaceService(
         }
     }
 
+    /// <summary>Publishes the new context to every subscriber CONCURRENTLY. Handlers are independent
+    /// projections of the same context, and awaiting them one after another made the whole workbench
+    /// wait for the slowest one: the source-control handler reads <c>git status</c> over the entire
+    /// index (O(tracked files) — seconds on a large repository), while the explorer handler, which
+    /// only enumerates one directory, was queued behind it and the user saw "opening this folder is
+    /// slow". Starting all handlers together keeps that git latency off the directory tree and off
+    /// first paint. Failure semantics are unchanged: every handler still runs, and the caller gets
+    /// the single failure or the aggregate so it can roll back.</summary>
     private async Task PublishAsync(ProjectWorkspaceContext? context)
     {
         var handlers = ContextChanged;
         if (handlers is null) return;
 
-        List<Exception>? failures = null;
-        foreach (var handler in handlers.GetInvocationList().Cast<Func<ProjectWorkspaceContext?, Task>>())
-        {
-            try
-            {
-                await handler(context);
-            }
-            catch (Exception ex)
-            {
-                // A single page must not prevent the remaining projections from moving to the
-                // same context. The caller still receives the failure and can roll back.
-                (failures ??= []).Add(ex);
-            }
-        }
+        var invocations = handlers.GetInvocationList()
+            .Cast<Func<ProjectWorkspaceContext?, Task>>()
+            .Select(handler => InvokeHandlerAsync(handler, context))
+            .ToArray();
+        var results = await Task.WhenAll(invocations);
+        var failures = results.Where(exception => exception is not null).Cast<Exception>().ToArray();
 
-        if (failures is { Count: 1 })
+        if (failures.Length == 1)
         {
             throw failures[0];
         }
 
-        if (failures is { Count: > 1 })
+        if (failures.Length > 1)
         {
             throw new AggregateException("一个或多个工作区上下文订阅者切换失败。", failures);
+        }
+    }
+
+    /// <summary>Runs one subscriber and returns its failure instead of throwing, so a single page
+    /// cannot prevent the remaining projections from moving to the same context.</summary>
+    private static async Task<Exception?> InvokeHandlerAsync(
+        Func<ProjectWorkspaceContext?, Task> handler,
+        ProjectWorkspaceContext? context)
+    {
+        try
+        {
+            await handler(context);
+            return null;
+        }
+        catch (Exception ex)
+        {
+            return ex;
         }
     }
 

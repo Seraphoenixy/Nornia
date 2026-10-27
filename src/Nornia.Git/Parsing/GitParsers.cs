@@ -33,12 +33,22 @@ public static class GitStatusParser
         var unstaged = new List<GitFileChange>(Math.Min(512, maxEntries));
         var truncated = false;
 
+        // G11: 两条有界早退,让「病态仓库」的成本与输出规模无关:
+        // 1) 条目上限命中且后面还有记录 → 直接收尾,不再扫描剩余文本(旧实现即使已经截断,
+        //    仍会把几十 MB 的 stdout 逐条切完)。
+        // 2) 末尾没有 NUL 终止符 = 记录被读取上限截断成半条,半条记录不得入库(否则会产生
+        //    一条路径被切短的假更改条目)。
         var text = output.AsSpan();
         var position = 0;
         while (position < text.Length)
         {
             var nul = text[position..].IndexOf('\0');
-            var length = nul < 0 ? text.Length - position : nul;
+            if (nul < 0)
+            {
+                break;
+            }
+
+            var length = nul;
             var record = text.Slice(position, length);
             if (!record.IsEmpty && record[0] == '2')
             {
@@ -48,17 +58,33 @@ public static class GitStatusParser
                 if (after < text.Length)
                 {
                     var nextNul = text[after..].IndexOf('\0');
-                    originalLength = nextNul < 0 ? text.Length - after : nextNul;
+                    if (nextNul < 0)
+                    {
+                        break;
+                    }
+
+                    originalLength = nextNul;
                 }
 
                 var originalPath = originalLength > 0 ? text.Slice(after, originalLength).ToString() : null;
                 ParseRenameEntry(record, originalPath, staged, unstaged, maxEntries, ref truncated);
                 position = after + originalLength + 1;
+                if (staged.Count + unstaged.Count >= maxEntries && position < text.Length)
+                {
+                    truncated = true;
+                    break;
+                }
+
                 continue;
             }
 
             ParseRecord(record, ref branch, ref upstream, ref ahead, ref behind, staged, unstaged, maxEntries, ref truncated);
             position += length + 1;
+            if (staged.Count + unstaged.Count >= maxEntries && position < text.Length)
+            {
+                truncated = true;
+                break;
+            }
         }
 
         return new GitRepositoryStatus(IsRepository: true, branch, upstream, ahead, behind, staged, unstaged, truncated);
@@ -741,5 +767,179 @@ public static class GitLogParser
         }
 
         return refs;
+    }
+}
+
+/// <summary>Parses <c>git blame --porcelain</c> output into the compact <see cref="GitBlame"/> model.
+/// 提交元数据块只在该提交首次出现时输出;行头携带 (origLine finalLine [numLines]),据此把
+/// 行号映射成提交下标。带 <c>\t</c> 前缀的行是文件内容,跳过。</summary>
+public static class GitBlameParser
+{
+    public const int MaxLines = 200_000;
+    public const int MaxCommits = 10_000;
+
+    private sealed class PendingCommit
+    {
+        public required string Hash;
+        public bool Boundary;
+        public string Author = string.Empty;
+        public string Mail = string.Empty;
+        public long Time;
+        public string TimeZone = "+0000";
+        public string Summary = string.Empty;
+    }
+
+    public static GitBlame Parse(string output)
+    {
+        var commits = new List<GitBlameCommit>();
+        var commitIndex = new Dictionary<string, int>(StringComparer.Ordinal);
+        var lineCommits = new List<int>();
+        var truncated = false;
+        PendingCommit? pending = null;
+
+        foreach (var raw in output.Split('\n'))
+        {
+            var line = raw.TrimEnd('\r');
+            if (line.Length == 0)
+            {
+                continue;
+            }
+
+            if (line[0] == '\t')
+            {
+                // 文件内容行:仅用来结束当前提交的元数据段,不进入模型。
+                continue;
+    }
+
+            var space = line.IndexOf(' ');
+            var head = space < 0 ? line : line[..space];
+            if (TryParseHeaderHead(head, out var boundary, out var hash))
+            {
+                // 行头:[^]<hash> <origLine> <finalLine> [<numLines>]
+                FlushPending();
+                if (commits.Count >= MaxCommits && !commitIndex.ContainsKey(hash))
+                {
+                    truncated = true;
+                    continue;
+                }
+
+                var parts = (space < 0 ? string.Empty : line[(space + 1)..]).Split(' ');
+                if (parts.Length < 2 || !int.TryParse(parts[1], out var finalLine) || finalLine < 1)
+                {
+                    continue;
+                }
+
+                var numLines = parts.Length >= 3 && int.TryParse(parts[2], out var groupLines) && groupLines > 0
+                    ? groupLines
+                    : 1;
+                int expectedIndex;
+                if (commitIndex.TryGetValue(hash, out var known))
+                {
+                    expectedIndex = known;
+                }
+                else
+                {
+                    pending = new PendingCommit { Hash = hash, Boundary = boundary };
+                    expectedIndex = commits.Count; // FlushPending 会把它追加到这个下标。
+                }
+
+                // git 按行号顺序连续输出;防御性只接受"正好接在已收集行数之后"的块。
+                if (finalLine - 1 != lineCommits.Count)
+                {
+                    continue;
+                }
+
+                for (var i = 0; i < numLines; i++)
+                {
+                    if (lineCommits.Count >= MaxLines)
+                    {
+                        truncated = true;
+                        break;
+                    }
+
+                    lineCommits.Add(expectedIndex);
+                }
+            }
+            else if (pending is not null && space > 0)
+            {
+                var value = line[(space + 1)..];
+                switch (head)
+                {
+                    case "author":
+                        pending.Author = value;
+                        break;
+                    case "author-mail":
+                        pending.Mail = value.Trim('<', '>');
+                        break;
+                    case "author-time" when long.TryParse(value, out var seconds):
+                        pending.Time = seconds;
+                        break;
+                    case "author-tz":
+                        pending.TimeZone = value;
+                        break;
+                    case "summary":
+                        pending.Summary = value;
+                        break;
+                    case "boundary":
+                        pending.Boundary = true;
+                        break;
+                }
+            }
+        }
+
+        FlushPending();
+        return new GitBlame(commits, lineCommits, truncated);
+
+        void FlushPending()
+        {
+            if (pending is null)
+            {
+                return;
+            }
+
+            var offset = ParseTimeZone(pending.TimeZone);
+            commits.Add(new GitBlameCommit(
+                pending.Hash,
+                pending.Author,
+                pending.Mail,
+                DateTimeOffset.FromUnixTimeSeconds(pending.Time).ToOffset(offset),
+                pending.Summary,
+                pending.Boundary));
+            commitIndex[pending.Hash] = commits.Count - 1;
+            pending = null;
+        }
+
+        static bool TryParseHeaderHead(string head, out bool boundary, out string hash)
+        {
+            boundary = false;
+            hash = string.Empty;
+            var candidate = head;
+            if (candidate.Length > 0 && candidate[0] == '^')
+            {
+                boundary = true;
+                candidate = candidate[1..];
+            }
+
+            if (candidate.Length is < 6 or > 40 || candidate.Any(ch => !Uri.IsHexDigit(ch)))
+            {
+                return false;
+            }
+
+            hash = candidate;
+            return true;
+        }
+
+        static TimeSpan ParseTimeZone(string zone)
+        {
+            if (zone.Length == 5 && (zone[0] is '+' or '-')
+                && int.TryParse(zone[1..3], out var hours)
+                && int.TryParse(zone[3..5], out var minutes))
+            {
+                var offset = new TimeSpan(hours, minutes, 0);
+                return zone[0] == '-' ? -offset : offset;
+            }
+
+            return TimeSpan.Zero;
+        }
     }
 }

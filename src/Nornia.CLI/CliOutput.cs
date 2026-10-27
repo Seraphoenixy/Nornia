@@ -24,6 +24,20 @@ public static class CliOutput
         }
     }
 
+    public static void PrintRollbackPlan(EnvironmentRollbackPlan plan)
+    {
+        Console.WriteLine($"{Nornia.CLI.Localization.CliText.Get("Rollback_BatchHeader")} {plan.CorrelationId:N}");
+        Console.WriteLine("SEQ\tCOMPONENT\tFROM\tTO\tSTRATEGY\tPLAN");
+        foreach (var action in plan.Actions)
+        {
+            Console.WriteLine($"{action.OriginalSequence}\t{action.Component}\t{action.FromVersion}\t{action.ToVersion}\t{action.Strategy}\t{action.PackageId}");
+            if (!string.IsNullOrWhiteSpace(action.Hint))
+            {
+                Console.WriteLine($"\t\t{action.Hint}");
+            }
+        }
+    }
+
     public static void PrintRepairPlan(EnvironmentRepairPlan plan)
     {
         if (plan.Actions.Count == 0)

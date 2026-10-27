@@ -658,8 +658,12 @@
           <StackPanel Orientation="Horizontal" VerticalAlignment="Center"
                       Visibility="{Binding Workbench.SelectedEditorTab.EditorTab, Converter={StaticResource DocumentTabVisibilityConverter}, ConverterParameter=file}">
             <TextBlock Text="·" FontSize="{DynamicResource TypeBody}" Foreground="{DynamicResource StatusBarForegroundBrush}" VerticalAlignment="Center" Margin="8,0" />
-            <TextBlock Text="{Binding Workbench.SelectedEditorTab.EditorTab.EncodingName}" FontSize="{DynamicResource TypeBody}"
-                       Foreground="{DynamicResource StatusBarForegroundBrush}" VerticalAlignment="Center" />
+            <!-- 编码:点击按所选编码强制重新解码(VS Code "Reopen with Encoding" 的只读等价物) -->
+            <Button Style="{StaticResource LinkButton}" FontSize="{DynamicResource TypeBody}" Padding="0,0"
+                    Content="{Binding Workbench.SelectedEditorTab.EditorTab.EncodingName}"
+                    Command="{Binding OpenEncodingPickerCommand}"
+                    CommandParameter="{Binding Workbench.SelectedEditorTab.EditorTab}"
+                    ToolTip="选择编码并重新解码（BOM → 严格 UTF-8 → GB18030 自动检测可被覆盖）" />
             <TextBlock Text="·" FontSize="{DynamicResource TypeBody}" Foreground="{DynamicResource StatusBarForegroundBrush}" VerticalAlignment="Center" Margin="8,0" />
             <TextBlock Text="{Binding Workbench.SelectedEditorTab.EditorTab.NewlineTypeText}" FontSize="{DynamicResource TypeBody}"
                        Foreground="{DynamicResource StatusBarForegroundBrush}" VerticalAlignment="Center" />
@@ -745,6 +749,48 @@
         </DockPanel>
       </Grid>
     </Border>
+
+    <!-- 通知 toast:右上角(标题栏之下)堆叠,容量 3、8 秒自动消失、点击关闭;
+         操作失败终态经 PageViewModel.OperationFailed 聚合而来(状态栏一行文字易被忽略)。 -->
+    <ItemsControl Grid.RowSpan="3" ItemsSource="{Binding Notifications}" Panel.ZIndex="35"
+                  HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,44,16,0"
+                  Focusable="False" IsHitTestVisible="True">
+      <ItemsControl.ItemsPanel><ItemsPanelTemplate><StackPanel /></ItemsPanelTemplate></ItemsControl.ItemsPanel>
+      <ItemsControl.ItemTemplate>
+        <DataTemplate>
+          <Button Command="{Binding DataContext.DismissNotificationCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                  CommandParameter="{Binding}" Cursor="Hand" Margin="0,0,0,8"
+                  AutomationProperties.Name="关闭通知">
+            <Button.Template>
+              <ControlTemplate TargetType="Button">
+                <Border Width="300" Padding="10,8" CornerRadius="{StaticResource RadiusMd}"
+                        Background="{DynamicResource ToolTipBackgroundBrush}"
+                        BorderBrush="{DynamicResource ErrorTextBrush}" BorderThickness="1"
+                        Effect="{StaticResource ShadowPopupEffect}">
+                  <Border.Style>
+                    <Style TargetType="Border">
+                      <Style.Triggers>
+                        <DataTrigger Binding="{Binding Level}" Value="warning">
+                          <Setter Property="BorderBrush" Value="{DynamicResource WarningBrush}" />
+                        </DataTrigger>
+                        <DataTrigger Binding="{Binding Level}" Value="info">
+                          <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}" />
+                        </DataTrigger>
+                      </Style.Triggers>
+                    </Style>
+                  </Border.Style>
+                  <StackPanel>
+                    <TextBlock Text="{Binding Title}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" ToolTip="{Binding Title}" />
+                    <TextBlock Text="{Binding Message}" FontSize="{DynamicResource TypeBody}" Foreground="{DynamicResource MutedTextBrush}"
+                               TextWrapping="Wrap" Margin="0,2,0,0" MaxHeight="60" ToolTip="{Binding Message}" />
+                  </StackPanel>
+                </Border>
+              </ControlTemplate>
+            </Button.Template>
+          </Button>
+        </DataTemplate>
+      </ItemsControl.ItemTemplate>
+    </ItemsControl>
 
     <!-- QuickInput (VS Code command palette / quick open):
          全窗口遮罩压暗整个壳层(标题栏/侧栏/编辑器/状态栏,VS Code 行为),调色板从顶栏中部项目框下方展开。

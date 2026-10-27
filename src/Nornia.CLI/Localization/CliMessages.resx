@@ -53,4 +53,13 @@
   <data name="Summary_ProjectImport" xml:space="preserve"><value>Import an environment declaration into a project.</value></data>
   <data name="Summary_ProjectOpen" xml:space="preserve"><value>Open a project in its editor.</value></data>
   <data name="Summary_Help" xml:space="preserve"><value>Show this help.</value></data>
+  <data name="Env_FixBatchId" xml:space="preserve"><value>Repair batch {0}. Undo with: Nornia env rollback {0} --apply</value></data>
+  <data name="Env_FixRollbackHint" xml:space="preserve"><value>Undo this batch with: Nornia env rollback {0} --apply</value></data>
+  <data name="Summary_EnvRollback" xml:space="preserve"><value>Undo a previously applied environment repair batch.</value></data>
+  <data name="Rollback_BatchHeader" xml:space="preserve"><value>Rollback batch</value></data>
+  <data name="Rollback_InvalidId" xml:space="preserve"><value>'{0}' is not a valid correlation id (expected a GUID).</value></data>
+  <data name="Rollback_NoBatch" xml:space="preserve"><value>No repair batch found for correlation id {0}.</value></data>
+  <data name="Rollback_PreviewOnly" xml:space="preserve"><value>Preview only. Add --apply to undo the steps above.</value></data>
+  <data name="Rollback_Applied" xml:space="preserve"><value>Rollback finished: {0} of {1} step(s) undone, {2} skipped, {3} failed.</value></data>
+  <data name="Rollback_StepFailed" xml:space="preserve"><value>STEP FAILED {0}: {1}</value></data>
 </root>

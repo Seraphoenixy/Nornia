@@ -120,6 +120,32 @@ public sealed record EnvironmentRollbackAction(
     RollbackStrategy Strategy,
     string? Hint = null);
 
+/// <summary>回滚批次中未能自动完成的一步。</summary>
+public sealed record EnvironmentRollbackFailure(
+    int OriginalSequence,
+    string Component,
+    string FromVersion,
+    string ToVersion,
+    string PackageId,
+    string? PackageVersion,
+    string Reason,
+    string? Hint = null);
+
+/// <summary>一次回滚批次的结局。回滚是唯一会反向改动用户机器的路径,失败必须显式表达——
+/// 调用方据此提示用户手动处理,而不是让失败悄悄消失、让用户误以为环境已复原。</summary>
+public sealed record EnvironmentRollbackResult(
+    Guid CorrelationId,
+    int TotalSteps,
+    int UndoneCount,
+    int SkippedCount,
+    IReadOnlyList<EnvironmentRollbackFailure> Failures)
+{
+    public bool FullySucceeded => Failures.Count == 0;
+
+    /// <summary>存在失败或需要人工执行的步骤时为真,调用方应当据此外显醒目提示。</summary>
+    public bool RequiresManualIntervention => Failures.Count > 0 || SkippedCount > 0;
+}
+
 /// <summary>Lightweight reference from the Dashboard to a project that requires attention; used so a
 /// metric-card "Go to details" click can jump straight to the right project instead of the page root.</summary>
 public sealed record DashboardProjectReference(

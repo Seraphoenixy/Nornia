@@ -56,6 +56,7 @@ public partial class ExplorerPageViewModel : PageViewModel, INavigationTarget
         Explorer.FileOpenPermanentRequested += (_, path) => _ = OpenExplorerFileAsync(path, permanent: true);
         Editor.SelectedTabChanged += (_, _) => QueueActiveEditorReveal();
         Explorer.DiffOpenRequested += (_, node) => _ = OpenExplorerDiffAsync(node);
+        Explorer.FileHistoryRequested += (_, node) => OpenExplorerFileHistory(node);
         Git.StatusRefreshed += OnGitStatusRefreshed;
         Git.RevealRequested += (_, path) =>
         {
@@ -396,6 +397,20 @@ public partial class ExplorerPageViewModel : PageViewModel, INavigationTarget
             StagedChanges = status.StagedChanges.Select(Rebase).OfType<GitFileChange>().ToArray(),
             UnstagedChanges = status.UnstagedChanges.Select(Rebase).OfType<GitFileChange>().ToArray()
         };
+    }
+
+    /// <summary>资源管理器文件右键"文件历史":切到 Git 页并按仓库相对路径打开提交历史
+    /// (无仓库/仓库外文件静默忽略——菜单入口可见性不做状态绑定,保持简单)。</summary>
+    private void OpenExplorerFileHistory(WorkspaceNode node)
+    {
+        if (!Git.IsRepository)
+        {
+            return;
+        }
+
+        var relative = ToRepositoryRelativePath(node.RelativePath).Replace('\\', '/');
+        _navigation.Navigate(NavigationTargets.Git, (string?)null);
+        Git.OpenFileHistoryForPath(relative);
     }
 
     private string ToRepositoryRelativePath(string projectRelativePath)

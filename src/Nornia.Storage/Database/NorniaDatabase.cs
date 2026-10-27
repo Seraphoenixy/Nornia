@@ -46,6 +46,10 @@ public sealed class OperationScope : IDisposable
 
 public sealed class NorniaDatabase(string databasePath) : ISqliteConnectionFactory
 {
+    /// <summary>当前 schema 版本，记录在 SQLite 的 <c>user_version</c> 上。
+    /// 提高版本号时，在 <see cref="CreateSchemaAsync"/> 的版本门控块里追加对应的一次性升级语句。</summary>
+    public const int SchemaVersion = 1;
+
     private static readonly bool ProviderInitialized = InitializeProvider();
 
     public string DatabasePath { get; } = databasePath;
@@ -157,11 +161,13 @@ public sealed class NorniaDatabase(string databasePath) : ISqliteConnectionFacto
         _initialization.TrySetResult(true);
     }
 
-    /// <summary>当前 schema 的唯一实现:直接建出最终表结构(不再使用版本化迁移)。
-    /// 供 <see cref="InitializeAsync"/> 与测试(任意连接来源)共用。重复执行安全
-    /// (IF NOT EXISTS),对已按旧版本建好的库也是幂等的。</summary>
+    /// <summary>当前 schema 的唯一实现:建出最终表结构,并执行一次性的版本化升级。
+    /// 供 <see cref="InitializeAsync"/> 与测试(任意连接来源)共用。重复执行安全:
+    /// 建表全部 <c>IF NOT EXISTS</c>,破坏性语句只在 <c>user_version</c> 落后时执行一次。</summary>
     public static async Task CreateSchemaAsync(SqliteConnection connection, CancellationToken cancellationToken = default)
     {
+        // ① 建表。唯一索引留到一次性升级(②)之后:旧库可能残留同一 path 的多条项目记录,
+        //    先建唯一索引会直接抛异常导致应用起不来。
         await connection.ExecuteAsync(new CommandDefinition("""
             CREATE TABLE IF NOT EXISTS runtimes (
                 id TEXT PRIMARY KEY, name TEXT NOT NULL, version TEXT NOT NULL, install_path TEXT NOT NULL,
@@ -180,18 +186,49 @@ public sealed class NorniaDatabase(string databasePath) : ISqliteConnectionFacto
             CREATE TABLE IF NOT EXISTS environment_bindings (
                 id TEXT PRIMARY KEY, project_id TEXT NOT NULL, runtime_id TEXT NOT NULL,
                 component TEXT NOT NULL DEFAULT '', required_version TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL);
-            CREATE UNIQUE INDEX IF NOT EXISTS ux_projects_path ON projects(path);
-            CREATE UNIQUE INDEX IF NOT EXISTS ux_environment_profiles_project_id ON environment_profiles(project_id);
-            CREATE INDEX IF NOT EXISTS ix_packages_id_architecture ON packages(id, architecture);
             CREATE TABLE IF NOT EXISTS scan_state (
                 kind TEXT PRIMARY KEY, scanned_at INTEGER NOT NULL,
                 duration_ms INTEGER NOT NULL DEFAULT 0, fingerprint TEXT NOT NULL DEFAULT '');
-
-            -- 日志类数据已全部移出数据库(操作日志整体移除;环境修复明细改为数据目录下的文件)。
-            -- 旧版本库中残留的三张表在此清理;全新库上为无操作。
-            DROP TABLE IF EXISTS logs;
-            DROP TABLE IF EXISTS environment_repair_logs;
-            DROP TABLE IF EXISTS schema_migrations;
             """, cancellationToken: cancellationToken));
+
+        // ② 版本化的一次性升级。旧版实现把下面这些破坏性语句放在每次启动都跑的位置 ——
+        //    它们没有版本或时间戳门控,一旦将来有人恢复某张日志表,数据会被静默销毁。
+        //    现在只在 user_version 落后时执行一次。
+        //    注意:不用 schema_migrations 表记录版本 —— 那张表本身就是要被清理的对象。
+        var version = await connection.ExecuteScalarAsync<long>(
+            new CommandDefinition("PRAGMA user_version;", cancellationToken: cancellationToken));
+        if (version < SchemaVersion)
+        {
+            await connection.ExecuteAsync(new CommandDefinition("""
+                -- 日志类数据已全部移出数据库(操作日志整体移除;环境修复明细改为数据目录下的文件)。
+                DROP TABLE IF EXISTS logs;
+                DROP TABLE IF EXISTS environment_repair_logs;
+                DROP TABLE IF EXISTS schema_migrations;
+
+                -- 唯一索引缺失期间可能积累同一 path 的多条项目记录。保留最近打开的一条,
+                -- 否则下面的 CREATE UNIQUE INDEX ux_projects_path 会抛异常。
+                DELETE FROM projects WHERE rowid NOT IN (
+                    SELECT rowid FROM (
+                        SELECT rowid, ROW_NUMBER() OVER (
+                            PARTITION BY path
+                            ORDER BY COALESCE(last_opened_at, 0) DESC, created_at DESC, rowid ASC) AS rn
+                        FROM projects
+                    ) WHERE rn = 1);
+                """, cancellationToken: cancellationToken));
+        }
+
+        // ③ 索引。
+        await connection.ExecuteAsync(new CommandDefinition("""
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_projects_path ON projects(path);
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_environment_profiles_project_id ON environment_profiles(project_id);
+            CREATE INDEX IF NOT EXISTS ix_packages_id_architecture ON packages(id, architecture);
+            """, cancellationToken: cancellationToken));
+
+        // ④ 抬升版本标记:下次启动不会再执行 ② 里的破坏性语句。
+        if (version < SchemaVersion)
+        {
+            await connection.ExecuteAsync(
+                new CommandDefinition($"PRAGMA user_version = {SchemaVersion};", cancellationToken: cancellationToken));
+        }
     }
 }

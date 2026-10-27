@@ -1,4 +1,4 @@
-using ICSharpCode.AvalonEdit;
+﻿using ICSharpCode.AvalonEdit;
 using ICSharpCode.AvalonEdit.Document;
 using ICSharpCode.AvalonEdit.Editing;
 using ICSharpCode.AvalonEdit.Highlighting;
@@ -103,7 +103,9 @@ public partial class DiffDocumentView : UserControl
     // 滚动路径上的 BlockAtIndex 扫描零分配。
     private IReadOnlyList<DiffRenderLine> _sideChangeMask = [];
     private bool _positionedFirstChange;
-    private readonly List<DiffFindMatch> _diffFindMatches = [];
+    /// <summary>查找匹配语义与预览标签共用同一实现(大小写/整词/正则的支持因此在两条路径上一致)。</summary>
+    private static readonly ITextSearchService SearchService = TextSearchService.Instance;
+    private readonly List<DiffSearchMatch> _diffFindMatches = [];
     // 与 _diffFindMatches 一一对应的文档偏移段,跳转时复用,避免每次对全部匹配重建段集合。
     // 内联模式只用 Inline 列表;并排模式统一行模型文档为空,按旧/新侧分别建段。
     private readonly List<(int Start, int Length)> _diffFindSegments = [];
@@ -116,11 +118,6 @@ public partial class DiffDocumentView : UserControl
     private DiffHunkBlock? _hoverBlock;
     private TextView? _hoverTextView;
     private DiffScrollState? _pendingScrollRestore;
-
-    /// <summary>查找匹配所在的编辑器面板:内联模式在统一行模型上,并排模式直接在旧/新侧行模型上。</summary>
-    private enum DiffFindPane { Inline, Old, New }
-
-    private readonly record struct DiffFindMatch(DiffFindPane Pane, int LineIndex, int Column, int Length);
 
     /// <summary>One contiguous changed block (连续 +/- 行) inside a hunk. git 把间距不超过
     /// 2×上下文行的多处修改合并成一个 hunk——工具条按块锚定、按块应用,用户才能只暂存其中
@@ -284,6 +281,8 @@ public partial class DiffDocumentView : UserControl
             _tab.DiffLines.CollectionChanged -= OnDiffLinesChanged;
             _tab.SideBySideRows.CollectionChanged -= OnSideBySideRowsChanged;
             _tab.ChangeNavigationRequested -= OnChangeNavigationRequested;
+            _tab.FindStepRequested -= OnFindStepRequested;
+            _tab.FindSelectionSeeder = null;
         }
 
         _tab = DataContext as DiffTab;
@@ -299,6 +298,10 @@ public partial class DiffDocumentView : UserControl
         _tab.DiffLines.CollectionChanged += OnDiffLinesChanged;
         _tab.SideBySideRows.CollectionChanged += OnSideBySideRowsChanged;
         _tab.ChangeNavigationRequested += OnChangeNavigationRequested;
+        _tab.FindStepRequested += OnFindStepRequested;
+        // 选区播种只读当前持有焦点的编辑面(旧 Ctrl+F 行为),渲染面无选区时返回 null。
+        _tab.FindSelectionSeeder = () =>
+            _positionedEditor is { IsKeyboardFocusWithin: true, SelectionLength: > 0 } ? _positionedEditor.SelectedText : null;
         _positionedEditor = InlineEditor;
         _ = _tab.LoadAsync();
         RebuildDocuments();
@@ -308,6 +311,9 @@ public partial class DiffDocumentView : UserControl
         ScheduleInitialSideScrollSync();
         RefreshDiffFind();
     }
+
+    /// <summary>DiffTab.FindNext/FindPreviousCommand(命令平台 F3/Shift+F3)→ 视图执行实际跳转。</summary>
+    private void OnFindStepRequested(int direction) => DiffFindJump(direction);
 
     private void OnDiffTextViewMouseMove(object sender, MouseEventArgs e)
     {
@@ -1116,6 +1122,8 @@ public partial class DiffDocumentView : UserControl
         {
             if (_tab!.IsFindBarOpen)
             {
+                // 重开时立即按现有关键字刷新计数(关闭时已 ClearDiffFind,输入未变不会触发去抖)。
+                RefreshDiffFind();
                 DiffFindBox.Focus();
                 DiffFindBox.SelectAll();
             }
@@ -1124,9 +1132,18 @@ public partial class DiffDocumentView : UserControl
                 ClearDiffFind();
             }
         }
-        else if (e.PropertyName == nameof(DiffTab.FindText))
+        else if (e.PropertyName == nameof(DiffTab.FindFocusRequest))
         {
-            // 查找输入逐键触发全量扫描(遍历全部 diff 行 + 构建段集合):150ms 去抖合并
+            // Ctrl+F 命令重复触发(查找框已打开):IsFindBarOpen 不再变化,靠请求序号重新聚焦。
+            DiffFindBox.Focus();
+            DiffFindBox.SelectAll();
+        }
+        else if (e.PropertyName is nameof(DiffTab.FindText)
+            or nameof(DiffTab.FindCaseSensitive)
+            or nameof(DiffTab.FindWholeWord)
+            or nameof(DiffTab.FindUseRegex))
+        {
+            // 查找输入/选项开关逐键触发全量扫描(遍历全部 diff 行 + 构建段集合):150ms 去抖合并
             // 连续按键,大 diff 下避免每键一次 UI 线程遍历。
             if (_diffFindDebounceTimer is null)
             {
@@ -1166,26 +1183,10 @@ public partial class DiffDocumentView : UserControl
     {
         if (_tab is null || e.Handled) return;
         var modifiers = Keyboard.Modifiers;
-        if (e.Key == Key.F && modifiers == ModifierKeys.Control)
-        {
-            var editor = _positionedEditor;
-            if (editor is not null && editor.IsKeyboardFocusWithin && editor.SelectionLength > 0)
-                _tab.FindText = editor.SelectedText;
-            _tab.IsFindBarOpen = true;
-            Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Input, () =>
-            {
-                DiffFindBox.Focus();
-                DiffFindBox.SelectAll();
-            });
-            RefreshDiffFind();
-            e.Handled = true;
-        }
-        else if (e.Key == Key.F3 && modifiers is ModifierKeys.None or ModifierKeys.Shift)
-        {
-            DiffFindJump(modifiers == ModifierKeys.Shift ? -1 : 1);
-            e.Handled = true;
-        }
-        else if (e.Key == Key.Escape && modifiers == ModifierKeys.None && _tab.IsFindBarOpen)
+        // Ctrl+F / F3 不在此处理:它们是命令平台的默认键位
+        // (editor.action.startFind / editor.action.findNext),由窗口级键绑定分发路由到
+        // DiffTab 的命令,用户可在 keybindings.json 重绑。
+        if (e.Key == Key.Escape && modifiers == ModifierKeys.None && _tab.IsFindBarOpen)
         {
             _tab.IsFindBarOpen = false;
             FocusDiffReadingSurface();
@@ -1257,6 +1258,7 @@ public partial class DiffDocumentView : UserControl
         {
             _tab.FindCount = 0;
             _tab.FindIndex = 0;
+            _tab.FindErrorMessage = string.Empty;
         }
         _inlineFindRenderer?.Clear();
         _oldFindRenderer?.Clear();
@@ -1277,6 +1279,19 @@ public partial class DiffDocumentView : UserControl
             return;
         }
 
+        // 正则模式先验证并把编译错误交给查找框(非法表达式不进入扫描,与文件阅读侧一致)。
+        var options = _tab.FindOptions;
+        var regexError = options.UseRegex ? TextSearchService.GetRegexError(query, options.CaseSensitive) : null;
+        if (regexError is not null)
+        {
+            ClearDiffFind();
+            _tab.FindErrorMessage = regexError;
+            return;
+        }
+        _tab.FindErrorMessage = string.Empty;
+
+        // 匹配扫描(逐行 + 上限截断)与并排双栏合并都在 DiffTextSearch 里完成——纯字符串逻辑、
+        // 可脱离 STA 单测;视图只负责把"文本坐标(行号,列)"翻译成 AvalonEdit 的文档偏移并交给渲染器。
         if (EffectiveInline())
         {
             if (_inlineLines.Count == 0)
@@ -1285,32 +1300,11 @@ public partial class DiffDocumentView : UserControl
                 return;
             }
 
-            // 内联模式:统一行模型即 InlineEditor 文档,段按其偏移。
             var document = InlineEditor.Document;
-            for (var i = 0; i < _inlineLines.Count; i++)
+            foreach (var match in DiffTextSearch.SearchLines(_inlineLines, DiffSearchPane.Inline, query, SearchService, options))
             {
-                var text = _inlineLines[i].Text;
-                var column = 0;
-                while (column < text.Length
-                    && (column = text.IndexOf(query, column, StringComparison.OrdinalIgnoreCase)) >= 0)
-                {
-                    _diffFindMatches.Add(new DiffFindMatch(DiffFindPane.Inline, i, column, query.Length));
-                    if (document is not null)
-                    {
-                        _diffFindSegments.Add((document.GetLineByNumber(i + 1).Offset + column, query.Length));
-                    }
-                    if (_diffFindMatches.Count >= 10_000)
-                    {
-                        break;
-                    }
-
-                    column += Math.Max(1, query.Length);
-                }
-
-                if (_diffFindMatches.Count >= 10_000)
-                {
-                    break;
-                }
+                _diffFindMatches.Add(match);
+                AddSegment(document, match, _diffFindSegments);
             }
 
             _oldFindRenderer?.Clear();
@@ -1320,20 +1314,23 @@ public partial class DiffDocumentView : UserControl
         }
         else
         {
-            // 并排模式:InlineEditor 文档为空,直接扫描两侧可见行模型;两侧按行对齐,
-            // 匹配按(行号,旧在前)合并,F3 才能自上而下推进。旧/新编辑器同步显示段高亮。
-            List<DiffFindMatch> oldMatches = [], newMatches = [];
-            ScanSideFind(query, _oldLines, OldEditor, oldMatches, _oldFindSegments);
-            ScanSideFind(query, _newLines, NewEditor, newMatches, _newFindSegments);
-            var (oldIndex, newIndex) = (0, 0);
-            while ((oldIndex < oldMatches.Count || newIndex < newMatches.Count)
-                && _diffFindMatches.Count < 10_000)
+            // 并排模式:InlineEditor 文档为空,直接扫描两侧行模型;两侧按行对齐,匹配按
+            // (行号,旧在前)合并,F3 才能自上而下推进。旧/新编辑器同步显示段高亮。
+            var oldMatches = DiffTextSearch.SearchLines(_oldLines, DiffSearchPane.Old, query, SearchService, options);
+            var newMatches = DiffTextSearch.SearchLines(_newLines, DiffSearchPane.New, query, SearchService, options);
+            var oldDocument = OldEditor.Document;
+            var newDocument = NewEditor.Document;
+            foreach (var match in oldMatches)
             {
-                var takeOld = newIndex >= newMatches.Count
-                    || (oldIndex < oldMatches.Count
-                        && oldMatches[oldIndex].LineIndex <= newMatches[newIndex].LineIndex);
-                _diffFindMatches.Add(takeOld ? oldMatches[oldIndex++] : newMatches[newIndex++]);
+                AddSegment(oldDocument, match, _oldFindSegments);
             }
+
+            foreach (var match in newMatches)
+            {
+                AddSegment(newDocument, match, _newFindSegments);
+            }
+
+            _diffFindMatches.AddRange(DiffTextSearch.MergeSideBySide(oldMatches, newMatches));
 
             _inlineFindRenderer?.Clear();
             var oldRenderer = _oldFindRenderer ??= new DiffFindRenderer(this, OldEditor);
@@ -1346,31 +1343,16 @@ public partial class DiffDocumentView : UserControl
         _tab.FindIndex = -1;
     }
 
-    private void ScanSideFind(string query, IReadOnlyList<DiffRenderLine> lines, TextEditor editor,
-        List<DiffFindMatch> matches, List<(int Start, int Length)> segments)
+    /// <summary>把文本坐标翻译成编辑器文档偏移。行号越界(文档与行模型短暂不同步)时跳过该段,
+    /// 只丢高亮、不影响匹配计数与跳转。</summary>
+    private static void AddSegment(TextDocument? document, DiffSearchMatch match, List<(int Start, int Length)> segments)
     {
-        var document = editor.Document;
-        for (var i = 0; i < lines.Count && matches.Count < 10_000; i++)
+        if (document is null || match.LineIndex >= document.LineCount)
         {
-            var text = lines[i].Text;
-            var column = 0;
-            while (column < text.Length
-                && (column = text.IndexOf(query, column, StringComparison.OrdinalIgnoreCase)) >= 0)
-            {
-                matches.Add(new DiffFindMatch(lines == _oldLines ? DiffFindPane.Old : DiffFindPane.New,
-                    i, column, query.Length));
-                if (document is not null)
-                {
-                    segments.Add((document.GetLineByNumber(i + 1).Offset + column, query.Length));
-                }
-                if (matches.Count >= 10_000)
-                {
-                    return;
-                }
-
-                column += Math.Max(1, query.Length);
-            }
+            return;
         }
+
+        segments.Add((document.GetLineByNumber(match.LineIndex + 1).Offset + match.Column, match.Length));
     }
 
     private void DiffFindJump(int step)
@@ -1380,9 +1362,7 @@ public partial class DiffDocumentView : UserControl
             return;
         }
 
-        var index = _tab.FindIndex < 0
-            ? step < 0 ? _diffFindMatches.Count - 1 : 0
-            : (_tab.FindIndex + step + _diffFindMatches.Count) % _diffFindMatches.Count;
+        var index = DiffTextSearch.Step(_tab.FindIndex, _diffFindMatches.Count, step);
         _tab.FindIndex = index;
         var match = _diffFindMatches[index];
         var lineNumber = match.LineIndex + 1;
@@ -1393,13 +1373,13 @@ public partial class DiffDocumentView : UserControl
         DiffFindRenderer? renderer;
         switch (match.Pane)
         {
-            case DiffFindPane.Old:
+            case DiffSearchPane.Old:
                 editor = OldEditor;
                 counterpart = NewEditor;
                 segments = _oldFindSegments;
                 renderer = _oldFindRenderer;
                 break;
-            case DiffFindPane.New:
+            case DiffSearchPane.New:
                 editor = NewEditor;
                 counterpart = OldEditor;
                 segments = _newFindSegments;

@@ -258,7 +258,7 @@ public sealed class SettingsLiveEffectTests : IDisposable
         var watcher = new FakeGitRepositoryWatcher();
         var viewModel = new GitViewModel(
             git, new FakeFolderPicker { Result = _tempDir }, new FakeConfirmationService(),
-            new FakeProjectCatalog(), new EditorAreaViewModel(git, new FakeUiLogService()),
+            new FakeTextPromptService(), new FakeProjectCatalog(), new EditorAreaViewModel(git, new FakeUiLogService()),
             new FakeUiLogService(), new FakeClipboardService(), watcher,
             new FakeProjectWorkspaceService(), new FakeApplicationStateStore(), settings);
 
@@ -274,8 +274,11 @@ public sealed class SettingsLiveEffectTests : IDisposable
         await WaitUntilAsync(() => watcher.AttachedPaths.Count >= 2, "重新开启自动刷新后未重新附加监视器");
     }
 
-    // ===== 恢复上次工作区:会话中开关实时语义 =====
+    // git.statusLimit 的实时生效需要「后台线程改设置 + 所有权线程发布」的真实线程形态,
+    // 由 GitStatusLimitOwnerThreadTests 在自建 STA 宿主上承担(本类的测试线程没有 WPF 宿主,
+    // 跨线程亲和的发布只会被内联,证明不了这条红线)。
 
+    // ===== 恢复上次工作区:会话中开关实时语义 =====
     [Fact]
     public async Task RestoreLastWorkspace_ToggledOnAfterStartup_RestoresRecentWorkspace()
     {

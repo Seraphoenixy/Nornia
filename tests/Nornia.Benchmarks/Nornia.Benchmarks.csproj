@@ -1,14 +1,19 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>Exe</OutputType>
+    <!-- 与 Directory.Build.props 同值,但必须写在这里:BenchmarkDotNet 生成的脚手架工程只读
+         本项目文件的 TargetFramework,读不到继承来的 net10.0-windows 时会退回 net10.0 并还原失败。 -->
+    <TargetFramework>net10.0-windows</TargetFramework>
     <Optimize>true</Optimize>
     <IsPackable>false</IsPackable>
+    <IsPublishable>false</IsPublishable>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="BenchmarkDotNet" Version="0.14.0" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\\..\\src\\Nornia.Core\\Nornia.Core.csproj" />
+    <ProjectReference Include="..\\..\\src\\Nornia.Git\\Nornia.Git.csproj" />
     <ProjectReference Include="..\\..\\src\\Nornia.Package\\Nornia.Package.csproj" />
     <ProjectReference Include="..\\..\\src\\Nornia.Project\\Nornia.Project.csproj" />
   </ItemGroup>

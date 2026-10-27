@@ -28,8 +28,11 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
     private const int BinaryProbeLength = 4096;
 
     /// <summary>Upper bound for a single <c>git status</c> stdout capture. The cap bounds memory and
-    /// the truncation flag lets the caller degrade instead of buffering unbounded output.</summary>
-    internal const int StatusMaximumOutputBytes = 32 * 1024 * 1024;
+    /// the truncation flag lets the caller degrade instead of buffering unbounded output. Sized so a
+    /// full <see cref="StatusMaximumEntries"/> read always fits (a generous ~1.6 KB per record), while
+    /// a pathological working tree (hundreds of thousands of untracked files) is cut off and its
+    /// <c>git status</c> terminated instead of drained.</summary>
+    internal const int StatusMaximumOutputBytes = 16 * 1024 * 1024;
 
     /// <summary>Entry cap for one status parse (VS Code's statusLimit). Beyond it
     /// <see cref="GitRepositoryStatus.Truncated"/> is set and the UI degrades gracefully.</summary>
@@ -41,6 +44,16 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
     internal static readonly IReadOnlyDictionary<string, string> OptionalLocksDisabled =
         new Dictionary<string, string>(StringComparer.Ordinal) { ["GIT_OPTIONAL_LOCKS"] = "0" };
 
+    /// <summary>Index-resident caches (untracked cache) that a status read may maintain. Passed only
+    /// together with an index write-back: without the write-back git cannot persist what it
+    /// computed, so requesting the cache would be a no-op. No daemon is involved — the untracked
+    /// cache lives inside <c>.git/index</c>.</summary>
+    internal static readonly string[] IndexCacheArguments = ["-c", "core.untrackedCache=true"];
+
+    /// <summary>Opt-in file-system monitor (<c>git.fsmonitor</c> setting). Git starts a background
+    /// monitor daemon per repository, which is why it is never enabled implicitly.</summary>
+    internal static readonly string[] FileSystemMonitorArguments = ["-c", "core.fsmonitor=true"];
+
     // Read-only Git commands use a small shared pool per repository. Writes remain exclusive and
     // wait for every read to finish, so the safety invariant is preserved without making the full
     // Git page pay the sum of status + branch + log + stash command durations.
@@ -49,21 +62,68 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
     private RepositoryExecutionGate RepositoryGate(string repositoryPath) =>
         _repositoryGates.GetOrAdd(Path.GetFullPath(repositoryPath), _ => new RepositoryExecutionGate());
 
-    public async Task<GitRepositoryStatus> GetStatusAsync(
+    public Task<GitRepositoryStatus> GetStatusAsync(
         string repositoryPath,
         CancellationToken cancellationToken = default,
-        bool includeAllUntracked = true)
-    {
-        var untrackedMode = includeAllUntracked ? "all" : "normal";
-        var result = await RunGitAsync(
+        bool includeAllUntracked = true) =>
+        GetStatusCoreAsync(
             repositoryPath,
-            ["status", "--porcelain=v2", "--branch", "-z", $"--untracked-files={untrackedMode}"],
+            cancellationToken,
+            new GitStatusReadOptions(StatusMaximumEntries, includeAllUntracked));
+
+    /// <summary>Status read with an explicit entry cap (the Desktop workbench feeds this from the
+    /// <c>git.statusLimit</c> setting). The cap is clamped to <see cref="StatusMaximumEntries"/>: a
+    /// smaller value degrades earlier, a larger one never exceeds the bound the UI is designed for.</summary>
+    public Task<GitRepositoryStatus> GetStatusAsync(
+        string repositoryPath,
+        int maximumEntries,
+        CancellationToken cancellationToken = default) =>
+        GetStatusCoreAsync(
+            repositoryPath,
+            cancellationToken,
+            new GitStatusReadOptions(maximumEntries, IncludeAllUntracked: true));
+
+    /// <summary>Full status read: entry cap, untracked mode and the index write-back / fsmonitor
+    /// policy all come from <paramref name="options"/>. The cap never bounds git's own work (the
+    /// index refresh is O(tracked files) either way) — only the retained entries.</summary>
+    public Task<GitRepositoryStatus> GetStatusAsync(
+        string repositoryPath,
+        GitStatusReadOptions options,
+        CancellationToken cancellationToken = default) =>
+        GetStatusCoreAsync(repositoryPath, cancellationToken, options);
+
+    private async Task<GitRepositoryStatus> GetStatusCoreAsync(
+        string repositoryPath,
+        CancellationToken cancellationToken,
+        GitStatusReadOptions options)
+    {
+        var untrackedMode = options.IncludeAllUntracked ? "all" : "normal";
+        var maxEntries = Math.Clamp(options.MaximumEntries, 1, StatusMaximumEntries);
+        var arguments = new List<string>();
+        if (options.AllowIndexWriteBack)
+        {
+            arguments.AddRange(IndexCacheArguments);
+        }
+
+        if (options.EnableFileSystemMonitor)
+        {
+            arguments.AddRange(FileSystemMonitorArguments);
+        }
+
+        arguments.AddRange(["status", "--porcelain=v2", "--branch", "-z", $"--untracked-files={untrackedMode}"]);
+        // G11: 有界读取 —— 保留前缀达到上限就终止 git status,不再排空整段输出;
+        // 解析与建模在 ConfigureAwait(false) 之后回到线程池,不占用调用方(dispatcher)线程。
+        var result = await RunGitBoundedAsync(
+            repositoryPath,
+            arguments,
             cancellationToken,
             allowFailure: true,
-            readOnly: true,
-            maximumOutputBytes: StatusMaximumOutputBytes);
-        return result.IsSuccess
-            ? GitStatusParser.Parse(result.StandardOutput, StatusMaximumEntries)
+            maximumOutputBytes: StatusMaximumOutputBytes,
+            allowIndexWriteBack: options.AllowIndexWriteBack).ConfigureAwait(false);
+        // A stopped-at-limit run reports the kill's exit code, not 0: the retained prefix is the
+        // agreed partial result, so truncation is treated as success here by design.
+        return result.IsSuccess || result.OutputTruncated
+            ? GitStatusParser.Parse(result.StandardOutput, maxEntries)
             : GitRepositoryStatus.NotARepository;
     }
 
@@ -697,14 +757,12 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
 
         if (paths.Count == 0)
         {
-            var status = await GetStatusAsync(repositoryPath, cancellationToken);
-            if (!status.IsRepository)
-            {
-                throw new GitOperationException("Not a git repository.");
-            }
-
+            // "Discard everything" only needs the untracked set (the tracked side is restored with a
+            // single `restore ... -- .`). A full `git status` here would repeat the O(tracked files)
+            // index refresh the view model performs right after this call — one user action paid two
+            // whole-repository scans. `ls-files --others` reads the index without refreshing it.
             tracked = []; // restore everything below
-            untracked = status.UnstagedChanges.Where(change => change.IsUntracked).Select(change => change.Path).ToArray();
+            untracked = await ListUntrackedPathsAsync(repositoryPath, cancellationToken);
         }
         else
         {
@@ -754,14 +812,12 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
 
         if (paths.Count == 0)
         {
-            var status = await GetStatusAsync(repositoryPath, cancellationToken);
-            if (!status.IsRepository)
-            {
-                throw new GitOperationException("Not a git repository.");
-            }
-
-            tracked = status.UnstagedChanges.Where(change => !change.IsUntracked).Select(change => change.Path).ToArray();
-            untracked = status.UnstagedChanges.Where(change => change.IsUntracked).Select(change => change.Path).ToArray();
+            // 与 DiscardAsync 同理:"丢弃全部未暂存"不需要一次完整 status。已跟踪侧用一条
+            // `restore --worktree -- .`(等价于原先按 status 列表逐路径还原),未跟踪侧用
+            // `ls-files --others`(不刷新索引,不重复视图层紧接着要做的那次全库扫描)。
+            await RunGitAsync(repositoryPath, ["restore", "--worktree", "--", "."], cancellationToken: cancellationToken);
+            untracked = await ListUntrackedPathsAsync(repositoryPath, cancellationToken);
+            tracked = [];
         }
         else
         {
@@ -794,6 +850,23 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
                 throw new GitOperationException($"Unable to discard untracked file '{path}': {ex.Message}", ex.Message);
             }
         }
+    }
+
+    /// <summary>Untracked, non-ignored worktree files (<c>ls-files --others --exclude-standard -z</c>).
+    /// Unlike <c>git status</c> this never refreshes the index, so it does not cost one stat (and,
+    /// for changed entries, one content hash) per TRACKED file — the mutation paths that only need
+    /// the untracked set use this instead of a whole-repository status read.</summary>
+    private async Task<IReadOnlyCollection<string>> ListUntrackedPathsAsync(string repositoryPath, CancellationToken cancellationToken)
+    {
+        var listed = await RunGitAsync(
+            repositoryPath,
+            ["ls-files", "--others", "--exclude-standard", "-z"],
+            cancellationToken,
+            allowFailure: true,
+            readOnly: true);
+        return listed.IsSuccess
+            ? listed.StandardOutput.Split('\0', StringSplitOptions.RemoveEmptyEntries)
+            : [];
     }
 
     public async Task CommitAsync(string repositoryPath, string message, CancellationToken cancellationToken = default)
@@ -831,6 +904,44 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
     public Task<IReadOnlyList<GitCommitInfo>> GetIncomingCommitsAsync(
         string repositoryPath, string upstreamReference, int count = 30, CancellationToken cancellationToken = default) =>
         GetRangeLogAsync(repositoryPath, $"HEAD..{upstreamReference}", count, cancellationToken);
+
+    public async Task<IReadOnlyList<GitCommitInfo>> GetFileLogAsync(
+        string repositoryPath, string path, int count = 50, int skip = 0, CancellationToken cancellationToken = default)
+    {
+        // --follow 跨重命名跟随;--skip 偏移分页(与 LoadMore 的累积语义一致)。
+        var arguments = new List<string>
+        {
+            "log", "-n", Math.Clamp(count, 1, 200).ToString(),
+            "--follow", "--topo-order", "--decorate=full", "--shortstat",
+            $"--pretty=format:{GitLogParser.Format}",
+        };
+        if (skip > 0)
+        {
+            arguments.Add($"--skip={skip}");
+        }
+
+        arguments.Add("--");
+        arguments.Add(path);
+        var result = await RunGitAsync(repositoryPath, arguments, cancellationToken, allowFailure: true, readOnly: true);
+        return result.IsSuccess ? GitLogParser.Parse(result.StandardOutput) : [];
+    }
+
+    public async Task<GitBlame> GetBlameAsync(string repositoryPath, string path, CancellationToken cancellationToken = default)
+    {
+        // 有界读取:超限即终止子进程,保留前缀并标记截断(超大文件的 porcelain 输出可能远超 16MB)。
+        var result = await RunGitBoundedAsync(
+            repositoryPath,
+            ["blame", "--porcelain", "--", path],
+            cancellationToken,
+            allowFailure: true);
+        if (!result.IsSuccess && !result.OutputTruncated)
+        {
+            return GitBlame.Empty;
+        }
+
+        var blame = GitBlameParser.Parse(result.StandardOutput);
+        return result.OutputTruncated ? blame with { Truncated = true } : blame;
+    }
 
     public Task<IReadOnlyList<GitCommitInfo>> GetOutgoingCommitsAsync(
         string repositoryPath, string upstreamReference, int count = 30, CancellationToken cancellationToken = default) =>
@@ -1111,20 +1222,52 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
     public async Task PushAsync(string repositoryPath, GitPushOptions options, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(options);
-        var status = await GetStatusAsync(repositoryPath, cancellationToken);
-        if (!status.IsRepository)
-        {
-            throw new GitOperationException("Not a git repository.");
-        }
-
-        var currentBranch = status.Branch;
-        if (string.IsNullOrWhiteSpace(currentBranch))
+        // The branch name used to be read out of a full `git status`, which pays the whole
+        // repository's index refresh just to learn "HEAD -> name". Two cheap probes replace it and
+        // the expensive read stays where it belongs (the view model's own refresh).
+        var currentBranch = await ResolveCurrentBranchAsync(repositoryPath, cancellationToken);
+        if (currentBranch is null)
         {
             throw new GitOperationException("Push requires a checked-out branch (detached HEAD cannot be pushed).");
         }
 
+        if (currentBranch.Length == 0)
+        {
+            throw new GitOperationException("Not a git repository.");
+        }
+
         var args = options.BuildArguments(currentBranch).ToList();
         await RunGitAsync(repositoryPath, args, cancellationToken: cancellationToken);
+    }
+
+    /// <summary>Current branch short name without a status read. Returns the branch name, an empty
+    /// string when the path is not a git repository, or <see langword="null"/> for a detached HEAD
+    /// (or an unborn branch), which is what push must refuse.</summary>
+    private async Task<string?> ResolveCurrentBranchAsync(string repositoryPath, CancellationToken cancellationToken)
+    {
+        var head = await RunGitAsync(
+            repositoryPath,
+            ["rev-parse", "--abbrev-ref", "HEAD"],
+            cancellationToken,
+            allowFailure: true,
+            readOnly: true);
+        var branch = head.IsSuccess ? head.StandardOutput.Trim() : string.Empty;
+        if (branch.Length > 0 && !string.Equals(branch, "HEAD", StringComparison.Ordinal))
+        {
+            return branch;
+        }
+
+        // Ambiguous failure (detached HEAD, unborn branch, or not a repository) — one extra cheap
+        // probe only on this error path decides which message the caller gets.
+        var inside = await RunGitAsync(
+            repositoryPath,
+            ["rev-parse", "--is-inside-work-tree"],
+            cancellationToken,
+            allowFailure: true,
+            readOnly: true);
+        return inside.IsSuccess && inside.StandardOutput.Trim().Equals("true", StringComparison.OrdinalIgnoreCase)
+            ? null
+            : string.Empty;
     }
 
     private async Task<string?> ResolveHeadAsync(string repositoryPath, CancellationToken cancellationToken)
@@ -1416,26 +1559,83 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
         }
     }
 
-    private async Task<ProcessResult> RunGitAsync(
+    /// <summary>Runs a git command off the caller's thread. Git reads are subprocess-bound, and the
+    /// Desktop workbench calls them from the dispatcher: without this hop <c>Process.Start</c> and the
+    /// gate acquisition would both execute synchronously on the UI thread (a free semaphore slot
+    /// completes its await inline), so even a fully <c>ConfigureAwait(false)</c> body could not keep
+    /// the launch itself off the UI thread.</summary>
+    private Task<ProcessResult> RunGitAsync(
         string repositoryPath,
         IReadOnlyList<string> arguments,
         CancellationToken cancellationToken,
         bool allowFailure = false,
         bool readOnly = false,
-        int? maximumOutputBytes = null)
+        int? maximumOutputBytes = null) =>
+        Task.Run(() => RunGitCoreAsync(
+            repositoryPath,
+            arguments,
+            cancellationToken,
+            allowFailure,
+            readOnly,
+            maximumOutputBytes,
+            stopAtOutputLimit: false,
+            allowIndexWriteBack: false), cancellationToken);
+
+    /// <summary>Bounded read variant of <see cref="RunGitAsync"/>: keeps the retained stdout under
+    /// <paramref name="maximumOutputBytes"/> and stops the child once the cap is hit. Like the text
+    /// variant it is launched on the thread pool, because <c>Process.Start</c> and an uncontended
+    /// gate slot both complete synchronously on the caller's thread.</summary>
+    /// <param name="allowIndexWriteBack">When true the child runs WITHOUT
+    /// <c>GIT_OPTIONAL_LOCKS=0</c>, so git may persist the index refresh this read computed. The
+    /// command still holds a read slot (it never takes the per-repository write turnstile); git's
+    /// own <c>.git/index.lock</c> serializes the write against other git processes.</param>
+    private Task<ProcessResult> RunGitBoundedAsync(
+        string repositoryPath,
+        IReadOnlyList<string> arguments,
+        CancellationToken cancellationToken,
+        bool allowFailure = false,
+        int maximumOutputBytes = StatusMaximumOutputBytes,
+        bool allowIndexWriteBack = false) =>
+        Task.Run(() => RunGitCoreAsync(
+            repositoryPath,
+            arguments,
+            cancellationToken,
+            allowFailure,
+            readOnly: true,
+            maximumOutputBytes,
+            stopAtOutputLimit: true,
+            allowIndexWriteBack), cancellationToken);
+
+    private async Task<ProcessResult> RunGitCoreAsync(        string repositoryPath,
+        IReadOnlyList<string> arguments,
+        CancellationToken cancellationToken,
+        bool allowFailure,
+        bool readOnly,
+        int? maximumOutputBytes,
+        bool stopAtOutputLimit,
+        bool allowIndexWriteBack)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(repositoryPath);
         var args = new List<string>(arguments.Count + 2) { "-C", repositoryPath };
         args.AddRange(arguments);
+        var environmentVariables = readOnly && !allowIndexWriteBack ? OptionalLocksDisabled : null;
 
         using (await RepositoryGate(repositoryPath).EnterAsync(readOnly, cancellationToken).ConfigureAwait(false))
         {
-            var result = await processRunner.RunAsync(
-                GitExecutable,
-                args,
-                cancellationToken: cancellationToken,
-                environmentVariables: readOnly ? OptionalLocksDisabled : null,
-                maximumOutputBytes: maximumOutputBytes);
+            var result = stopAtOutputLimit
+                ? await processRunner.RunBoundedAsync(
+                    GitExecutable,
+                    args,
+                    maximumOutputBytes ?? throw new ArgumentException(
+                        "A bounded git read requires an output cap.", nameof(maximumOutputBytes)),
+                    environmentVariables,
+                    cancellationToken).ConfigureAwait(false)
+                : await processRunner.RunAsync(
+                    GitExecutable,
+                    args,
+                    cancellationToken: cancellationToken,
+                    environmentVariables: environmentVariables,
+                    maximumOutputBytes: maximumOutputBytes).ConfigureAwait(false);
             if (!result.IsSuccess && !allowFailure)
             {
                 throw GitOperationException.FromResult($"git {arguments[0]}", result.StandardOutput, result.StandardError);
@@ -1464,7 +1664,7 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
                 GitExecutable,
                 args,
                 readOnly ? OptionalLocksDisabled : null,
-                cancellationToken);
+                cancellationToken).ConfigureAwait(false);
             if (!result.IsSuccess)
             {
                 throw GitOperationException.FromResult($"git {arguments[0]}", string.Empty, result.StandardError);
@@ -1475,12 +1675,16 @@ public sealed partial class GitService(IProcessRunner processRunner) : IGitServi
     }
 }
 
-/// <summary>Async reader/writer gate for one repository. Up to four read-only Git processes may
+/// <summary>Async reader/writer gate for one repository. Up to two read-only Git processes may
 /// overlap; a writer closes the turnstile first, then acquires all read slots, preventing both
 /// overlap with existing readers and starvation by newly arriving readers.</summary>
 internal sealed class RepositoryExecutionGate
 {
-    private const int ReadSlots = 4;
+    /// <summary>并发只读 git 进程的槽位数。曾经是 4:打开工作区时 status/branches/remoteBranches/log/
+    /// stashes/remoteCommits 会同时抢槽,六个 <c>git</c> 进程与资源管理器的目录枚举、首屏排版抢同一批
+    /// 线程池线程和同一块盘的 IO,界面因此整体卡顿。两个槽保留了"进程启动延迟重叠"的收益(读命令的
+    /// 主要成本是 launch,而不是执行),同时把并发 IO 压到会与文件枚举交错的下限。</summary>
+    private const int ReadSlots = 2;
     private readonly SemaphoreSlim _turnstile = new(1, 1);
     private readonly SemaphoreSlim _slots = new(ReadSlots, ReadSlots);
 

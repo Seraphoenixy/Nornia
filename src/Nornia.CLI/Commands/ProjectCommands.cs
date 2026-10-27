@@ -12,6 +12,7 @@ public sealed class ProjectInitCommand(CliServices services) : ICommand
     public async Task<int> ExecuteAsync(IReadOnlyList<string> args, CancellationToken cancellationToken)
     {
         var path = Environment.CurrentDirectory;
+        var pathProvided = false;
         string? name = null;
         for (var index = 0; index < args.Count; index++)
         {
@@ -19,9 +20,15 @@ public sealed class ProjectInitCommand(CliServices services) : ICommand
             {
                 name = args[++index];
             }
-            else if (!args[index].StartsWith("--", StringComparison.Ordinal))
+            else if (!args[index].StartsWith("--", StringComparison.Ordinal) && !pathProvided)
             {
                 path = args[index];
+                pathProvided = true;
+            }
+            else
+            {
+                // 未知选项/多余路径参数按用法错误处理,不再静默忽略。
+                throw new CliUsageException($"Usage: Nornia {Name} [path] [--name <name>]");
             }
         }
 
@@ -60,7 +67,7 @@ public sealed class ProjectExportCommand(CliServices services) : ICommand
             return (args[0], args[1]);
         }
 
-        throw new ArgumentException($"Usage: Nornia {CliCommands.Project} {CliCommands.Export} [path] <destination>");
+        throw new CliUsageException($"Usage: Nornia {CliCommands.Project} {CliCommands.Export} [path] <destination>");
     }
 }
 
@@ -85,7 +92,7 @@ public sealed class ProjectImportCommand(CliServices services) : ICommand
     {
         if (args.Count == 0)
         {
-            throw new ArgumentException($"Usage: Nornia {CliCommands.Project} {CliCommands.Import} <source> [path]");
+            throw new CliUsageException($"Usage: Nornia {CliCommands.Project} {CliCommands.Import} <source> [path]");
         }
 
         return args.Count >= 2 ? (args[0], args[1]) : (args[0], Environment.CurrentDirectory);

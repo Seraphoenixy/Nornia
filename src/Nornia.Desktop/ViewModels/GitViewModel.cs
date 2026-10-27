@@ -24,6 +24,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     private readonly IGitService _gitService;
     private readonly IFolderPickerService _folderPicker;
     private readonly IConfirmationService _confirmationService;
+    private readonly ITextPromptService _textPrompt;
     private readonly ISettingsService _scopedSettings;
     private ISettingsSession? _settingsSession;
     private IApplicationStateStore? _stateStore;
@@ -42,6 +43,9 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     // context instead of consulting Application.Current from a timer continuation: tests and
     // secondary WPF hosts can expose a global Dispatcher that belongs to another, idle thread.
     private readonly SynchronizationContext? _uiContext;
+    // 所有权线程:变更列表及其 CollectionView 只能在这条线程上发布。设置会话的 Changed 事件由
+    // 后台监视线程投递,激活链也可能落在线程池,所以"是否已在所有权线程"必须按线程判定。
+    private readonly int _ownerThreadId = Thread.CurrentThread.ManagedThreadId;
 
     // Silent auto-refresh bookkeeping (watcher-driven): at most one refresh in flight, at most one
     // merged refresh pending; a pending refresh that hits a busy (user operation) state is deferred
@@ -66,7 +70,13 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     // every change landing right after a refresh wait ~2s (and mid-flight changes a second full
     // cooldown) before the changes column updated — the "changes not picked up in time" complaint.
     // 500ms caps git-status frequency at 2/s during bursts while keeping update latency < ~1s.
-    internal const long QuietRefreshMinimumIntervalMs = 500;
+    internal const long DefaultQuietRefreshMinimumIntervalMs = 500;
+
+    /// <summary>静默刷新之间的最小间隔(毫秒)。刻意做成可覆盖属性而非 <c>const</c>:
+    /// 测试可以把它调小,从而断言「节流行为本身」而不是「实现跑得够快」——
+    /// 后者是墙钟断言,在负载稍高的 CI 上必然偶发失败。</summary>
+    internal long QuietRefreshMinimumIntervalMs { get; set; } = DefaultQuietRefreshMinimumIntervalMs;
+
     private long _lastQuietRefreshCompletedUtcTicks; // Environment.TickCount64 value, monotonic
     private int _quietRefreshRetryScheduled; // at most one pending retry timer
 
@@ -76,6 +86,25 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     private bool _hasFullStateLoad;
     private string? _lastHeadSignature;
     private bool _scmLayoutRestored;
+
+    // 条目上限来自 git.statusLimit(默认与 GitService 的硬上限一致):上限之外的变更在解析阶段就被
+    // 丢弃,列表只保留前 N 条并显示降级提示——病态工作树不该让 UI 为无界输出付费。
+    internal int StatusEntryLimit { get; set; } = GitService.StatusMaximumEntries;
+
+    /// <summary>每段更改树一次发布的行数上限(「显示更多」按 <see cref="TreeRowRenderChunk"/> 抬高)。
+    /// 刻意做成可注入属性而非 const:测试断言的是「预算生效」,不是「实现跑得够快」。</summary>
+    internal int TreeRowRenderLimit { get; set; } = DefaultTreeRowRenderLimit;
+
+    internal int TreeRowRenderChunk { get; set; } = DefaultTreeRowRenderChunk;
+
+    /// <summary>Opt-in <c>git.fsmonitor</c>: passes <c>-c core.fsmonitor=true</c> to status reads.
+    /// Off by default because Git then runs a background monitor daemon for the repository
+    /// (<c>git fsmonitor--daemon</c> + <c>.git/fsmonitor--daemon</c>); on Windows local NTFS it
+    /// replaces git's per-tracked-file stat pass with the daemon's change list.</summary>
+    private bool _enableFileSystemMonitor;
+
+    private const int DefaultTreeRowRenderLimit = 512;
+    private const int DefaultTreeRowRenderChunk = 512;
 
     /// <summary>The shared editor area (diff tabs). Also the main content of this page.</summary>
     public EditorAreaViewModel Editor => _editor;
@@ -154,6 +183,8 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     {
         OnPropertyChanged(nameof(IsTreeLayout));
         OnPropertyChanged(nameof(IsListLayout));
+        OnPropertyChanged(nameof(ShowMoreUnstagedRowsFooter));
+        OnPropertyChanged(nameof(ShowMoreStagedRowsFooter));
         if (_scmLayoutRestored)
         {
             _ = PersistScmLayoutAsync(value);
@@ -218,7 +249,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             _collapsedFolders.Add(folder.FolderPath);
         }
 
-        RebuildTreeRows();
+        PublishTreeRows();
     }
 
     /// <summary>当前布局下共同选中的未暂存更改。树状视图选中文件夹时展开为该目录下的全部文件。</summary>
@@ -271,17 +302,81 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     private static IEnumerable<GitChangeItem> UniquifyChanges(IEnumerable<GitChangeItem> changes) =>
         changes.GroupBy(change => change.Path, StringComparer.OrdinalIgnoreCase)
             .Select(group => group.First());
+    private IReadOnlyList<ScmRowNode> _unstagedExpandedRows = [];
+    private IReadOnlyList<ScmRowNode> _stagedExpandedRows = [];
+
     private void RebuildTreeRows()
     {
-        FillTreeRows(UnstagedTreeRows, BuildTreeRows(UnstagedChanges, _collapsedFolders));
-        FillTreeRows(StagedTreeRows, BuildTreeRows(StagedChanges, _collapsedFolders));
-        PruneSelection(SelectedUnstagedTreeRows, UnstagedTreeRows);
-        PruneSelection(SelectedStagedTreeRows, StagedTreeRows);
+        _unstagedExpandedRows = BuildTreeRows(UnstagedChanges);
+        _stagedExpandedRows = BuildTreeRows(StagedChanges);
+        PublishTreeRows();
     }
 
-    /// <summary>前后缀差分同步树行:展开/折叠只对受影响区间发 Remove/Insert,其余行与容器
-    /// 保持不动(滚动锚点不跳),避免整列表 Reset 造成的全部可见行重排卡顿;无变化时不发事件。</summary>
-    private static void FillTreeRows(BulkObservableCollection<ScmRowNode> target, IReadOnlyList<ScmRowNode> rows) =>
+    private void PublishTreeRows()
+    {
+        var (unstagedRows, unstagedHidden) = VisibleTreeRows(_unstagedExpandedRows, TreeRowRenderLimit);
+        var (stagedRows, stagedHidden) = VisibleTreeRows(_stagedExpandedRows, TreeRowRenderLimit);
+        HiddenUnstagedRowCount = unstagedHidden;
+        HiddenStagedRowCount = stagedHidden;
+        var unstagedChanged = FillTreeRows(UnstagedTreeRows, unstagedRows);
+        var stagedChanged = FillTreeRows(StagedTreeRows, stagedRows);
+        // 选区裁剪只在集合真的换过内容时做:一次目录折叠只翻转一个文件夹行的标记,
+        // 而按路径重建 10k 条目的可用集合只为确认「选中的行还在」——那是纯浪费。
+        if (unstagedChanged)
+        {
+            PruneSelection(SelectedUnstagedTreeRows, UnstagedTreeRows);
+        }
+
+        if (stagedChanged)
+        {
+            PruneSelection(SelectedStagedTreeRows, StagedTreeRows);
+        }
+    }
+
+    /// <summary>「显示更多」:按块抬高渲染预算后重新发布。命令语义仍作用于全量列表
+    /// (暂存/丢弃/复制读的是 <see cref="UnstagedChanges"/>/<see cref="StagedChanges"/> 与其树选区,
+    /// 预算只限制一次发布的行数,不改变任何操作的作用范围)。</summary>
+    [RelayCommand]
+    private void ShowMoreUnstagedRows()
+    {
+        TreeRowRenderLimit += TreeRowRenderChunk;
+        PublishTreeRows();
+    }
+
+    [RelayCommand]
+    private void ShowMoreStagedRows()
+    {
+        TreeRowRenderLimit += TreeRowRenderChunk;
+        PublishTreeRows();
+    }
+
+    /// <summary>折叠过滤 + 渲染预算:返回发布给视图的行与被预算挡住的行数。预算截断的是
+    /// **发布**的行数,不是数据的完整性;剩余计数驱动「显示更多」页脚。</summary>
+    private (IReadOnlyList<ScmRowNode> Rows, int HiddenCount) VisibleTreeRows(
+        IReadOnlyList<ScmRowNode> expanded, int limit)
+    {
+        var visible = new List<ScmRowNode>();
+        var hiddenBelowDepth = int.MaxValue;
+        var hidden = 0;
+        foreach (var row in expanded)
+        {
+            if (row.Depth > hiddenBelowDepth) continue;
+            hiddenBelowDepth = int.MaxValue;
+            if (row is ScmFolderNode folder && _collapsedFolders.Contains(folder.FolderPath))
+            {
+                if (visible.Count < limit) visible.Add(folder with { IsCollapsed = true });
+                else hidden++;
+                hiddenBelowDepth = folder.Depth;
+            }
+            else if (visible.Count < limit) visible.Add(row);
+            else hidden++;
+        }
+        return (visible, hidden);
+    }
+
+    /// <summary>树行发布:小区间走差分(保留行容器与滚动锚点),大区间单次快照通知(逐条
+    /// Remove/Insert 的通知成本随区间长度二次增长)。无变化时不发任何事件,返回 false。</summary>
+    private static bool FillTreeRows(BulkObservableCollection<ScmRowNode> target, IReadOnlyList<ScmRowNode> rows) =>
         SyncCollection(target, rows);
 
     /// <summary>把更改按目录路径组织成扁平树行序列:文件夹行 + 缩进的文件行,同级条目按名称
@@ -305,13 +400,8 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
 
         var rows = new List<ScmRowNode>();
         FlattenTree(root, string.Empty, 0, collapsedFolders ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase), rows);
-        foreach (var row in rows)
-        {
-            // 竖线 1px 宽,画在列中心 12k + 9:取左缘 12k + 8.5,与文件夹自己列内(折叠图标列,
-            // col0 宽 18,居中线中心 12d + 9)完全对齐;子行把这些线重画到自身整行高度,
-            // 上层折叠图标列的竖线便从第一个子行起连续向下,文件夹行自身不画该列竖线
-            row.AncestorGuideLefts = Enumerable.Range(0, row.Depth).Select(k => 12.0 * k + 8.5).ToArray();
-        }
+        // 层级导线由 ScmRowNode 按深度取共享只读数线(不再每行分配数组:每轮刷新上万次
+        // 小数组分配,且数组按引用参与 record 等值比较,会让「无变化」的发布永远判成有变化)。
         return rows;
     }
 
@@ -623,6 +713,44 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     // the user has toggled the section this session. 提交行自身是否展开属于 GitLogRow 行状态。
     [ObservableProperty] private bool isUnstagedSectionExpanded;
     [ObservableProperty] private bool isStagedSectionExpanded;
+
+    /// <summary>git status 命中条目上限:更改栏只保留了前 N 条,页脚显示可见的降级提示。
+    /// 只写一行日志的降级等于没有降级——用户看不到就以为仓库没有更多变更。</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(StatusTruncationSummary))]
+    private bool isStatusTruncated;
+
+    /// <summary>被渲染预算挡住的未暂存树行数(驱动「显示更多」页脚)。</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasMoreUnstagedRows), nameof(MoreUnstagedRowsSummary), nameof(ShowMoreUnstagedRowsFooter))]
+    private int hiddenUnstagedRowCount;
+
+    /// <summary>被渲染预算挡住的已暂存树行数。</summary>
+    [ObservableProperty]
+    [NotifyPropertyChangedFor(nameof(HasMoreStagedRows), nameof(MoreStagedRowsSummary), nameof(ShowMoreStagedRowsFooter))]
+    private int hiddenStagedRowCount;
+
+    public bool HasMoreUnstagedRows => HiddenUnstagedRowCount > 0;
+
+    public bool HasMoreStagedRows => HiddenStagedRowCount > 0;
+
+    /// <summary>「显示更多」页脚是否出现:渲染预算只作用于树状发布,平铺列表不分页。</summary>
+    public bool ShowMoreUnstagedRowsFooter => HasMoreUnstagedRows && IsTreeLayout;
+
+    public bool ShowMoreStagedRowsFooter => HasMoreStagedRows && IsTreeLayout;
+
+    public string MoreUnstagedRowsSummary => HasMoreUnstagedRows
+        ? $"显示更多（还有 {HiddenUnstagedRowCount} 项未列出）"
+        : string.Empty;
+
+    public string MoreStagedRowsSummary => HasMoreStagedRows
+        ? $"显示更多（还有 {HiddenStagedRowCount} 项未列出）"
+        : string.Empty;
+
+    public string StatusTruncationSummary => IsStatusTruncated
+        ? $"变更条目过多，仅列出前 {StatusEntryLimit} 项（可在设置 git.statusLimit 中调整）。"
+        : string.Empty;
+
     [ObservableProperty] private bool isBranchesSectionExpanded;
     [ObservableProperty] private bool isLogSectionExpanded = true;
 
@@ -655,6 +783,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         IGitService gitService,
         IFolderPickerService folderPicker,
         IConfirmationService confirmationService,
+        ITextPromptService textPromptService,
         IProjectCatalogService projectCatalogService,
         EditorAreaViewModel editor,
         IUiLogService logService,
@@ -667,6 +796,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         _gitService = gitService;
         _folderPicker = folderPicker;
         _confirmationService = confirmationService;
+        _textPrompt = textPromptService;
         _projectCatalogService = projectCatalogService;
         _editor = editor;
         _clipboard = clipboard;
@@ -1512,8 +1642,9 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     /// <summary>弹出标签名对话框,确认后创建标签(轻量或注释化)并刷新历史徽标。</summary>
     private async Task PromptAndCreateTagAsync(string? targetRef, string operation)
     {
-        var owner = System.Windows.Application.Current?.MainWindow;
-        var result = Views.Dialogs.TextPromptDialog.ShowPrompt(owner, operation, "输入新标签名（可用空格分隔，不带 refs/tags/ 前缀）");
+        // 走 ITextPromptService 而不是直接弹 WPF 对话框:ViewModel 不依赖 View,
+        // 且这条命令因此可以在非 STA 宿主里用替身测试。
+        var result = _textPrompt.Prompt(operation, "输入新标签名（可用空格分隔，不带 refs/tags/ 前缀）");
         if (!result.Confirmed || string.IsNullOrWhiteSpace(result.Text))
         {
             LogService.Write("INFO", $"已取消：{operation}。");
@@ -1793,11 +1924,16 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             return;
         }
 
-        if (changes is { HeadOrRefsChanged: true } or { IsUnknown: true })
+        if (changes is { HeadOrRefsChanged: true })
         {
             Interlocked.Exchange(ref _quietRefreshRequiresFullLoad, 1);
         }
 
+        // Watcher overflow / watcher error (isUnknown) deliberately does NOT escalate to a full
+        // load: HEAD never moved in that case, and the full load costs the whole status + the
+        // 2×for-each-ref / log / stash / range-log fan-out. The status-only refresh below is the
+        // authoritative snapshot for lost paths, and a genuine ref change still escalates through
+        // the HEAD-signature comparison in RunQuietRefreshAsync (and through HeadOrRefsChanged above).
         StartQuietRefresh(immediate: false);
     }
 
@@ -1858,19 +1994,11 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
                 return;
             }
 
-            if (_uiContext is null)
-            {
-                HandleWatcherChanges(); // no WPF app (unit tests without STA context)
-                return;
-            }
-
-            // Marshal back to the context that owns the ViewModel and its bound collections.
+            // Marshal back to the context that owns the ViewModel and its bound collections; without a
+            // captured context (no WPF host, e.g. a unit test thread) inline is the only option.
             // Do not use Application.Current.Dispatcher here: it may belong to an unrelated WPF
             // host (notably a shared STA test host) whose queue is not currently being pumped.
-            _uiContext.Post(_ =>
-            {
-                HandleWatcherChanges();
-            }, null);
+            RunOnOwnerThread(() => HandleWatcherChanges());
         });
     }
 
@@ -1940,7 +2068,9 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         // 静默刷新与显式刷新一致,逐文件列出未跟踪内容(仿 VS Code):--untracked-files=normal
         // 会把新建文件夹折叠成 "? dir/" 单条目,更改列表渲染成空名文件行,且无法对其中文件单独
         // 暂存/丢弃/查看 diff。watcher 已忽略 bin/obj/node_modules,条目上限兜底病理仓库。
-        var status = await _gitService.GetStatusAsync(path, cancellationToken);
+        // 索引写回刻意不开启:静默刷新最高每 500ms 一次,若它自己写 .git/index,写事件会经 watcher
+        // 反过来触发下一轮刷新(前台加载已经把索引持久化,这里读到的是热路径)。
+        var status = await LoadStatusAsync(path, includeAllUntracked: true, allowIndexWriteBack: false, cancellationToken);
         if (!IsServiceContextCurrent()) return;
         StatusRefreshed?.Invoke(this, status);
         IsRepository = status.IsRepository;
@@ -2027,6 +2157,51 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         }
     }
 
+    private async Task<GitRepositoryStatus> LoadStatusAsync(
+        string path,
+        bool includeAllUntracked,
+        bool allowIndexWriteBack,
+        CancellationToken cancellationToken) =>
+        await _gitService.GetStatusAsync(
+            path,
+            new GitStatusReadOptions(
+                StatusEntryLimit,
+                IncludeAllUntracked: includeAllUntracked,
+                AllowIndexWriteBack: allowIndexWriteBack,
+                EnableFileSystemMonitor: _enableFileSystemMonitor),
+            cancellationToken);
+
+    /// <summary>Status read for the workspace's FIRST full load (打开工作区): ask for the cheap
+    /// <c>--untracked-files=normal</c> snapshot first so branch / tracked changes / counts are on
+    /// screen without walking every untracked directory, then hand the untracked detail to one
+    /// immediate silent refresh.
+    /// <para>Returns the snapshot to publish plus whether the untracked side still needs the
+    /// <c>all</c> refinement. Collapsed directory records (<c>? dir/</c>) are dropped from the
+    /// published snapshot: they render as a nameless file row (see the SCM untracked-folder fix) and
+    /// the refinement replaces them with the individual files a moment later. The entry count is
+    /// therefore briefly low by the number of collapsed directories — never wrong about tracked
+    /// changes, and never hiding a file that the <c>all</c> read would report.</para></summary>
+    private async Task<(GitRepositoryStatus Status, bool NeedsUntrackedRefinement)> LoadFirstPaintStatusAsync(
+        string path,
+        CancellationToken cancellationToken)
+    {
+        var fast = await LoadStatusAsync(path, includeAllUntracked: false, allowIndexWriteBack: true, cancellationToken);
+        if (!fast.HasCollapsedUntrackedDirectory)
+        {
+            // No untracked directory was collapsed, so `normal` and `all` would have produced the
+            // same records: this snapshot is already complete.
+            return (fast, false);
+        }
+
+        var withoutCollapsed = fast with
+        {
+            UnstagedChanges = fast.UnstagedChanges
+                .Where(change => change.IsUntracked is false || change.Path.EndsWith('/') is false)
+                .ToArray(),
+        };
+        return (withoutCollapsed, true);
+    }
+
     private async Task LoadStateCoreAsync(CancellationToken cancellationToken = default)
     {
         var path = RepositoryPath;
@@ -2040,7 +2215,21 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             return;
         }
 
-        var status = await _gitService.GetStatusAsync(path, cancellationToken);
+        // 首屏:工作区首次全量加载走 -unormal 快照(必要时随后静默补 -uall 明细);之后的显式刷新
+        // 已经是"索引被刷新过"的热路径,直接一次 -uall。两条路径都允许 git 写回索引——把这次读取
+        // 算出的 stat/哈希结果持久化,否则(见 GitStatusReadOptions)每次读取都要重算整棵工作树。
+        var isFirstLoad = !_hasFullStateLoad;
+        GitRepositoryStatus status;
+        var needsUntrackedRefinement = false;
+        if (isFirstLoad)
+        {
+            (status, needsUntrackedRefinement) = await LoadFirstPaintStatusAsync(path, cancellationToken);
+        }
+        else
+        {
+            status = await LoadStatusAsync(path, includeAllUntracked: true, allowIndexWriteBack: true, cancellationToken);
+        }
+
         if (!IsServiceContextCurrent()) return;
         StatusRefreshed?.Invoke(this, status);
         IsRepository = status.IsRepository;
@@ -2062,12 +2251,17 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         PopulateChanges(status);
         if (status.Truncated)
         {
-            // G2: status 超条目上限 → UI 降级提示(列表只保留前 N 条,不继续无界缓冲)。
+            // G2: status 超条目上限 → 页脚的可见降级提示(见 StatusTruncationSummary)+ 一条日志,
+            // 便于从日志确认工作树确实被截断,而不是"列表只保留了前 N 条"的静默行为。
             LogService.Write("WARNING",
-                $"仓库变更条目过多，仅显示前 {GitService.StatusMaximumEntries} 条。");
+                $"仓库变更条目过多，仅列出前 {StatusEntryLimit} 项。");
         }
 
         // G3: 相互独立的 git 读命令一次性并发发出(总耗时从"和"变"最大值")。
+        // 首屏不需要人为让位:GitService 的每次调用都在 Task.Run 里启动子进程并 ConfigureAwait(false),
+        // 发布之后的 await 一定会把 UI 线程交回消息泵,排队的输入与渲染自然落地。
+        // (刻意不用 Task.Yield():它把续延排回 *当前* 同步上下文,而绑定集合的 CollectionView
+        // 有线程亲和——换线程发布就是跨线程修改 SourceCollection。)
         // G7: 折叠区段对应的读命令不发——其数据按展开懒加载(见 EnsureLazySectionsLoadedAsync)。
         var branchesTask = LoadBranchesSectionAsync(path, cancellationToken);
         var remoteBranchesTask = LoadRemoteBranchesSectionAsync(path, cancellationToken);
@@ -2143,6 +2337,14 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         _lastHeadSignature = ReadHeadSignature(path);
         _hasFullStateLoad = true;
 
+        // 首屏快路径留下折叠的未跟踪目录时,立刻用一次静默刷新补 -uall 明细(不打扰用户、不显示
+        // 忙碌横幅)。它排在本次全量加载之后:静默刷新会等 _repositoryContextGate,因此不会与
+        // 正在发布的这一轮交错;而用户操作期间它会被合并成一次 catch-up 刷新(见 OnPropertyChanged)。
+        if (needsUntrackedRefinement)
+        {
+            StartQuietRefresh(immediate: true);
+        }
+
         // A healthy state load (re-)arms the watcher; the re-attach also refreshes the
         // suppression window so index write-backs from this very refresh stay ignored.
         if (_enableScmAutoRefresh) _repositoryWatcher.Attach(path);
@@ -2150,6 +2352,8 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
 
     private void PopulateChanges(GitRepositoryStatus status)
     {
+        // 降级提示与列表同步分开:两次快照内容相同时下面会提前返回,截断标记仍须保持最新。
+        IsStatusTruncated = status.Truncated;
         var previousUnstaged = SelectedUnstagedChange?.Path;
         var previousStaged = SelectedStagedChange?.Path;
         var stagedChanged = SyncCollection(StagedChanges, status.StagedChanges
@@ -2211,9 +2415,11 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
 
     private static void PruneSelection<T>(ObservableCollection<T> selection, ObservableCollection<T> current)
     {
+        if (selection.Count == 0) return;
+        var available = current.ToHashSet();
         for (var i = selection.Count - 1; i >= 0; i--)
         {
-            if (!current.Contains(selection[i]))
+            if (!available.Contains(selection[i]))
             {
                 selection.RemoveAt(i);
             }
@@ -2225,43 +2431,39 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     /// refreshes must not repaint unchanged lists — that churn is what flickers the graph). When it
     /// changes, the prefix/suffix diff (<see cref="CollectionDiffer"/>) replays only the affected
     /// middle range as Remove/Insert so unchanged rows keep their instances and containers
-    /// (scroll anchor, expansion state survive); a wholesale change (no common prefix) keeps the
-    /// single-Reset contract callers rely on to restore path-based selections after publishing.</summary>
+    /// (scroll anchor, expansion state survive). Two shapes publish a single Reset instead: a
+    /// wholesale change (no common prefix, callers restore selection by path after that), and a
+    /// middle range beyond <see cref="CollectionDiffer.SinglePassReplaceThreshold"/> — per-item
+    /// notifications over thousands of rows are quadratic in WPF, which is what froze the workbench
+    /// on repositories with many changes. The differ is run exactly once per publish: the diff already
+    /// answers "did anything change", so no separate full equality pass precedes it.</summary>
     internal static bool SyncCollection<T>(BulkObservableCollection<T> target, IReadOnlyList<T> desired)
     {
         var comparer = EqualityComparer<T>.Default;
-        if (target.Count == desired.Count)
+        var operation = CollectionDiffer.Compute(target, desired, comparer);
+        if (operation.IsNoOp)
         {
-            var same = true;
-            for (var i = 0; i < desired.Count; i++)
-            {
-                if (!comparer.Equals(target[i], desired[i]))
-                {
-                    same = false;
-                    break;
-                }
-            }
-
-            if (same)
-            {
-                return false;
-            }
+            return false;
         }
 
-        // No common prefix = the whole sequence is replaced: one Reset, exactly like the old
-        // ReplaceRange path (callers restore selection by path right after this returns true).
-        if (CollectionDiffer.Compute(target, desired, comparer).RemoveStart == 0)
+        if (operation.RemoveStart == 0 ||
+            operation.RemoveCount + operation.InsertCount > CollectionDiffer.SinglePassReplaceThreshold)
         {
-            target.ReplaceRange(desired);
+            target.ReplaceRange(desired, checkEquality: false);
             return true;
         }
 
-        CollectionDiffer.Apply(target, desired, comparer);
+        CollectionDiffer.Apply(target, desired, operation);
         return true;
     }
 
     private void ClearChanges()
     {
+        _unstagedExpandedRows = [];
+        _stagedExpandedRows = [];
+        IsStatusTruncated = false;
+        HiddenUnstagedRowCount = 0;
+        HiddenStagedRowCount = 0;
         StagedChanges.Clear();
         UnstagedChanges.Clear();
         UnstagedTreeRows.Clear();
@@ -2342,10 +2544,7 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
             var context = _workspaceContext;
             var changes = await _gitService.GetCommitFilesAsync(path, row.Commit.Hash);
             if (!IsRepositoryContextCurrent(context, path)) return;
-            foreach (var change in changes)
-            {
-                row.Files.Add(new LogFileRow(row, change));
-            }
+            row.Files.ReplaceRange(changes.Select(change => new LogFileRow(row, change)));
 
             row.IsLoaded = true;
         }
@@ -2916,7 +3115,11 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     {
         var context = _workspaceContext ?? _workspaceService.Current;
         var session = await _scopedSettings.OpenSessionAsync(new(context?.ProjectPath),
-            [BuiltInSettingsCatalog.GitAutoRefresh.Id]);
+            [
+                BuiltInSettingsCatalog.GitAutoRefresh.Id,
+                BuiltInSettingsCatalog.GitStatusLimit.Id,
+                BuiltInSettingsCatalog.GitFileSystemMonitor.Id,
+            ]);
         if (!ReferenceEquals(_workspaceContext, context)
             || !ReferenceEquals(_workspaceService.Current, context))
         {
@@ -2933,19 +3136,39 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
 
     private void ApplyScopedSettingsSafely(ISettingsSession session)
     {
-        if (session.Current is not { } snapshot)
+        // Changed 事件来自设置服务的后台监视线程,而应用设置会立刻按新上限重取状态并发布变更列表
+        // (见 ApplyScopedSettings 的 StartQuietRefresh):跨线程发布会撞上 CollectionView 的线程
+        // 亲和,整轮刷新被异常吞掉,列表停在旧条数上。先回所有权线程再应用。
+        RunOnOwnerThread(() =>
         {
+            if (session.Current is not { } snapshot)
+            {
+                return;
+            }
+
+            try
+            {
+                ApplyScopedSettings(snapshot);
+            }
+            catch (Exception ex)
+            {
+                LogService.Write("WARNING", $"Git 设置应用失败：{ex.Message}");
+            }
+        });
+    }
+
+    /// <summary>在所有权线程上执行 <paramref name="action"/>:已经在这条线程上就内联,否则经构造期
+    /// 捕获的 UI 上下文投递。没有上下文(无 WPF 宿主、也没有消息泵)时只能内联,排队等于永不落地。</summary>
+    private void RunOnOwnerThread(Action action)
+    {
+        var context = _uiContext;
+        if (context is null || Environment.CurrentManagedThreadId == _ownerThreadId)
+        {
+            action();
             return;
         }
 
-        try
-        {
-            ApplyScopedSettings(snapshot);
-        }
-        catch (Exception ex)
-        {
-            LogService.Write("WARNING", $"Git 设置应用失败：{ex.Message}");
-        }
+        context.Post(_ => action(), null);
     }
 
     private void ApplyScopedSettings(SettingsSnapshot snapshot)
@@ -2953,6 +3176,22 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
         if (!IsSettingsContextCurrent(snapshot.Context)) return;
         if (!_settingsRevisionGate.TryAccept(snapshot)) return;
         _enableScmAutoRefresh = snapshot.Effective(BuiltInSettingsCatalog.GitAutoRefresh);
+        var fsMonitor = snapshot.Effective(BuiltInSettingsCatalog.GitFileSystemMonitor);
+        var fsMonitorChanged = fsMonitor != _enableFileSystemMonitor;
+        _enableFileSystemMonitor = fsMonitor;
+        // fsmonitor 改变会改变读取端的行为(下一次读取要么带上 -c core.fsmonitor=true,要么不再带),
+        // 立刻按新策略重取一次状态,避免界面停留在旧策略的结果上。
+        if (fsMonitorChanged && IsRepository) StartQuietRefresh(immediate: true);
+        var configuredLimit = snapshot.Effective(BuiltInSettingsCatalog.GitStatusLimit);
+        var statusEntryLimit = Math.Clamp(
+            configuredLimit > 0 ? configuredLimit : GitService.StatusMaximumEntries,
+            1,
+            GitService.StatusMaximumEntries);
+        var limitChanged = statusEntryLimit != StatusEntryLimit;
+        StatusEntryLimit = statusEntryLimit;
+        // 上限改变会改变"列表里应当有多少条",下一次静默刷新不重读就会被旧条数覆盖,
+        // 因此设置生效即刻按新上限重取状态(静默路径,不打扰用户)。
+        if (limitChanged && IsRepository) StartQuietRefresh(immediate: true);
         if (_enableScmAutoRefresh && IsRepository) _repositoryWatcher.Attach(RepositoryPath);
         else _repositoryWatcher.Detach();
     }
@@ -3006,6 +3245,114 @@ public partial class GitViewModel : PageViewModel, INavigationTarget
     // 丢弃只允许作用于未暂存内容:已暂存更改必须取消暂存后才能丢弃。
     private bool CanDiscardChange(GitChangeItem? item) => IsRepository && item is { HasUnstagedChanges: true };
     private bool CanCreateBranch() => IsRepository && !string.IsNullOrWhiteSpace(NewBranchName);
+
+    // ===== 文件历史(git log --follow -- path;行点击 → 该提交对该文件的 diff) =====
+
+    private const int FileHistoryPageSize = 50;
+
+    public ObservableCollection<GitCommitInfo> FileHistoryCommits { get; } = [];
+
+    /// <summary>当前文件历史目标的仓库相对路径;null/空 = 分区收起。</summary>
+    [ObservableProperty]
+    private string? fileHistoryPath;
+
+    public string FileHistoryCaption => string.IsNullOrEmpty(FileHistoryPath)
+        ? "文件历史"
+        : $"文件历史：{FileHistoryPath}";
+
+    /// <summary>分区显隐驱动(有历史目标才显示分区)。</summary>
+    public bool HasFileHistory => !string.IsNullOrEmpty(FileHistoryPath);
+
+    [ObservableProperty]
+    private bool canLoadMoreFileHistory;
+
+    [ObservableProperty]
+    private bool isFileHistoryLoading;
+
+    partial void OnFileHistoryPathChanged(string? value)
+    {
+        OnPropertyChanged(nameof(FileHistoryCaption));
+        OnPropertyChanged(nameof(HasFileHistory));
+    }
+
+    [RelayCommand]
+    private async Task OpenFileHistoryAsync(GitChangeItem? item)
+    {
+        if (item is null || !IsRepository)
+        {
+            return;
+        }
+
+        FileHistoryPath = item.Path;
+        await LoadFileHistoryPageAsync(reset: true);
+    }
+
+    /// <summary>外部入口(命令面板/资源管理器右键):按仓库相对路径直接打开文件历史
+    /// (不依赖更改列表——工作区干净时也可用)。</summary>
+    public void OpenFileHistoryForPath(string? relativePath)
+    {
+        if (string.IsNullOrWhiteSpace(relativePath) || !IsRepository)
+        {
+            return;
+        }
+
+        FileHistoryPath = relativePath;
+        _ = LoadFileHistoryPageAsync(reset: true);
+    }
+
+    [RelayCommand]
+    private Task LoadMoreFileHistoryAsync() => LoadFileHistoryPageAsync(reset: false);
+
+    private async Task LoadFileHistoryPageAsync(bool reset)
+    {
+        if (string.IsNullOrEmpty(FileHistoryPath) || !IsRepository || IsFileHistoryLoading)
+        {
+            return;
+        }
+
+        IsFileHistoryLoading = true;
+        try
+        {
+            var skip = reset ? 0 : FileHistoryCommits.Count;
+            var page = await _gitService.GetFileLogAsync(RepositoryPath, FileHistoryPath, FileHistoryPageSize, skip);
+            if (reset)
+            {
+                FileHistoryCommits.Clear();
+            }
+
+            foreach (var commit in page)
+            {
+                FileHistoryCommits.Add(commit);
+            }
+
+            CanLoadMoreFileHistory = page.Count >= FileHistoryPageSize;
+        }
+        finally
+        {
+            IsFileHistoryLoading = false;
+        }
+    }
+
+    [RelayCommand]
+    private void CloseFileHistory()
+    {
+        FileHistoryPath = null;
+        FileHistoryCommits.Clear();
+        CanLoadMoreFileHistory = false;
+    }
+
+    /// <summary>文件历史行点击 → 该提交对该文件的 diff(预览语义,与更改页一致)。</summary>
+    [RelayCommand]
+    private void OpenFileHistoryDiff(GitCommitInfo? commit)
+    {
+        if (commit is null || string.IsNullOrEmpty(FileHistoryPath))
+        {
+            return;
+        }
+
+        DiffOpenRequested?.Invoke(this, new GitDiffRequest(RepositoryPath, FileHistoryPath, IsStaged: false, IsUntracked: false,
+            CommitHash: commit.Hash, IsPreview: true));
+    }
 }
 
 /// <summary>UI wrapper for a git status change, exposing display text and the status badge letter.
@@ -3103,8 +3450,38 @@ public abstract record ScmRowNode(int Depth)
     public System.Windows.Thickness IndentMargin => new(12 * Depth, 0, 0, 0);
 
     /// <summary>祖先层级竖线的左缘 x(第 k 层列中心 12k + 9,1px 宽 → 左缘 12k + 8.5)。
-    /// 子行把这些线重画到自身整行高度,保证上层竖线穿过所有后代行,不会在行边界断开。</summary>
-    public double[] AncestorGuideLefts { get; internal set; } = [];
+    /// 子行把这些线重画到自身整行高度,保证上层竖线穿过所有后代行,不会在行边界断开。
+    /// 竖线 1px 宽画在列中心 12k + 9,与文件夹自身列(col0 宽 18,居中线中心 12d + 9)完全对齐;
+    /// 文件夹行自身不画该列竖线,由第一个子行起接续。
+    /// 每个深度共用一条只读数线:10k 行的树每轮刷新会省下 10k 次数组分配,同时让 record 的
+    /// 值相等真正反映「这一行没变」(数组按引用比较时,永远不等的导线会把每次发布都判成整表替换)。</summary>
+    public double[] AncestorGuideLefts => GuideLeftsFor(Depth);
+
+    private static readonly object GuideLeftsGate = new();
+    private static List<double[]> _guideLeftsByDepth = [[]];
+
+    private static double[] GuideLeftsFor(int depth)
+    {
+        if (depth <= 0)
+        {
+            return [];
+        }
+
+        lock (GuideLeftsGate)
+        {
+            while (_guideLeftsByDepth.Count <= depth)
+            {
+                var level = _guideLeftsByDepth.Count;
+                var previous = _guideLeftsByDepth[level - 1];
+                var line = new double[level];
+                Array.Copy(previous, line, level - 1);
+                line[level - 1] = 12.0 * (level - 1) + 8.5;
+                _guideLeftsByDepth.Add(line);
+            }
+
+            return _guideLeftsByDepth[depth];
+        }
+    }
 
     /// <summary>深度大于 0 的行位于某个文件夹子树内。</summary>
     public bool HasParent => Depth > 0;
@@ -3181,7 +3558,7 @@ public sealed partial class GitLogRow : ObservableObject
     [ObservableProperty] private bool isLoading;
 
     /// <summary>该提交行内联的更改文件(懒加载,每个提交只加载一次)。</summary>
-    public ObservableCollection<LogFileRow> Files { get; } = [];
+    public BulkObservableCollection<LogFileRow> Files { get; } = [];
 
     /// <summary>已加载且没有文件更改(空提交 / 根提交)时显示"无文件更改"占位。</summary>
     public bool HasNoFiles => IsLoaded && Files.Count == 0;

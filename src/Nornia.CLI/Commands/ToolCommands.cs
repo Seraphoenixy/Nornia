@@ -1,4 +1,4 @@
-using Nornia.CLI.Localization;
+﻿using Nornia.CLI.Localization;
 using Nornia.Core.Interfaces;
 using Nornia.Core.Models;
 
@@ -27,7 +27,7 @@ public sealed class ToolListCommand(CliServices services) : ICommand
         }
 
         Console.WriteLine("NAME\tVERSION\tPATH");
-        foreach (var tool in tools.OrderBy(tool => tool.Name).ThenBy(tool => tool.Version))
+        foreach (var tool in tools.OrderBy(tool => tool.Name).ThenBy(tool => tool.Version, VersionOrder.Comparer))
         {
             Console.WriteLine($"{tool.Name}\t{tool.Version}\t{tool.InstallPath}");
         }

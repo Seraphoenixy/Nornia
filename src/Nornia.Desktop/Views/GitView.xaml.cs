@@ -365,6 +365,62 @@ public partial class GitView : UserControl
         ViewModel.OpenChangeDiffCommand.Execute(candidate);
     }
 
+    // ===== 键盘首字母直跳(type-ahead) =====
+
+    private string _typeAheadBuffer = string.Empty;
+    private long _typeAheadStamp;
+
+    /// <summary>更改平铺列表的键盘直跳:输入字母/数字按文件名前缀选中并滚到匹配行,
+    /// 800ms 无输入自动重置(VS Code 列表语义)。退格删除缓冲。纯几何文本处理。</summary>
+    private void ChangeList_KeyDown(object sender, KeyEventArgs e)
+    {
+        if (sender is not ListBox { IsVisible: true } list)
+        {
+            return;
+        }
+
+        if (Environment.TickCount64 - _typeAheadStamp > 800)
+        {
+            _typeAheadBuffer = string.Empty;
+        }
+
+        if (e.Key == Key.Back)
+        {
+            _typeAheadBuffer = _typeAheadBuffer.Length > 0 ? _typeAheadBuffer[..^1] : string.Empty;
+            _typeAheadStamp = Environment.TickCount64;
+            e.Handled = true;
+            return;
+        }
+
+        char? typed = e.Key switch
+        {
+            >= Key.A and <= Key.Z => (char)('a' + (e.Key - Key.A)),
+            >= Key.D0 and <= Key.D9 => (char)('0' + (e.Key - Key.D0)),
+            >= Key.NumPad0 and <= Key.NumPad9 => (char)('0' + (e.Key - Key.NumPad0)),
+            Key.OemMinus => '_',
+            _ => null,
+        };
+        if (typed is null)
+        {
+            return;
+        }
+
+        _typeAheadBuffer += typed.Value;
+        _typeAheadStamp = Environment.TickCount64;
+        e.Handled = true;
+
+        foreach (var item in list.Items.OfType<GitChangeItem>())
+        {
+            if ((item.FileName ?? string.Empty).StartsWith(_typeAheadBuffer, StringComparison.OrdinalIgnoreCase)
+                || (item.Path ?? string.Empty).StartsWith(_typeAheadBuffer, StringComparison.OrdinalIgnoreCase))
+            {
+                list.SelectedItem = item;
+                list.ScrollIntoView(item);
+                return;
+            }
+        }
+    }
+
     // ===== 拖放暂存:未暂存 ↔ 已暂存分区之间拖动文件行(VS Code SCM) =====
 
     /// <summary>按下并移动选中的更改行时发起拖动;平铺与树状列表的选择统一收集为路径。</summary>

@@ -165,8 +165,7 @@ public partial class TerminalViewModel : PageViewModel
             ShowSessionSidebar = snapshot.Effective(BuiltInSettingsCatalog.TerminalSidebarVisible);
             SessionSidebarWidth = snapshot.Effective(BuiltInSettingsCatalog.TerminalSidebarWidth);
         }
-        var dispatcher = System.Windows.Application.Current?.Dispatcher;
-        if (dispatcher is null || dispatcher.CheckAccess()) Apply(); else _ = dispatcher.BeginInvoke(Apply);
+        if (UiDispatcher.CheckAccess()) Apply(); else UiDispatcher.BeginInvoke(Apply);
     }
 
     private async Task OnWorkspaceChangedAsync(ProjectWorkspaceContext? context)
@@ -179,21 +178,9 @@ public partial class TerminalViewModel : PageViewModel
         try
         {
             _workspaceContext = context;
-            var oldSessions = Sessions.ToArray();
-            Sessions.Clear();
-            SelectedSession = null;
-            foreach (var tab in oldSessions)
-            {
-                try
-                {
-                    await _terminalService.StopAsync(tab.Session);
-                }
-                catch (Exception ex) when (ex is IOException or InvalidOperationException)
-                {
-                    LogService.Write("WARNING", $"关闭旧终端会话失败：{ex.Message}");
-                }
-            }
-
+            // 切换项目保留已打开的终端会话(VS Code 语义):旧会话继续运行在其原目录,
+            // 新终端从新工作区目录启动(WorkingDirectory 随切换更新);终端的字体等
+            // 工作区级设置经上方会话交换 + 下方的配置文件重载生效。
             WorkingDirectory = context?.ProjectPath ?? Environment.CurrentDirectory;
             await LoadProfilesAsync(useSavedDefault: true);
         }

@@ -367,7 +367,7 @@ public partial class EditorGroupsView : UserControl
         e.Handled = true;
     }
 
-    /// <summary>双击:未转正(预览/斜体)的文件标签转正为常驻标签;已转正标签不受影响。</summary>
+    /// <summary>双击:未转正(预览/斜体)的文件标签或内容页标签转正为常驻标签;已转正标签不受影响。</summary>
     private void EditorTabList_MouseDoubleClick(object sender, MouseButtonEventArgs e)
     {
         if (_workbench is null)
@@ -376,9 +376,14 @@ public partial class EditorGroupsView : UserControl
         }
 
         var container = FindAncestor<ListBoxItem>(e.OriginalSource as DependencyObject);
-        if (container?.DataContext is EditorWorkbenchTab tab && tab.IsPreview)
+        switch (container?.DataContext)
         {
-            tab.EditorTab.IsPreview = false;
+            case EditorWorkbenchTab tab when tab.IsPreview:
+                tab.EditorTab.IsPreview = false;
+                break;
+            case PageWorkbenchTab pageTab when pageTab.IsPreview:
+                pageTab.IsPreview = false;
+                break;
         }
     }
 

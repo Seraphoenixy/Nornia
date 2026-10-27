@@ -148,4 +148,48 @@ public sealed class TextDocumentDecoderTests : IDisposable
         Assert.Equal("1.5 KB", TextDocumentDecoder.FormatSize(1536));
         Assert.Equal("1 MB", TextDocumentDecoder.FormatSize(1024 * 1024));
     }
+
+    [Fact]
+    public async Task ForcedEncoding_OverridesDetectionWithoutNulBinaryGate()
+    {
+        // UTF-16 无 BOM 内容含 NUL 字节:自动检测判为二进制;强制 UTF-16 时按用户选择解码。
+        var path = Path.Combine(_tempDir, "forced-utf16.txt");
+        var text = "标题\n第二行";
+        await File.WriteAllBytesAsync(path, System.Text.Encoding.Unicode.GetBytes(text));
+
+        var auto = await TextDocumentDecoder.Instance.DecodeAsync(path, 1_000_000);
+        Assert.True(auto.IsBinary);
+
+        var forced = await TextDocumentDecoder.Instance.DecodeAsync(path, 1_000_000,
+            TextDocumentDecoder.CreateForcedEncoding("utf-16"));
+        Assert.True(forced.Success);
+        Assert.Equal(text, forced.Text);
+        Assert.Equal("UTF-16 LE", forced.EncodingName);
+    }
+
+    [Fact]
+    public async Task ForcedEncoding_DecodesLenientlyInsteadOfThrowing()
+    {
+        // 强制 UTF-16 遇到奇数长度字节序列:无法配对的尾字节显示为替换符,不把异常抛进 UI。
+        var path = Path.Combine(_tempDir, "odd.bin");
+        await File.WriteAllBytesAsync(path, [0x41, 0x00, 0x42]);
+
+        var forced = await TextDocumentDecoder.Instance.DecodeAsync(path, 1_000_000,
+            TextDocumentDecoder.CreateForcedEncoding("utf-16"));
+
+        Assert.True(forced.Success);
+        Assert.Equal("A�", forced.Text);
+    }
+
+    [Fact]
+    public void CreateForcedEncoding_KnownNamesAndFallbacks()
+    {
+        Assert.Null(TextDocumentDecoder.CreateForcedEncoding(null));
+        Assert.Null(TextDocumentDecoder.CreateForcedEncoding(""));
+        Assert.Null(TextDocumentDecoder.CreateForcedEncoding("utf-7"));
+        Assert.Equal("utf-8", TextDocumentDecoder.CreateForcedEncoding("UTF-8")!.WebName);
+        Assert.Equal("gb18030", TextDocumentDecoder.CreateForcedEncoding("GB18030")!.WebName);
+        Assert.Equal("utf-16", TextDocumentDecoder.CreateForcedEncoding("utf-16")!.WebName);
+        Assert.Equal("utf-16BE", TextDocumentDecoder.CreateForcedEncoding("utf-16be")!.WebName);
+    }
 }

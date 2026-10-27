@@ -18,6 +18,29 @@ public interface IProcessRunner
         IReadOnlyDictionary<string, string>? environmentVariables = null,
         int? maximumOutputBytes = null);
 
+    /// <summary>Bounded variant of <see cref="RunAsync"/>: once <paramref name="maximumOutputBytes"/>
+    /// of stdout has been retained the child is <em>terminated</em> instead of drained to EOF, so a
+    /// pathological payload costs a fixed amount of time and memory. <see
+    /// cref="ProcessResult.OutputTruncated"/> marks the retained prefix as partial, and a stopped run
+    /// can report a non-zero exit code — consumers parse the retained output when
+    /// <c>IsSuccess || OutputTruncated</c>. This compatibility body caps the buffered output but keeps
+    /// draining (behaviourally equivalent for test doubles); the production <see
+    /// cref="Nornia.Core.Services.ProcessRunner"/> stops the child.</summary>
+    Task<ProcessResult> RunBoundedAsync(
+        string fileName,
+        IReadOnlyList<string> arguments,
+        int maximumOutputBytes,
+        IReadOnlyDictionary<string, string>? environmentVariables = null,
+        CancellationToken cancellationToken = default)
+    {
+        return RunAsync(
+            fileName,
+            arguments,
+            cancellationToken: cancellationToken,
+            environmentVariables: environmentVariables,
+            maximumOutputBytes: maximumOutputBytes);
+    }
+
     /// <summary>Launches a process with shell-execute semantics (<c>UseShellExecute=true</c>) so
     /// PATH entries that are batch shims — VS Code's <c>code</c>, for example — resolve exactly as
     /// they do from a terminal. Unlike <see cref="RunAsync"/> the launched process is not awaited:
@@ -125,5 +148,9 @@ public interface IEnvironmentRepairLogRepository
 public interface IEnvironmentRollbackService
 {
     Task<EnvironmentRollbackPlan?> BuildPlanAsync(Guid correlationId, CancellationToken cancellationToken = default);
-    Task RollbackAsync(EnvironmentRollbackPlan plan, IProgress<ProcessOutput>? progress = null, CancellationToken cancellationToken = default);
+
+    /// <summary>逆向执行计划的每个自动步骤。单步失败不中断批次,而是记入
+    /// <see cref="EnvironmentRollbackResult.Failures"/> 由调用方呈现。
+    /// 只有用户显式取消才会抛出 <see cref="OperationCanceledException"/>。</summary>
+    Task<EnvironmentRollbackResult> RollbackAsync(EnvironmentRollbackPlan plan, IProgress<ProcessOutput>? progress = null, CancellationToken cancellationToken = default);
 }

@@ -210,6 +210,48 @@ public sealed class TerminalScreen
         }
     }
 
+    /// <summary>原子读取:同一把 _gate 锁内同时取回某行的单元格、渲染文本与版本号。
+    /// 渲染与复制必须走此路径,绝不能分别调用 GetLine / GetRenderedLine / GetLineVersion —— 后者
+    /// 各自重新加锁,ConPTY 输出泵在三次加锁之间写入模型,会使 line(单元格)与 text(字符)来自
+    /// 不同版本而错位,渲染出叠加/错乱的字符;该错位结果又被脏行缓存按版本永久回放,表现为
+    /// dotnet build 等长输出结束后终端仍乱码。此处三者同源,杜绝错位。</summary>
+    public (TerminalCell[]? Line, string Text, int Version) GetLineWithText(int lineFromBottom)
+    {
+        lock (_gate)
+        {
+            var line = GetLineCore(lineFromBottom);
+            var version = GetLineVersionCore(lineFromBottom);
+            if (line is null)
+            {
+                return (null, string.Empty, 0);
+            }
+
+            string text;
+            if (_renderedLineCache.TryGetValue(lineFromBottom, out var entry) && entry.Version == version)
+            {
+                text = entry.Text;
+            }
+            else
+            {
+                var length = line.Length;
+                while (length > 0 && line[length - 1].Char == '\0')
+                {
+                    length--;
+                }
+
+                text = LineToText(line.AsSpan(0, length));
+                if (_renderedLineCache.Count >= 4096)
+                {
+                    _renderedLineCache.Clear();
+                }
+
+                _renderedLineCache[lineFromBottom] = (version, text);
+            }
+
+            return (line, text, version);
+        }
+    }
+
     public (int Row, int Column) Cursor
     {
         get { lock (_gate) return (_cursorRow, _cursorColumn); }
@@ -984,13 +1026,19 @@ public sealed class TerminalScreen
 
     private static string LineToText(ReadOnlySpan<TerminalCell> cells)
     {
-        var text = new char[cells.Length];
-        for (var i = 0; i < cells.Length; i++)
+        // 宽字符的延续格(Char='\0',Width=0)与未写入格不产生文本:否则 CJK 行的文本/
+        // 复制路径会夹 NUL(渲染端按同样条件跳过)。组合字符(Width=0 但 Char 非 0)保留。
+        Span<char> text = stackalloc char[cells.Length];
+        var length = 0;
+        foreach (var cell in cells)
         {
-            text[i] = cells[i].Char;
+            if (cell.Char != '\0')
+            {
+                text[length++] = cell.Char;
+            }
         }
 
-        return new string(text);
+        return new string(text[..length]);
     }
 
     internal void Clear()

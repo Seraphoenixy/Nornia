@@ -22,6 +22,8 @@ public sealed class BuiltInSettingsCatalog
     public static readonly SettingKey<string> TerminalDefaultProfile = new("nornia.terminal.defaultProfile");
     public static readonly SettingKey<string[]> TerminalCustomShells = new("nornia.terminal.customShells");
     public static readonly SettingKey<bool> GitAutoRefresh = new("git.autorefresh");
+    public static readonly SettingKey<bool> GitFileSystemMonitor = new("git.fsmonitor");
+    public static readonly SettingKey<int> GitStatusLimit = new("git.statusLimit");
     public static readonly SettingKey<Dictionary<string, bool>> FilesExclude = new("files.exclude");
     public static readonly SettingKey<string> ExternalEditor = new("nornia.general.externalEditor");
     public static readonly SettingKey<bool> RestoreLastWorkspace = new("nornia.general.restoreLastWorkspace");
@@ -44,6 +46,10 @@ public sealed class BuiltInSettingsCatalog
     public static readonly SettingKey<string> EditorRulers = new("editor.rulers");
     public static readonly SettingKey<bool> DiffIgnoreTrimWhitespace = new("diffEditor.ignoreTrimWhitespace");
     public static readonly SettingKey<bool> DiffNarrowInline = new("diffEditor.useInlineViewWhenSpaceIsLimited");
+    public static readonly SettingKey<int> ReadingFullSourceMb = new("nornia.reading.fullSourceMb");
+    public static readonly SettingKey<int> ReadingWindowedSourceMb = new("nornia.reading.windowedSourceMb");
+    public static readonly SettingKey<int> ReadingFullDiffLines = new("nornia.reading.fullDiffLines");
+    public static readonly SettingKey<int> ReadingWindowedDiffLines = new("nornia.reading.windowedDiffLines");
 
     private static readonly SettingScope EditorScopes = SettingScope.User | SettingScope.Workspace | SettingScope.Language;
     private static readonly SettingScope SharedScopes = SettingScope.User | SettingScope.Workspace;
@@ -75,6 +81,10 @@ public sealed class BuiltInSettingsCatalog
             Bool(DiffSyncScroll, true, "同步滚动", "并排模式下同步两侧视图。", "Diff", SharedScopes),
             Bool(DiffIgnoreTrimWhitespace, false, "忽略行尾空白", "对比时忽略行尾空白差异。", "Diff", SharedScopes),
             Bool(DiffNarrowInline, true, "窄窗自动内联", "窗口过窄时自动以内联模式显示 Diff。", "Diff", SharedScopes),
+            Number(ReadingFullSourceMb, 8, 1, 64, "全文阅读上限（MB）", "源码文件低于该大小整份载入内存；超过则切换到磁盘窗口化阅读。对之后加载的内容生效。", "编辑器", SharedScopes),
+            Number(ReadingWindowedSourceMb, 32, 8, 512, "窗口化阅读上限（MB）", "超过该大小的文件只显示摘要，需按行号跳转进入窗口阅读。对之后加载的内容生效。", "编辑器", SharedScopes),
+            Number(ReadingFullDiffLines, 100_000, 10_000, 1_000_000, "Diff 全量行数上限", "低于该行数的 Diff 整份渲染；超过则按窗口分页阅读。对之后打开的 Diff 生效。", "编辑器", SharedScopes),
+            Number(ReadingWindowedDiffLines, 500_000, 100_000, 5_000_000, "Diff 窗口化行数上限", "超过该行数的 Diff 只显示首个阅读窗口并保留 hunk 索引。对之后打开的 Diff 生效。", "编辑器", SharedScopes),
             Number(TerminalFontSize, 13d, 8, 28, "终端字号", "终端内容使用的独立字号。", "终端", SharedScopes),
             Font(TerminalFontFamily, FontCatalog.DefaultTerminalFamily, "终端字体", "终端使用的等宽字体；下拉框列出该应用支持的全部字体。", "终端", SharedScopes),
             Text(TerminalDefaultProfile, "pwsh", "默认 Shell", "仅影响之后新建的终端会话。", "终端", SettingScope.User, SettingEditorKind.Shell),
@@ -83,6 +93,8 @@ public sealed class BuiltInSettingsCatalog
             Bool(TerminalSidebarVisible, true, "显示会话侧栏", "显示终端会话列表。", "终端", SettingScope.User),
             Number(TerminalSidebarWidth, 190d, 140, 320, "会话侧栏宽度", "终端会话侧栏的默认宽度。", "终端", SettingScope.User),
             Bool(GitAutoRefresh, true, "Git 自动刷新", "文件变化后刷新源代码管理状态。", "工作区与源代码管理", SharedScopes),
+            Bool(GitFileSystemMonitor, false, "Git 文件系统监视（fsmonitor）", "对超大仓库让 Git 用后台监视进程代替逐文件状态扫描（会为该仓库启动 git fsmonitor--daemon 进程）。", "工作区与源代码管理", SharedScopes),
+            Number(GitStatusLimit, 10_000, 100, 100_000, "更改条目上限", "源代码管理的更改栏最多保留多少条变更；超出时列表降级并显示截断提示，避免超大工作树把界面拖住。", "工作区与源代码管理", SharedScopes),
             new SettingDefinition<Dictionary<string, bool>>(FilesExclude, new(), "排除的文件", "影响资源管理器、快速打开和全局搜索，不改变 Git 或文件系统。",
                 "工作区与源代码管理", ["glob", "exclude"], SharedScopes, SettingEditorKind.Glob),
             Bool(ExplorerTreeGuides, true, "资源管理器树状线", "显示文件树层级参考线。", "工作区与源代码管理", SharedScopes),

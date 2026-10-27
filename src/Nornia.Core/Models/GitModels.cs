@@ -85,7 +85,33 @@ public sealed record GitRepositoryStatus(
     public static GitRepositoryStatus NotARepository { get; } = new(false, null, null, 0, 0, [], []);
 
     public bool IsClean => StagedChanges.Count == 0 && UnstagedChanges.Count == 0;
+
+    /// <summary>True when an untracked record is a collapsed DIRECTORY (<c>? dir/</c>), which only
+    /// <c>--untracked-files=normal</c> produces. <c>--untracked-files=all</c> lists the files inside
+    /// such a directory instead, so a snapshot carrying a collapsed entry is an incomplete view of
+    /// the untracked set (files inside it cannot be staged, discarded or diffed individually) and
+    /// the reader must refine it with an <c>all</c> read.</summary>
+    public bool HasCollapsedUntrackedDirectory =>
+        UnstagedChanges.Any(change => change.IsUntracked &&
+            (change.Path.EndsWith('/') || change.Path.EndsWith('\\')));
 }
+
+/// <summary>Options for one <c>git status</c> read.
+/// <para><b>Index write-back</b> (<see cref="AllowIndexWriteBack"/>): a status read refreshes the
+/// index (one stat per tracked entry, plus a content hash for every entry whose stat differs). By
+/// default Git is told not to persist that refresh (<c>GIT_OPTIONAL_LOCKS=0</c>), which keeps a
+/// silent refresh from feeding the file watcher, but also means the whole stat/hash pass is paid
+/// again on EVERY read. Foreground loads (workspace open, explicit refresh) may allow the
+/// write-back so the expensive pass is paid once and the following reads take the cheap path.</para>
+/// <para><b>File-system monitor</b> (<see cref="EnableFileSystemMonitor"/>): passes
+/// <c>-c core.fsmonitor=true</c>. Git then runs a background monitor daemon for the repository
+/// (<c>git fsmonitor--daemon</c> plus <c>.git/fsmonitor--daemon</c>), which is why this is opt-in
+/// through the <c>git.fsmonitor</c> setting instead of being enabled for every read.</para></summary>
+public sealed record GitStatusReadOptions(
+    int MaximumEntries,
+    bool IncludeAllUntracked = true,
+    bool AllowIndexWriteBack = false,
+    bool EnableFileSystemMonitor = false);
 
 public enum GitDiffLineKind
 {
@@ -259,6 +285,28 @@ public sealed record GitCommitInfo(
 
 /// <summary>一条贮藏记录(<c>git stash list</c>)。</summary>
 public sealed record GitStashInfo(int Index, string Message);
+
+/// <summary>git blame 的提交元数据(<c>--porcelain</c> 首次出现块;边界提交是哈希带 <c>^</c> 前缀的
+/// 根/截断历史提交)。Summary 单行,不含正文。</summary>
+public sealed record GitBlameCommit(
+    string Hash,
+    string AuthorName,
+    string AuthorEmail,
+    DateTimeOffset AuthorDate,
+    string Summary,
+    bool IsBoundary);
+
+/// <summary>行级 blame 的紧凑模型:提交表 + 每行的提交下标(同名提交只存一次,每行只存 int)。
+/// 20 万行/1 万提交上限之外的内容被丢弃,Truncated 置位——消费方必须可见降级。</summary>
+public sealed record GitBlame(
+    IReadOnlyList<GitBlameCommit> Commits,
+    IReadOnlyList<int> LineCommits,
+    bool Truncated = false)
+{
+    public static GitBlame Empty { get; } = new([], []);
+
+    public int TotalLines => LineCommits.Count;
+}
 
 /// <summary>A local branch.</summary>
 public sealed record GitBranchInfo(

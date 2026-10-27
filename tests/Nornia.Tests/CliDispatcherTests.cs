@@ -99,7 +99,9 @@ public sealed class CliDispatcherTests
     [Fact]
     public void CliArguments_RejectsUnknownLanguage()
     {
-        Assert.Throws<ArgumentException>(() => CliArguments.Parse(["--lang", "not-a-culture", "help"]));
+        // 用法错误以 CliUsageException 抛出,CLI 据此返回退出码 2(而非普通失败的 1)。
+        var exception = Assert.Throws<CliUsageException>(() => CliArguments.Parse(["--lang", "not-a-culture", "help"]));
+        Assert.IsAssignableFrom<ArgumentException>(exception);
     }
 
     private sealed class FakeCommand(string name) : ICommand

@@ -97,14 +97,19 @@ public sealed class EditorWorkbenchTab : WorkbenchTabViewModel
     public override string ToolTipText => EditorTab.Path;
 }
 
-/// <summary>内容页(环境管理 / 项目管理 / 设置)标签:普通可关闭标签,导航可重开。
+/// <summary>内容页(环境管理 / 项目管理 / 设置)标签:导航打开默认为预览态(斜体标题),
+/// 行为对齐文件预览标签——再次导航替换当前预览页、双击转正、固定即常驻。
 /// 实例由 Workbench 预建,首次导航才加入条带。</summary>
-public sealed class PageWorkbenchTab : WorkbenchTabViewModel
+public sealed partial class PageWorkbenchTab : WorkbenchTabViewModel
 {
     public PageWorkbenchTab(PageViewModel page, string glyph)
         : base($"page:{page.Title}", page.Title, glyph, page.Title, page)
     {
     }
+
+    /// <summary>VS Code 预览语义:导航打开为预览态,双击/固定转正;关闭后重开回到预览态。</summary>
+    [ObservableProperty]
+    private bool isPreview = true;
 }
 
 /// <summary>Drag-reorder payload for the workbench tab strip (from/to strip indices).</summary>

@@ -1,3 +1,4 @@
+using Nornia.Desktop.Code;
 using Nornia.Desktop.ViewModels;
 using System.ComponentModel;
 using System.Diagnostics;
@@ -25,6 +26,10 @@ public partial class FilePreviewView : UserControl
     private bool _outlinePanelOpen = true;
     // M9: 滚动偏移写入 50ms 尾沿节流(滚动事件风暴只落一次标签写入)。
     private MarkdownScrollThrottle? _scrollOffsetThrottle;
+    // 预览自身滚动产生的"当前标题"回显正在写入逻辑位置:此期间标签 MarkdownAnchor 的
+    // 属性变更不得再触发 ScrollToAnchor(否则按该标题重新居中,与用户滚动位置冲突,
+    // 表现为滚动后弹回开头/跳变)。导航(大纲点击、链接)走显式 ScrollToAnchor,不受影响。
+    private bool _reportingCurrentHeading;
 
     /// <summary>M9: 滚动偏移节流器(测试断言写入次数用)。</summary>
     internal MarkdownScrollThrottle? ScrollOffsetThrottle => _scrollOffsetThrottle;
@@ -106,6 +111,7 @@ public partial class FilePreviewView : UserControl
         _tab = DataContext as FilePreviewTab;
         if (_tab is null)
         {
+            CodeView.UpdateBlame(null, loading: false, truncated: false);
             return;
         }
 
@@ -130,6 +136,8 @@ public partial class FilePreviewView : UserControl
         };
         _pendingRestore = _tab.ViewState;
         RestoreMarkdownPosition();
+        UpdateBlameMargin();
+        UpdateMarkdownLayout();
         // 接线时序兜底:继承的 DataContext 绑定可能先于本处理器完成渲染(RenderCompleted
         // 触发时 _tab 尚未就绪)——此时补做 AST 分离。
         if (_tab.MarkdownRenderResult is { Document: not null } renderedResult
@@ -331,7 +339,17 @@ public partial class FilePreviewView : UserControl
             return;
         }
 
-        _tab.SetMarkdownHeading(heading?.Anchor, heading?.Line ?? 0);
+        // 仅写入逻辑位置,不要因 MarkdownAnchor 变更再触发 ScrollToAnchor:预览此刻就在该标题处,
+        // 回滚跳转会把用户滚动的位置重新居中(弹回开头/跳变)。
+        _reportingCurrentHeading = true;
+        try
+        {
+            _tab.SetMarkdownHeading(heading?.Anchor, heading?.Line ?? 0);
+        }
+        finally
+        {
+            _reportingCurrentHeading = false;
+        }
     }
 
     /// <summary>Markdown 预览位置恢复优先级:当前文档中存在的标题锚点 → 标题源码行号 →
@@ -407,13 +425,22 @@ public partial class FilePreviewView : UserControl
                 CodeView.ShowMinimap = _tab.ShowMinimap;
                 break;
             case nameof(FilePreviewTab.MarkdownAnchor) when _tab.IsMarkdownRendered:
+                // 预览自身滚动回显写入的锚点:跳过回滚跳转(见 _reportingCurrentHeading)。
+                // 导航(大纲点击/链接)经显式 ScrollToAnchor,不经过此回显路径。
+                if (_reportingCurrentHeading)
+                {
+                    break;
+                }
+
                 if (!string.IsNullOrEmpty(_tab.MarkdownAnchor))
                 {
                     MarkdownView.ScrollToAnchor(_tab.MarkdownAnchor);
                 }
                 break;
             case nameof(FilePreviewTab.MarkdownMode):
-                // 模式切换:预览 → 源码跳当前标题行(无标题恢复光标),源码 → 预览按优先级落位。
+                // 模式切换:预览 → 源码跳当前标题行(无标题恢复光标),源码 → 预览按优先级落位;
+                // 并排模式同样走渲染面落位(布局列已由 UpdateMarkdownLayout 展开)。
+                UpdateMarkdownLayout();
                 if (_tab.IsMarkdown)
                 {
                     if (_tab.IsMarkdownRendered)
@@ -423,6 +450,25 @@ public partial class FilePreviewView : UserControl
                     else
                     {
                         RestoreSourcePositionForMarkdown();
+                    }
+                }
+                break;
+            case nameof(FilePreviewTab.MarkdownHeadingLine):
+                // 并排模式:源码光标跨标题时渲染面滚到对应标题(单向 源码→预览;
+                // 反向滚动同步需要块级双向映射,不在本轮范围)。防回环:渲染面自身滚动
+                // 引起的标题变化不再回写滚动。
+                if (_tab is { IsMarkdownRendered: true, MarkdownMode: MarkdownViewMode.SideBySide }
+                    && !_markdownPreviewSyncingHeading
+                    && _tab.MarkdownHeadingLine > 0)
+                {
+                    _markdownPreviewSyncingHeading = true;
+                    try
+                    {
+                        MarkdownView.ScrollToLineSafe(_tab.MarkdownHeadingLine);
+                    }
+                    finally
+                    {
+                        _markdownPreviewSyncingHeading = false;
                     }
                 }
                 break;
@@ -470,7 +516,24 @@ public partial class FilePreviewView : UserControl
                 FindBox.Focus();
                 FindBox.SelectAll();
                 break;
+            case nameof(FilePreviewTab.FindFocusRequest):
+                // Ctrl+F 命令重复触发(查找框已打开):IsFindBarOpen 不再变化,靠请求序号重新聚焦。
+                FindBox.Focus();
+                FindBox.SelectAll();
+                break;
+            case nameof(FilePreviewTab.IsMarkdown):
+                UpdateMarkdownLayout();
+                break;
+            case nameof(FilePreviewTab.Blame):
+            case nameof(FilePreviewTab.IsBlameVisible):
+            case nameof(FilePreviewTab.IsBlameLoading):
+                UpdateBlameMargin();
+                break;
             case nameof(FilePreviewTab.IsGoToLineBarOpen) when _tab.IsGoToLineBarOpen:
+                GoToLineBox.Focus();
+                GoToLineBox.SelectAll();
+                break;
+            case nameof(FilePreviewTab.GoToLineFocusRequest):
                 GoToLineBox.Focus();
                 GoToLineBox.SelectAll();
                 break;
@@ -712,8 +775,6 @@ public partial class FilePreviewView : UserControl
         }
 
         var modifiers = Keyboard.Modifiers;
-        var ctrl = modifiers == ModifierKeys.Control;
-        var shift = modifiers == ModifierKeys.Shift;
         var key = e.Key == Key.System ? e.SystemKey : e.Key;
 
         if (_tab.IsFindBarOpen && modifiers == ModifierKeys.Alt
@@ -737,58 +798,9 @@ public partial class FilePreviewView : UserControl
             return;
         }
 
-        if (ctrl && e.Key == Key.F)
-        {
-            // 正文有选定内容时按 Ctrl+F,用选中文本覆盖更新搜索框(无论搜索框是否为空);
-            // 选区文本按当前显示文档(全文/窗口)的坐标从 Content 截取。
-            if (!_tab.IsMarkdownRendered && CodeView.IsKeyboardFocusWithin)
-            {
-                var selection = CodeView.Editor.TextArea.Selection;
-                if (!selection.IsEmpty
-                    && selection.SurroundingSegment is { } segment
-                    && segment.Offset >= 0 && segment.Offset + segment.Length <= _tab.Content.Length)
-                {
-                    _tab.SearchText = _tab.Content[segment.Offset..(segment.Offset + segment.Length)];
-                }
-            }
-
-            // 查找栏已打开时 Ctrl+F 不重开,而是把焦点交回查找输入框。
-            var wasOpen = _tab.IsFindBarOpen;
-            _tab.OpenFindBarCommand.Execute(null);
-            if (wasOpen)
-            {
-                FindBox.Focus();
-                FindBox.SelectAll();
-            }
-
-            e.Handled = true;
-            return;
-        }
-
-        if (e.Key == Key.F3 && modifiers is ModifierKeys.None or ModifierKeys.Shift)
-        {
-            if (shift)
-            {
-                _tab.FindPreviousCommand.Execute(null);
-            }
-            else
-            {
-                _tab.FindNextCommand.Execute(null);
-            }
-
-            e.Handled = true;
-            return;
-        }
-
-        if (ctrl && e.Key == Key.G)
-        {
-            _tab.OpenGoToLineBarCommand.Execute(null);
-            GoToLineBox.Focus();
-            GoToLineBox.SelectAll();
-            e.Handled = true;
-            return;
-        }
-
+        // Ctrl+F / Ctrl+G / F3 不在此处理:它们是命令平台的默认键位
+        // (editor.action.startFind / workbench.action.gotoLine / editor.action.findNext),
+        // 由窗口级键绑定分发路由到活动标签的命令,用户可在 keybindings.json 重绑。
         if (e.Key == Key.Escape && modifiers == ModifierKeys.None)
         {
             if (_tab.IsGoToLineBarOpen)
@@ -815,6 +827,65 @@ public partial class FilePreviewView : UserControl
         else
         {
             CodeView.Editor.TextArea.Focus();
+        }
+    }
+
+    /// <summary>并排模式源码→预览标题滚动同步的重入闸:渲染面自身滚动更新
+    /// MarkdownHeadingLine 时不再回写滚动,避免抖动环。</summary>
+    private bool _markdownPreviewSyncingHeading;
+
+    /// <summary>Blame 边距数据同步:开关开着推注解(装载中显示占位、截断常驻标记),否则折叠整列。
+    /// DataContext 切换(共享视图复用)时也会被调用清掉上一个标签的边距。</summary>
+    private void UpdateBlameMargin()
+    {
+        if (_tab is not { IsBlameVisible: true })
+        {
+            CodeView.UpdateBlame(null, loading: false, truncated: false);
+            return;
+        }
+
+        var blame = _tab.Blame;
+        CodeView.UpdateBlame(
+            blame is null ? null : BlameAnnotationLayout.Build(blame),
+            _tab.IsBlameLoading,
+            blame?.Truncated == true);
+    }
+
+    /// <summary>Markdown 布局驱动(与大纲栏同模式,列宽/ColumnSpan 必须落在 UI 线程的布局阶段):
+    /// 并排 = 源码列与预览列各半 + 可拖分隔条;其余模式预览列收拢,MarkdownView 跨全列。
+    /// 阅读位置同步沿用既有逻辑锚点(渲染重建后按 锚点→行号→偏移 恢复)。</summary>
+    private void UpdateMarkdownLayout()
+    {
+        var sideBySide = _tab is { IsMarkdown: true, MarkdownMode: MarkdownViewMode.SideBySide };
+        if (sideBySide)
+        {
+            MarkdownSplitterColumn.Width = new GridLength(5);
+            MarkdownPreviewColumn.MinWidth = 220;
+            MarkdownSourceColumn.MinWidth = 220;
+            if (MarkdownPreviewColumn.Width.Value == 0)
+            {
+                MarkdownPreviewColumn.Width = new GridLength(1, GridUnitType.Star);
+            }
+
+            if (MarkdownSourceColumn.Width.Value == 0)
+            {
+                MarkdownSourceColumn.Width = new GridLength(1, GridUnitType.Star);
+            }
+
+            Grid.SetColumn(MarkdownView, 2);
+            Grid.SetColumnSpan(MarkdownView, 1);
+            MarkdownSplitter.Visibility = Visibility.Visible;
+        }
+        else
+        {
+            MarkdownSplitterColumn.Width = new GridLength(0);
+            MarkdownPreviewColumn.MinWidth = 0;
+            MarkdownSourceColumn.MinWidth = 0;
+            MarkdownPreviewColumn.Width = new GridLength(0);
+            MarkdownSourceColumn.Width = new GridLength(1, GridUnitType.Star);
+            Grid.SetColumn(MarkdownView, 0);
+            Grid.SetColumnSpan(MarkdownView, 3);
+            MarkdownSplitter.Visibility = Visibility.Collapsed;
         }
     }
 

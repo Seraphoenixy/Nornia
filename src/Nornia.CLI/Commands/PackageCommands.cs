@@ -13,7 +13,7 @@ public sealed class PackageSearchCommand(CliServices services) : ICommand
     {
         if (args.Count == 0 || string.IsNullOrWhiteSpace(string.Join(' ', args)))
         {
-            throw new ArgumentException($"Usage: Nornia {Name} <query>");
+            throw new CliUsageException($"Usage: Nornia {Name} <query>");
         }
 
         CliOutput.PrintPackages(await services.PackageProvider.SearchAsync(string.Join(' ', args), services.ProcessProgress, cancellationToken));
@@ -46,7 +46,7 @@ public sealed class PackageInstallCommand(CliServices services) : ICommand
     {
         if (args.Count == 0)
         {
-            throw new ArgumentException($"Usage: Nornia {Name} <id> [version]");
+            throw new CliUsageException($"Usage: Nornia {Name} <id> [version]");
         }
 
         return await services.InstallPackageAsync(args[0], args.Count > 1 ? args[1] : null, cancellationToken);
@@ -64,7 +64,7 @@ public sealed class PackageUninstallCommand(CliServices services) : ICommand
     {
         if (args.Count == 0)
         {
-            throw new ArgumentException($"Usage: Nornia {Name} <id>");
+            throw new CliUsageException($"Usage: Nornia {Name} <id>");
         }
 
         return await services.UninstallPackageAsync(args[0], cancellationToken);
@@ -82,7 +82,7 @@ public sealed class PackageUpgradeCommand(CliServices services) : ICommand
     {
         if (args.Count == 0)
         {
-            throw new ArgumentException($"Usage: Nornia {Name} <id>");
+            throw new CliUsageException($"Usage: Nornia {Name} <id>");
         }
 
         return await services.UpgradePackageAsync(args[0], cancellationToken);
@@ -129,12 +129,12 @@ public sealed class PackageCacheCleanCommand(CliServices services) : ICommand
                 continue;
             }
 
-            throw new ArgumentException($"Usage: Nornia {Name}");
+            throw new CliUsageException($"Usage: Nornia {Name}");
         }
 
         if (ids.Count == 0)
         {
-            throw new ArgumentException(CliText.Get("Cache_Clean_RequiresId"));
+            throw new CliUsageException(CliText.Get("Cache_Clean_RequiresId"));
         }
 
         var candidates = services.CacheClassification.Classify(

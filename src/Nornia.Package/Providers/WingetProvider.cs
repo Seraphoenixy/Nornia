@@ -461,7 +461,10 @@ public sealed partial class WingetProvider(
     /// 把真正可升级实例的可用值留下来,再被上层当成包级可用值贴到所有实例上。</summary>
     private static IReadOnlyList<PackageInfo> Deduplicate(IEnumerable<PackageInfo> packages) => packages
         .GroupBy(package => $"{package.Id}\u001F{package.Version}\u001F{package.Provider}\u001F{package.Architecture}", StringComparer.OrdinalIgnoreCase)
-        .Select(group => group.OrderByDescending(package => package.AvailableVersion is not null).ThenByDescending(package => package.Version, StringComparer.OrdinalIgnoreCase).First())
+        .Select(group => group
+            .OrderByDescending(package => package.AvailableVersion is not null)
+            .ThenByDescending(package => package.Version, VersionOrder.Comparer)
+            .First())
         .ToArray();
 
     private static bool IsLocalIdentity(string packageId) =>

@@ -48,5 +48,7 @@
   <data name="Provider_ScoopFailed" xml:space="preserve"><value>Scoop 操作失败（退出码 {1}）：{2}</value></data>
   <data name="Provider_ChocolateyFailed" xml:space="preserve"><value>Chocolatey 操作失败（退出码 {1}）：{2}</value></data>
   <data name="Rollback_InstallFailed" xml:space="preserve"><value>  自动安装失败（Winget 可能不支持降级）：{0}。请按提示手动操作：{1}</value></data>
+  <data name="Rollback_UninstallFailed" xml:space="preserve"><value>  自动卸载失败：{0}。请手动移除：{1}</value></data>
+  <data name="Rollback_Completed" xml:space="preserve"><value>回滚结束：共 {1} 步，已撤销 {0} 步，跳过 {2} 步，失败 {3} 步。</value></data>
   <data name="Package_InstallNoVersion" xml:space="preserve"><value>  使用 {1} 安装 {0}。</value></data>
 </root>

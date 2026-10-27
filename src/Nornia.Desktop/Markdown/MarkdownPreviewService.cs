@@ -44,6 +44,10 @@ public enum MarkdownViewMode
 {
     Rendered,
     Source,
+
+    /// <summary>并排:源码面与渲染面同屏(VS Code markdown.sideBySide)。渲染面语义与
+    /// <see cref="Rendered"/> 相同(需要渲染产物、仅完整加载文件),另按需补齐源码侧高亮/折叠。</summary>
+    SideBySide,
 }
 
 public sealed record MarkdownDiagnostic(string Message, int Line = 0, bool IsError = false);

@@ -146,15 +146,34 @@
     </Border>
     <Border Grid.Row="1" Padding="24,8" BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,0,0,1">
       <Grid>
-        <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition Width="Auto" /><ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+        <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition Width="Auto" /><ColumnDefinition Width="Auto" /><ColumnDefinition Width="240" /><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
         <Button Content="用户" Command="{Binding Editor.SelectScopeCommand}" CommandParameter="User" AutomationProperties.Name="编辑用户设置" />
         <Button Grid.Column="1" Content="工作区" Margin="8,0,0,0" Command="{Binding Editor.SelectScopeCommand}"
                 CommandParameter="Workspace" IsEnabled="{Binding Editor.HasWorkspace}" AutomationProperties.Name="编辑工作区设置" />
         <Button Grid.Column="2" Content="键盘快捷方式" Margin="8,0,0,0" Command="{Binding Editor.ShowKeyboardShortcutsCommand}"
                 AutomationProperties.Name="打开键盘快捷方式编辑器" />
-        <TextBlock Grid.Column="3" Text="{Binding Editor.ScopeDescription}" Style="{StaticResource CaptionStyle}"
-                   Margin="16,0" VerticalAlignment="Center" TextWrapping="Wrap" />
-        <StackPanel Grid.Column="4" Orientation="Horizontal" VerticalAlignment="Center">
+        <!-- 搜索框:VM 的 SearchText 过滤(标题/描述/id/关键字 + @modified/@user/@workspace 令牌)早已就绪,
+             此前缺的只是输入口。水印用 adorner 风格的叠加 TextBlock。 -->
+        <Grid Grid.Column="3" Margin="16,0,8,0" VerticalAlignment="Center">
+          <TextBox Text="{Binding Editor.SearchText, UpdateSourceTrigger=PropertyChanged}"
+                   VerticalContentAlignment="Center" AutomationProperties.Name="搜索设置" />
+          <TextBlock Text="搜索设置（@modified 只看已修改）" IsHitTestVisible="False" Foreground="{DynamicResource MutedTextBrush}"
+                     VerticalAlignment="Center" Margin="6,0,0,0">
+            <TextBlock.Style>
+              <Style TargetType="TextBlock">
+                <Setter Property="Visibility" Value="Collapsed" />
+                <Style.Triggers>
+                  <DataTrigger Binding="{Binding Editor.SearchText}" Value="">
+                    <Setter Property="Visibility" Value="Visible" />
+                  </DataTrigger>
+                </Style.Triggers>
+              </Style>
+            </TextBlock.Style>
+          </TextBlock>
+        </Grid>
+        <TextBlock Grid.Column="4" Text="{Binding Editor.ScopeDescription}" Style="{StaticResource CaptionStyle}"
+                   VerticalAlignment="Center" TextWrapping="Wrap" />
+        <StackPanel Grid.Column="5" Orientation="Horizontal" VerticalAlignment="Center">
           <TextBlock Text="语言覆盖" Style="{StaticResource CaptionStyle}" VerticalAlignment="Center" Margin="0,0,8,0" />
           <ComboBox Width="160" ItemsSource="{Binding Editor.Languages}"
                     SelectedItem="{Binding Editor.SelectedLanguage}" AutomationProperties.Name="设置语言覆盖" />

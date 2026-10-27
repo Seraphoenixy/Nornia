@@ -102,7 +102,9 @@ public sealed class EnvironmentCheckEngine : IEnvironmentCheckEngine
             .Where(runtime => definition is not null
                 ? string.Equals(EnvironmentComponentCatalog.Get(runtime.Name)?.Id, definition.Id, StringComparison.OrdinalIgnoreCase)
                 : string.Equals(runtime.Name, component, StringComparison.OrdinalIgnoreCase))
-            .OrderByDescending(runtime => runtime.Version, StringComparer.OrdinalIgnoreCase)
+            // 必须按数值序排版本:字典序下 "9.0.1" 会大于 "10.0.0",
+            // installed[0] 就不是最新实例,修复计划会据此算出错误的目标版本。
+            .OrderByDescending(runtime => runtime.Version, VersionOrder.Comparer)
             .ToArray();
 
         if (installed.Length == 0)

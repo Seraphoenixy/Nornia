@@ -21,6 +21,16 @@ public interface ICommand
     Task<int> ExecuteAsync(IReadOnlyList<string> args, CancellationToken cancellationToken);
 }
 
+/// <summary>命令的参数组合不合法（缺参、多参、无法识别的取值）。
+/// 与领域/IO 失败区分对待：CLI 为它返回退出码 2（未知命令或参数组合），后者返回 1。
+/// 继承 <see cref="ArgumentException"/> 以保持既有 <c>catch (ArgumentException)</c> 行为不变。</summary>
+public sealed class CliUsageException : ArgumentException
+{
+    public CliUsageException(string message) : base(message)
+    {
+    }
+}
+
 /// <summary>Routes argument lists to the command whose route segments match the head of the input.
 /// The longest matching route wins, so <c>runtime list</c> is preferred over an ambiguous <c>runtime</c>
 /// prefix. Unknown or empty input falls through to help.</summary>

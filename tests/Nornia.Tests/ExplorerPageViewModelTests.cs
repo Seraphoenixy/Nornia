@@ -56,7 +56,7 @@ public sealed class ExplorerPageViewModelTests : IDisposable
             logs,
             new FakeClipboardService(),
             new FakeProjectWorkspaceService());
-        var git = new GitViewModel(gitService, folder, new FakeConfirmationService(), catalog, editor, logs,
+        var git = new GitViewModel(gitService, folder, new FakeConfirmationService(), new FakeTextPromptService(), catalog, editor, logs,
             new FakeClipboardService(), new FakeGitRepositoryWatcher(), new FakeProjectWorkspaceService(), new FakeApplicationStateStore(), settings);
         var page = new ExplorerPageViewModel(explorer, editor, terminal, git, projects, catalog, folder, new DesktopNavigationService(), logs);
         return (page, catalog, folder, gitService, settings);
@@ -176,10 +176,14 @@ public sealed class ExplorerPageViewModelTests : IDisposable
         var node = src.Children.First(child => child.Name == "A.cs");
 
         page.Explorer.OpenNodeCommand.Execute(node);
-        await Task.Delay(30);
+        // 打开是 fire-and-forget(见 ExplorerPageViewModel 的 FileOpenPermanentRequested 订阅),
+        // 固定睡眠会在慢的 CI 上抢跑;轮询到标签内容落地为止。
+        await WaitUntilAsync(() => page.Editor.OpenTabs.Count == 1,
+            "资源管理器打开预览标签");
 
         var preview = Assert.IsType<FilePreviewTab>(Assert.Single(page.Editor.OpenTabs));
         Assert.Equal(file, preview.Path);
+        await WaitUntilAsync(() => preview.Content == "hello", "预览标签读取文件内容");
         Assert.Equal("hello", preview.Content);
     }
 
@@ -198,7 +202,7 @@ public sealed class ExplorerPageViewModelTests : IDisposable
         var node = src.Children.First(child => child.Name == "A.cs");
 
         page.Explorer.OpenTreeFilePermanentCommand.Execute(new WorkspaceFileRow(node, depth: 1));
-        await Task.Delay(30);
+        await WaitUntilAsync(() => page.Editor.OpenTabs.Count == 1);
 
         var tab = Assert.IsType<FilePreviewTab>(Assert.Single(page.Editor.OpenTabs));
         Assert.Equal(file, tab.Path);
@@ -257,7 +261,7 @@ public sealed class ExplorerPageViewModelTests : IDisposable
         Assert.False(info.Value.IsUntracked);
     }
 
-    private static async Task WaitUntilAsync(Func<bool> condition)
+    private static async Task WaitUntilAsync(Func<bool> condition, string? describe = null)
     {
         var deadline = Environment.TickCount64 + 5_000;
         while (!condition() && Environment.TickCount64 < deadline)
@@ -265,6 +269,6 @@ public sealed class ExplorerPageViewModelTests : IDisposable
             await Task.Delay(10);
         }
 
-        Assert.True(condition(), "等待资源管理器同步活动文件超时。");
+        Assert.True(condition(), "等待异步状态超时:" + (describe ?? "资源管理器同步活动文件"));
     }
 }

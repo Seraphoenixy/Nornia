@@ -31,10 +31,11 @@ public sealed record TextDecodeResult(
 
 /// <summary>Reads and decodes a text file for preview. BOM first (UTF-8 / UTF-16 / UTF-32), then
 /// strict UTF-8 validation, then GB18030 so legacy Chinese sources do not garble. Binary data, files
-/// over the preview limit and unreadable files produce explicit results (never a partial parse).</summary>
+/// over the preview limit and unreadable files produce explicit results (never a partial parse).
+/// <paramref name="forcedEncoding"/> 是状态栏编码选择器的覆盖项:跳过探测,按所选编码解码。</summary>
 public interface ITextDocumentDecoder
 {
-    Task<TextDecodeResult> DecodeAsync(string path, long previewLimit, CancellationToken cancellationToken = default);
+    Task<TextDecodeResult> DecodeAsync(string path, long previewLimit, Encoding? forcedEncoding = null, CancellationToken cancellationToken = default);
 }
 
 public sealed class TextDocumentDecoder : ITextDocumentDecoder
@@ -48,7 +49,7 @@ public sealed class TextDocumentDecoder : ITextDocumentDecoder
     private static readonly UTF8Encoding StrictUtf8 = new(false, throwOnInvalidBytes: true);
     private static readonly Encoding Gb18030 = LoadGb18030();
 
-    public async Task<TextDecodeResult> DecodeAsync(string path, long previewLimit, CancellationToken cancellationToken = default)
+    public async Task<TextDecodeResult> DecodeAsync(string path, long previewLimit, Encoding? forcedEncoding = null, CancellationToken cancellationToken = default)
     {
         FileInfo info;
         try
@@ -97,11 +98,13 @@ public sealed class TextDocumentDecoder : ITextDocumentDecoder
             return Failed(info.Length, $"无法读取文件：{ex.Message}");
         }
 
-        var (encoding, bomLength) = DetectEncoding(bytes);
+        var (encoding, bomLength) = forcedEncoding is not null
+            ? (forcedEncoding, 0)
+            : DetectEncoding(bytes);
 
         // BOM-less files get the NUL probe; recognized text BOMs (UTF-16/32) legitimately contain
-        // NUL bytes and must not be treated as binary.
-        if (bomLength == 0 && bytes.Take(BinaryProbeLength).Any(value => value == 0))
+        // NUL bytes and must not be treated as binary. 用户强制编码 = 明确覆盖:跳过二进制判定。
+        if (forcedEncoding is null && bomLength == 0 && bytes.Take(BinaryProbeLength).Any(value => value == 0))
         {
             return new TextDecodeResult(true, null, null, NewlineType.Unknown, 0, bytes.LongLength, true, false, null);
         }
@@ -113,10 +116,21 @@ public sealed class TextDocumentDecoder : ITextDocumentDecoder
         }
         catch (DecoderFallbackException)
         {
+            if (forcedEncoding is not null)
+            {
+                // 强制编码带替换回退,正常不会失败;失败即字节序列与所选编码根本不兼容(如 UTF-16 奇数长度)。
+                return Failed(bytes.LongLength, $"按所选编码（{DescribeEncoding(forcedEncoding, 0)}）解码失败，请尝试其他编码。");
+            }
+
             // A fallback failure means the byte sequence is not well-formed for the detected
             // encoding; GB18030 is the last resort for legacy CJK text.
             text = Gb18030.GetString(bytes);
             encoding = Gb18030;
+        }
+        catch (ArgumentException) when (forcedEncoding is not null)
+        {
+            // UTF-16/32 对奇数长度字节序列抛 ArgumentException:同属"所选编码不兼容"。
+            return Failed(bytes.LongLength, $"按所选编码（{DescribeEncoding(forcedEncoding, 0)}）解码失败，请尝试其他编码。");
         }
 
         var newlineType = DetectNewlineType(text);
@@ -174,6 +188,26 @@ public sealed class TextDocumentDecoder : ITextDocumentDecoder
             12000 => "UTF-32 LE BOM",
             12001 => "UTF-32 BE BOM",
             _ => encoding.WebName,
+        };
+    }
+
+    /// <summary>编码选择器(web 名)→ 强制解码实例。统一带替换回退:阅读场景下坏字节显示
+    /// 替换符而不是抛错;null/未知名 → null(回到自动检测)。</summary>
+    public static Encoding? CreateForcedEncoding(string? webName)
+    {
+        if (string.IsNullOrWhiteSpace(webName))
+        {
+            return null;
+        }
+
+        Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        return webName.Trim().ToLowerInvariant() switch
+        {
+            "utf-8" => new UTF8Encoding(false, false),
+            "utf-16" => new UnicodeEncoding(false, false),
+            "utf-16be" => new UnicodeEncoding(true, false),
+            "gb18030" => Encoding.GetEncoding(54936, EncoderFallback.ExceptionFallback, DecoderFallback.ReplacementFallback),
+            _ => null,
         };
     }
 

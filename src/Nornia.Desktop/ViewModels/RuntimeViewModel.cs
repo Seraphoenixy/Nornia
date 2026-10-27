@@ -1,4 +1,4 @@
-using CommunityToolkit.Mvvm.ComponentModel;
+﻿using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using CoreRuntime = Nornia.Core.Models.Runtime;
 using Nornia.Core.Interfaces;
@@ -115,6 +115,9 @@ public partial class RuntimeViewModel(
     }, "确认相关命令已加入 PATH，或查看 Problems。", canCancel: true);
 
     /// <summary>用户显式发起的扫描:永远强制重扫并更新持久化快照与 scan_state。</summary>
+    /// <inheritdoc />
+    public override Task RefreshActiveViewAsync() => ScanCommand.ExecuteAsync(null);
+
     [RelayCommand]
     private Task ScanAsync() => RunAsync("扫描 Runtime", async cancellationToken =>
     {
@@ -302,7 +305,7 @@ public partial class RuntimeViewModel(
             })
             .ToArray();
         var snapshot = RestrictToLatestInstalls(annotated)
-            .OrderBy(item => item.Runtime.Name).ThenByDescending(item => item.Runtime.Version)
+            .OrderBy(item => item.Runtime.Name).ThenByDescending(item => item.Runtime.Version, VersionOrder.Comparer)
             .Select(item => new ManagedComponentItem(item.Runtime, item.Available))
             .ToArray();
         using var performance = performanceMetrics?.Begin("runtime.list.publish", snapshot.Length, "ui-batch");

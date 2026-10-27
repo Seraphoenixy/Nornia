@@ -1,6 +1,8 @@
 using System.Collections.ObjectModel;
+using System.Collections.Specialized;
 using Nornia.Core.Collections;
 using Nornia.Core.Coalescing;
+using Nornia.Desktop.ViewModels;
 
 namespace Nornia.Tests;
 
@@ -18,24 +20,28 @@ public sealed class CoalescingPrimitivesTests
         scheduler.Schedule();
         scheduler.Schedule();
 
-        SpinWait.SpinUntil(() => runs == 1, TimeSpan.FromSeconds(2));
-        Assert.False(scheduler.IsScheduled);
-        Thread.Sleep(80);
+        // IsScheduled 归位后不会再有待执行的回调,因此这是"只跑一次"的确定性证据,
+        // 不需要再 sleep 一段时间去"确认没有第二次"。
+        Assert.True(SpinWait.SpinUntil(() => runs == 1 && !scheduler.IsScheduled, TimeSpan.FromSeconds(2)));
         Assert.Equal(1, runs);
     }
 
     [Fact]
-    public void RunOnceScheduler_RescheduleResetsTheTimer()
+    public void RunOnceScheduler_RescheduleKeepsExactlyOnePendingRun()
     {
+        // 原实现用 Thread.Sleep(35) 去观察 60ms 计时器"尚未触发"——既没验证到重置
+        // (35ms 本来就早于 60ms),又在负载稍高的 CI 上会因为 sleep 超时误报。
+        // 改为断言真正有价值的性质:重复 Schedule 不叠加排程,最终恰好跑一次。
         var runs = 0;
         using var scheduler = new RunOnceScheduler(60) { Action = () => Interlocked.Increment(ref runs) };
         scheduler.Schedule();
-        Thread.Sleep(35);
-        scheduler.Schedule(); // trailing debounce: timer restarts
+        Assert.True(scheduler.IsScheduled);
 
-        Assert.Equal(0, runs);
-        SpinWait.SpinUntil(() => runs == 1, TimeSpan.FromSeconds(2));
-        Thread.Sleep(80);
+        scheduler.Schedule(); // 尾部去抖:重新计时
+        Assert.True(scheduler.IsScheduled);
+        Assert.Equal(0, runs); // 重复 Schedule 不得立刻执行
+
+        Assert.True(SpinWait.SpinUntil(() => runs == 1 && !scheduler.IsScheduled, TimeSpan.FromSeconds(5)));
         Assert.Equal(1, runs);
     }
 
@@ -165,7 +171,46 @@ public sealed class CoalescingPrimitivesTests
         Assert.Equal(1, op.RemoveStart);
         Assert.Equal(2, op.RemoveCount);
         Assert.Equal(1, op.InsertAt);
-        Assert.Equal([1, 2], op.Items);
+        Assert.Equal(2, op.InsertCount);
+        Assert.False(op.IsNoOp);
+    }
+
+    [Fact]
+    public void Compute_IsNoOpForIdenticalSequences()
+    {
+        var current = new List<object> { "a", "b", "c" };
+
+        var op = CollectionDiffer.Compute(current, new List<object> { "a", "b", "c" });
+
+        Assert.True(op.IsNoOp);
+        Assert.Equal(0, op.RemoveCount);
+        Assert.Equal(0, op.InsertCount);
+    }
+
+    [Fact]
+    public void Apply_WithPrecomputedOperation_InsertsTheDesiredSlice()
+    {
+        var collection = new ObservableCollection<string> { "a", "b", "c", "d" };
+        var desired = new List<string> { "a", "x", "y", "d" };
+        var op = CollectionDiffer.Compute(collection, desired);
+
+        var removed = CollectionDiffer.Apply(collection, desired, op);
+
+        Assert.Equal(new HashSet<string> { "b", "c" }, removed.ToHashSet());
+        Assert.Equal(["a", "x", "y", "d"], collection);
+    }
+
+    [Fact]
+    public void Apply_WithPrecomputedNoOp_EmitsNoNotifications()
+    {
+        var collection = new ObservableCollection<string> { "a", "b" };
+        var desired = new List<string> { "a", "b" };
+        var notifications = 0;
+        collection.CollectionChanged += (_, _) => notifications++;
+
+        CollectionDiffer.Apply(collection, desired, CollectionDiffer.Compute(collection, desired));
+
+        Assert.Equal(0, notifications);
     }
 
     [Fact]
@@ -199,5 +244,57 @@ public sealed class CoalescingPrimitivesTests
         CollectionDiffer.Apply(collection, new List<string> { "c", "d", "e" });
 
         Assert.Equal(["c", "d", "e"], collection);
+    }
+
+    [Fact]
+    public void ReplaceRange_WithEqualityCheck_SkipsTheResetWhenNothingChanged()
+    {
+        var collection = new BulkObservableCollection<string> { "a", "b" };
+        var notifications = 0;
+        collection.CollectionChanged += (_, _) => notifications++;
+
+        collection.ReplaceRange(new[] { "a", "b" });
+
+        Assert.Equal(0, notifications);
+    }
+
+    [Fact]
+    public void ReplaceRange_WithoutEqualityCheck_AlwaysPublishesOneReset()
+    {
+        var collection = new BulkObservableCollection<string> { "a", "b" };
+        var notifications = 0;
+        collection.CollectionChanged += (_, _) => notifications++;
+
+        // 调用方已经用一次差分确认过有变化时,跳过逐项 SequenceEqual 的第二遍全表比较。
+        collection.ReplaceRange(new[] { "a", "b" }, checkEquality: false);
+
+        Assert.Equal(1, notifications);
+    }
+
+    [Fact]
+    public void SyncCollection_TailShrinkToNewEntryLimit_PublishesRemovesOnly()
+    {
+        // git.statusLimit 生效就是这一形状:同一列表从 120 条缩到 100 条(尾部纯删除)。
+        // 必须走差分而不是快照:Reset 会重建每一行的容器与选中态,而逐条 Remove 让前 100 行
+        // 实例存活;同时列表必须精确落在目标条数上——发布中途被打断(例如跨线程通知抛异常)
+        // 会留下 119 条这种"提示说 100、列表不是 100"的半状态。
+        var current = Enumerable.Range(0, 120).Select(index => index.ToString("D3")).ToArray();
+        var desired = current[..100];
+        var target = new BulkObservableCollection<string>();
+        target.ReplaceRange(current);
+        var removes = 0;
+        var resets = 0;
+        target.CollectionChanged += (_, args) =>
+        {
+            if (args.Action == NotifyCollectionChangedAction.Remove) removes += args.OldItems?.Count ?? 0;
+            if (args.Action == NotifyCollectionChangedAction.Reset) resets++;
+        };
+
+        var changed = GitViewModel.SyncCollection(target, desired);
+
+        Assert.True(changed);
+        Assert.Equal(100, target.Count);
+        Assert.Equal(20, removes);
+        Assert.Equal(0, resets);
     }
 }

@@ -53,4 +53,13 @@
   <data name="Summary_ProjectImport" xml:space="preserve"><value>将环境声明导入到项目。</value></data>
   <data name="Summary_ProjectOpen" xml:space="preserve"><value>在编辑器中打开项目。</value></data>
   <data name="Summary_Help" xml:space="preserve"><value>显示帮助。</value></data>
+  <data name="Env_FixBatchId" xml:space="preserve"><value>修复批次 {0}。撤销：Nornia env rollback {0} --apply</value></data>
+  <data name="Env_FixRollbackHint" xml:space="preserve"><value>撤销该批次：Nornia env rollback {0} --apply</value></data>
+  <data name="Summary_EnvRollback" xml:space="preserve"><value>撤销一次已应用的环境修复批次。</value></data>
+  <data name="Rollback_BatchHeader" xml:space="preserve"><value>回滚批次</value></data>
+  <data name="Rollback_InvalidId" xml:space="preserve"><value>“{0}”不是有效的 correlation id（应为 GUID）。</value></data>
+  <data name="Rollback_NoBatch" xml:space="preserve"><value>未找到 correlation id 为 {0} 的修复批次。</value></data>
+  <data name="Rollback_PreviewOnly" xml:space="preserve"><value>预览模式。添加 --apply 以撤销上述步骤。</value></data>
+  <data name="Rollback_Applied" xml:space="preserve"><value>回滚结束：共 {1} 步，已撤销 {0} 步，跳过 {2} 步，失败 {3} 步。</value></data>
+  <data name="Rollback_StepFailed" xml:space="preserve"><value>步骤失败 {0}：{1}</value></data>
 </root>

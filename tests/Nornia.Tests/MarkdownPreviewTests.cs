@@ -606,20 +606,16 @@ public sealed class MarkdownFilePreviewTests : IDisposable
     }
 
     /// <summary>窗口阅读的大 Markdown 不产生渲染预览:模式显式落到源码,源码面(含提示)可见,
-    /// 无渲染产物驻留。</summary>
+    /// 无渲染产物驻留。注入小分层上限代替真实 8MB 文件——窗口化代码路径完全一致。</summary>
     [Fact]
     public async Task FilePreviewTab_WindowedMarkdown_FallsBackToSourceMode()
     {
         var path = Path.Combine(_directory, "big.md");
-        using (var writer = new StreamWriter(path, append: false))
+        await File.WriteAllTextAsync(path, "# Big\n\n" + new string('x', 2048));
+        var tab = new FilePreviewTab(path, TextDocumentDecoder.Instance, CodeFileTypeRegistry.Instance)
         {
-            writer.WriteLine("# Big");
-            for (var i = 0; i < 2100; i++)
-            {
-                writer.WriteLine(new string('x', 4096));
-            }
-        }
-        var tab = new FilePreviewTab(path, TextDocumentDecoder.Instance, CodeFileTypeRegistry.Instance);
+            ContentLimits = new ReadOnlyContentLimits(1024, 64 * 1024, ReadOnlyContentCapacity.FullDiffLines, ReadOnlyContentCapacity.WindowedDiffLines),
+        };
         await tab.LoadAsync();
 
         Assert.Equal(ReadOnlyContentTier.Windowed, tab.CapacityTier);
@@ -642,6 +638,58 @@ public sealed class MarkdownFilePreviewTests : IDisposable
         Assert.Equal(MarkdownViewMode.Source, tab.MarkdownMode);
         Assert.True(tab.ShowSourceSurface);
         Assert.NotEmpty(tab.Notice);
+    }
+
+    /// <summary>并排模式(VS Code markdown.sideBySide):源码面与渲染面同屏——两面可见性都为真,
+    /// 渲染产物照常构建;从纯渲染切入时产物保留,不重新解析。</summary>
+    [Fact]
+    public async Task FilePreviewTab_SideBySide_ShowsBothSurfaces()
+    {
+        var path = Path.Combine(_directory, "side-by-side.md");
+        await File.WriteAllTextAsync(path, "# Root\n\nbody");
+        var tab = new FilePreviewTab(path, TextDocumentDecoder.Instance, CodeFileTypeRegistry.Instance);
+        await tab.LoadAsync();
+        Assert.True(tab.IsMarkdownRendered); // 默认纯渲染,产物已就绪
+
+        tab.ShowMarkdownSideBySideCommand.Execute(null);
+
+        Assert.Equal(MarkdownViewMode.SideBySide, tab.MarkdownMode);
+        Assert.True(tab.ShowSourceSurface); // 源码面保持可见
+        Assert.True(tab.IsMarkdownRendered); // 渲染面语义与纯渲染一致
+        Assert.NotNull(tab.MarkdownRenderResult); // 产物保留,未因切并排重新解析
+
+        // 并排 → 源码:产物释放(源码模式不驻留渲染产物)。
+        tab.ShowMarkdownSourceCommand.Execute(null);
+        Assert.Equal(MarkdownViewMode.Source, tab.MarkdownMode);
+        Assert.Null(tab.MarkdownRenderResult);
+
+        // 源码 → 并排:产物已释放 → 重新解析并在并排模式下发布。
+        tab.ShowMarkdownSideBySideCommand.Execute(null);
+        Assert.True(await WaitForAsync(() => tab.MarkdownRenderResult is not null),
+            "从源码切入并排后应在超时内完成重新解析");
+        Assert.True(tab.IsMarkdownRendered);
+        Assert.True(tab.ShowSourceSurface);
+    }
+
+    /// <summary>窗口化大文件不可用并排:渲染门控把模式落回源码并给出提示(小上限注入)。</summary>
+    [Fact]
+    public async Task FilePreviewTab_SideBySide_WindowedFallsBackToSourceMode()
+    {
+        var path = Path.Combine(_directory, "side-by-side-big.md");
+        await File.WriteAllTextAsync(path, "# Big\n\n" + new string('x', 2048));
+        var tab = new FilePreviewTab(path, TextDocumentDecoder.Instance, CodeFileTypeRegistry.Instance)
+        {
+            ContentLimits = new ReadOnlyContentLimits(1024, 64 * 1024, ReadOnlyContentCapacity.FullDiffLines, ReadOnlyContentCapacity.WindowedDiffLines),
+        };
+        await tab.LoadAsync();
+        Assert.Equal(MarkdownViewMode.Source, tab.MarkdownMode);
+
+        tab.ShowMarkdownSideBySideCommand.Execute(null);
+        Assert.True(await WaitForAsync(() => tab.MarkdownMode == MarkdownViewMode.Source),
+            "并排请求应被渲染门控落回源码模式");
+
+        Assert.True(tab.ShowSourceSurface);
+        Assert.Null(tab.MarkdownRenderResult);
     }
 
     /// <summary>轮询等待条件成立(异步解析/渲染完成判定,上限 10 秒)。</summary>

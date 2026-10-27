@@ -49,6 +49,7 @@ project.fragment.lock.json
 AppPackages/
 BundleArtifacts/
 .build-cache-roots/
+BenchmarkDotNet.Artifacts/
 
 # OS files
 Thumbs.db

@@ -40,9 +40,13 @@ public sealed class EnvironmentRollbackService(
         return new EnvironmentRollbackPlan(correlationId, source.Timestamp, actions);
     }
 
-    public async Task RollbackAsync(EnvironmentRollbackPlan plan, IProgress<ProcessOutput>? progress = null, CancellationToken cancellationToken = default)
+    public async Task<EnvironmentRollbackResult> RollbackAsync(EnvironmentRollbackPlan plan, IProgress<ProcessOutput>? progress = null, CancellationToken cancellationToken = default)
     {
         progress?.Report(new ProcessOutput(WingetText.Format("Rollback_Starting", plan.CorrelationId, plan.Actions.Count), false));
+
+        var failures = new List<EnvironmentRollbackFailure>();
+        var undoneCount = 0;
+        var skippedCount = 0;
 
         for (var index = 0; index < plan.Actions.Count; index++)
         {
@@ -52,6 +56,7 @@ public sealed class EnvironmentRollbackService(
 
             if (action.Strategy != RollbackStrategy.Automatic)
             {
+                skippedCount++;
                 progress?.Report(new ProcessOutput(
                     WingetText.Format("Rollback_Skipped", action.Hint), true));
                 continue;
@@ -64,22 +69,74 @@ public sealed class EnvironmentRollbackService(
             if (action.ToVersion == "0.0.0-uninstalled" || action.ToVersion == "none" || string.IsNullOrEmpty(action.ToVersion))
             {
                 progress?.Report(new ProcessOutput(WingetText.Format("Package_UninstallUsing", action.PackageId, selected.Name), false));
-                await selected.UninstallAsync(action.PackageId, packageName: null, progress, cancellationToken);
+                try
+                {
+                    await selected.UninstallAsync(action.PackageId, packageName: null, progress, cancellationToken);
+                    undoneCount++;
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    // 卸载失败同样不得中断批次:记入结果,后续步骤照旧尝试。
+                    failures.Add(CreateFailure(action, ex));
+                    progress?.Report(new ProcessOutput(
+                        WingetText.Format("Rollback_UninstallFailed", ex.Message, DefaultManualHint(action)), true));
+                }
+
                 continue;
             }
 
             // Downgrade / reinstall exact previous version.
-            progress?.Report(new ProcessOutput(WingetText.Format("Package_InstallUsing", action.PackageId, action.PackageVersion ?? action.ToVersion, selected.Name), false));
+            var targetVersion = action.PackageVersion ?? action.ToVersion;
+            progress?.Report(new ProcessOutput(WingetText.Format("Package_InstallUsing", action.PackageId, targetVersion, selected.Name), false));
             try
             {
-                await selected.InstallAsync(action.PackageId, action.PackageVersion ?? action.ToVersion, progress, cancellationToken);
+                await selected.InstallAsync(action.PackageId, targetVersion, progress, cancellationToken);
+                undoneCount++;
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
             }
             catch (Exception ex)
             {
+                failures.Add(CreateFailure(action, ex));
                 progress?.Report(new ProcessOutput(
                     WingetText.Format("Rollback_InstallFailed", ex.Message, DefaultManualHint(action)), true));
             }
         }
+
+        var result = new EnvironmentRollbackResult(
+            plan.CorrelationId, plan.Actions.Count, undoneCount, skippedCount, failures);
+
+        progress?.Report(new ProcessOutput(
+            WingetText.Format("Rollback_Completed", result.UndoneCount, result.TotalSteps, result.SkippedCount, result.Failures.Count),
+            result.RequiresManualIntervention));
+
+        return result;
+    }
+
+    /// <summary>把单步异常固化为可呈现的失败项。原因是给用户看的,保留原文但去 NUL 与换行。</summary>
+    private static EnvironmentRollbackFailure CreateFailure(EnvironmentRollbackAction action, Exception exception)
+    {
+        var reason = exception.Message.Replace("\0", string.Empty).Trim();
+        if (reason.Length > 4_000)
+        {
+            reason = reason[..4_000] + "…";
+        }
+
+        return new EnvironmentRollbackFailure(
+            action.OriginalSequence,
+            action.Component,
+            action.FromVersion,
+            action.ToVersion,
+            action.PackageId,
+            action.PackageVersion,
+            reason,
+            DefaultManualHint(action));
     }
 
     private static RollbackStrategy DetermineStrategy(EnvironmentRepairLogEntry entry)
@@ -141,7 +198,7 @@ public sealed class TrackedEnvironmentRepairExecutor(
         packageDowngradeBlacklist?.Keys ?? DefaultDowngradeBlacklist,
         StringComparer.OrdinalIgnoreCase);
 
-    public async Task ExecuteAsync(
+    public async Task<Guid> ExecuteAsync(
         IReadOnlyCollection<RuntimePackageOperation> operations,
         IProgress<ProcessOutput>? progress = null,
         CancellationToken cancellationToken = default)
@@ -252,6 +309,9 @@ public sealed class TrackedEnvironmentRepairExecutor(
         {
             throw snapshotError;
         }
+
+        // 成功返回 correlation_id：它是回滚这一批次的唯一定位键，调用方负责呈现给用户。
+        return correlationId;
     }
 
     private static EnvironmentRepairFailure CreateFailure(
@@ -358,10 +418,14 @@ public sealed class TrackedEnvironmentRepairExecutor(
         try
         {
             var snapshot = await runtimeInventoryService.GetPersistedAsync(cancellationToken);
-            var match = snapshot.FirstOrDefault(r =>
-                string.Equals(r.Name, component, StringComparison.OrdinalIgnoreCase)
-                || (EnvironmentComponentCatalog.TryGet(component, out var def)
-                    && string.Equals(EnvironmentComponentCatalog.Get(r.Name)?.Id, def.Id, StringComparison.OrdinalIgnoreCase)));
+            // 同一组件可能有多个 side-by-side 实例(.NET SDK feature band / VC++ 多架构):
+            // 必须取数值序最大的那个作为回滚基点,否则会记录错误的 previous_version。
+            var match = snapshot
+                .Where(r =>
+                    string.Equals(r.Name, component, StringComparison.OrdinalIgnoreCase)
+                    || (EnvironmentComponentCatalog.TryGet(component, out var def)
+                        && string.Equals(EnvironmentComponentCatalog.Get(r.Name)?.Id, def.Id, StringComparison.OrdinalIgnoreCase)))
+                .MaxByVersion(r => r.Version);
             return match?.Version ?? "0.0.0-uninstalled";
         }
         catch (OperationCanceledException)

@@ -1,4 +1,4 @@
-using System.Collections.ObjectModel;
+﻿using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Globalization;
 using System.IO;
@@ -158,8 +158,8 @@ public partial class SettingsEditorViewModel : ObservableObject, IDisposable, IA
     private readonly IKeybindingService _keybindings;
     private readonly ICommandRegistry _commands;
     private readonly IApplicationStateStore _stateStore;
-    private readonly Dispatcher _dispatcher = Dispatcher.CurrentDispatcher;
-    private readonly DispatcherTimer _saveTimer;
+    private readonly IUiDispatcher _uiDispatcher = new ThreadAffineUiDispatcher();
+    private readonly IUiTimer _saveTimer;
     private readonly Dictionary<string, SettingEditorItem> _pending = new(StringComparer.Ordinal);
     private SettingsSnapshot? _snapshot;
     private ISettingsSession? _session;
@@ -191,8 +191,15 @@ public partial class SettingsEditorViewModel : ObservableObject, IDisposable, IA
                      .Concat(present.Where(item => !fixedCategories.Contains(item)).OrderBy(item => item, StringComparer.Ordinal)))
             Categories.Add(new(category, CategoryGlyph(category)));
         selectedCategory = Categories[0];
-        _saveTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(300) };
-        _saveTimer.Tick += async (_, _) => { _saveTimer.Stop(); await FlushAsync(); };
+        // 用局部变量承接自身引用:readonly 字段在构造器内被 lambda 捕获时,空值流分析无法
+        // 证明"回调一定发生在赋值之后",会报 CS8602。
+        IUiTimer? saveTimer = null;
+        saveTimer = _uiDispatcher.CreateTimer(TimeSpan.FromMilliseconds(300), () =>
+        {
+            saveTimer?.Stop();
+            _ = FlushAsync();
+        });
+        _saveTimer = saveTimer;
         _workspace.ContextChanged += OnWorkspaceChangedAsync;
         _keybindings.BindingsChanged += OnBindingsChanged;
     }
@@ -429,7 +436,7 @@ public partial class SettingsEditorViewModel : ObservableObject, IDisposable, IA
             ApplySnapshot();
             SaveStatus = current.Diagnostics.Count == 0 ? "已保存" : current.Diagnostics[0].Message;
         }
-        if (_dispatcher.CheckAccess()) Update(); else _dispatcher.BeginInvoke(Update);
+        if (_uiDispatcher.CheckAccess()) Update(); else _uiDispatcher.BeginInvoke(Update);
     }
 
     private async Task ReloadShortcutsAsync(CancellationToken cancellationToken = default)
@@ -445,13 +452,13 @@ public partial class SettingsEditorViewModel : ObservableObject, IDisposable, IA
     /// 在没有同步上下文的后台线程,await 续体落在线程池,必须显式回到调度程序线程。</summary>
     private void RunOnDispatcher(Action action)
     {
-        if (_dispatcher.CheckAccess())
+        if (_uiDispatcher.CheckAccess())
         {
             action();
         }
         else
         {
-            _dispatcher.BeginInvoke(action);
+            _uiDispatcher.BeginInvoke(action);
         }
     }
 
@@ -479,8 +486,8 @@ public partial class SettingsEditorViewModel : ObservableObject, IDisposable, IA
             if (_keybindings.Diagnostics.FirstOrDefault() is { } diagnostic) SaveStatus = diagnostic.Message;
             PopulateShortcutItems();
         }
-        if (_dispatcher.CheckAccess()) Update();
-        else _dispatcher.BeginInvoke(Update);
+        if (_uiDispatcher.CheckAccess()) Update();
+        else _uiDispatcher.BeginInvoke(Update);
     }
 
     private void ApplySnapshot()

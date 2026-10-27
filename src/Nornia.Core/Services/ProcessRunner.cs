@@ -17,38 +17,54 @@ public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
     private const int MaximumTextFallbackCaptureBytes = 64 * 1024 * 1024;
     private readonly ConcurrentDictionary<int, Process> _activeProcesses = new();
 
-    public async Task<ProcessResult> RunAsync(
+    public Task<ProcessResult> RunAsync(
         string fileName,
         IReadOnlyList<string> arguments,
         IProgress<ProcessOutput>? progress = null,
         CancellationToken cancellationToken = default,
         IReadOnlyDictionary<string, string>? environmentVariables = null,
-        int? maximumOutputBytes = null)
+        int? maximumOutputBytes = null) =>
+        RunAsyncCore(
+            fileName,
+            arguments,
+            progress,
+            cancellationToken,
+            environmentVariables,
+            maximumOutputBytes,
+            stopAtOutputLimit: false);
+
+    /// <summary>Bounded variant of <see cref="RunAsync"/> for pathological payloads (a big
+    /// repository's <c>git status</c>): once <paramref name="maximumOutputBytes"/> of stdout has been
+    /// retained the child is terminated instead of drained to EOF. Callers therefore pay a fixed
+    /// cost regardless of how much output the command would have produced, and
+    /// <see cref="ProcessResult.OutputTruncated"/> marks the retained prefix as partial. A
+    /// truncated run may report a non-zero exit code (the process was killed), so consumers must
+    /// treat <c>IsSuccess || OutputTruncated</c> as "parse what was retained".</summary>
+    public Task<ProcessResult> RunBoundedAsync(
+        string fileName,
+        IReadOnlyList<string> arguments,
+        int maximumOutputBytes,
+        IReadOnlyDictionary<string, string>? environmentVariables = null,
+        CancellationToken cancellationToken = default) =>
+        RunAsyncCore(
+            fileName,
+            arguments,
+            null,
+            cancellationToken,
+            environmentVariables,
+            maximumOutputBytes,
+            stopAtOutputLimit: true);
+
+    private async Task<ProcessResult> RunAsyncCore(
+        string fileName,
+        IReadOnlyList<string> arguments,
+        IProgress<ProcessOutput>? progress,
+        CancellationToken cancellationToken,
+        IReadOnlyDictionary<string, string>? environmentVariables,
+        int? maximumOutputBytes,
+        bool stopAtOutputLimit)
     {
-        var startInfo = new ProcessStartInfo
-        {
-            FileName = fileName,
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            StandardOutputEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
-            StandardErrorEncoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
-            CreateNoWindow = true
-        };
-
-        foreach (var argument in arguments)
-        {
-            startInfo.ArgumentList.Add(argument);
-        }
-
-        if (environmentVariables is not null)
-        {
-            foreach (var (key, value) in environmentVariables)
-            {
-                startInfo.EnvironmentVariables[key] = value;
-            }
-        }
-
+        var startInfo = CreateStartInfo(fileName, arguments, environmentVariables);
         using var process = new Process { StartInfo = startInfo };
         try
         {
@@ -68,18 +84,22 @@ public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
         {
             var standardOutput = new StringBuilder();
             var standardError = new StringBuilder();
-            var outputTask = ReadStreamAsync(process.StandardOutput, standardOutput, false, progress, maximumOutputBytes, cancellationToken);
-            var errorTask = ReadStreamAsync(process.StandardError, standardError, true, progress, maximumOutputBytes, cancellationToken);
+            // The bounded reader kills the child from its own (thread-pool) reader task; the
+            // continuation below must therefore never hop back onto the caller's synchronization
+            // context — a UI caller would otherwise pay the whole output copy on its dispatcher.
+            Action? requestStop = stopAtOutputLimit ? () => StopProcess(process) : null;
+            var outputTask = ReadStreamAsync(process.StandardOutput, standardOutput, false, progress, maximumOutputBytes, stopAtOutputLimit, requestStop, cancellationToken);
+            var errorTask = ReadStreamAsync(process.StandardError, standardError, true, progress, maximumOutputBytes, stopAtOutputLimit: false, null, cancellationToken);
 
             try
             {
-                await process.WaitForExitAsync(cancellationToken);
-                await Task.WhenAll(outputTask, errorTask);
+                await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+                await Task.WhenAll(outputTask, errorTask).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
                 StopProcess(process);
-                await process.WaitForExitAsync(CancellationToken.None);
+                await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
                 throw;
             }
 
@@ -118,17 +138,17 @@ public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
             var chunk = new byte[64 * 1024];
             var outputTask = ReadToAsync(process.StandardOutput.BaseStream, captured, chunk, cancellationToken);
             var error = new StringBuilder();
-            var errorTask = ReadStreamAsync(process.StandardError, error, true, null, null, cancellationToken);
+            var errorTask = ReadStreamAsync(process.StandardError, error, true, null, null, stopAtOutputLimit: false, null, cancellationToken);
 
             try
             {
-                await process.WaitForExitAsync(cancellationToken);
-                await Task.WhenAll(outputTask, errorTask);
+                await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+                await Task.WhenAll(outputTask, errorTask).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
                 StopProcess(process);
-                await process.WaitForExitAsync(CancellationToken.None);
+                await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
                 throw;
             }
 
@@ -522,13 +542,18 @@ public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
     /// <summary>Drains the reader into <paramref name="buffer"/>, appending at most
     /// <paramref name="maximumOutputBytes"/> characters. Reading always continues to the end so the
     /// child process can never block on a full pipe; excess output is dropped and reported through
-    /// the return value (<see cref="ProcessResult.OutputTruncated"/>).</summary>
+    /// the return value (<see cref="ProcessResult.OutputTruncated"/>).
+    /// <paramref name="stopAtOutputLimit"/> flips that contract for bounded reads: once the limit is
+    /// reached <paramref name="requestStop"/> runs (terminating the child) and the reader returns
+    /// without draining the rest.</summary>
     private static async Task<bool> ReadStreamAsync(
         StreamReader reader,
         StringBuilder buffer,
         bool isError,
         IProgress<ProcessOutput>? progress,
         int? maximumOutputBytes,
+        bool stopAtOutputLimit,
+        Action? requestStop,
         CancellationToken cancellationToken)
     {
         var truncated = false;
@@ -540,28 +565,44 @@ public sealed class ProcessRunner : IProcessRunner, IProcessRunnerShutdown
         if (progress is null)
         {
             var block = new char[8192];
-            while (true)
+            try
             {
-                var read = await reader.ReadAsync(block.AsMemory(), cancellationToken).ConfigureAwait(false);
-                if (read == 0)
+                while (true)
                 {
-                    break;
-                }
+                    var read = await reader.ReadAsync(block.AsMemory(), cancellationToken).ConfigureAwait(false);
+                    if (read == 0)
+                    {
+                        break;
+                    }
 
-                if (buffer.Length < limit)
-                {
-                    var take = Math.Min(read, (int)Math.Min(limit - buffer.Length, int.MaxValue));
-                    buffer.Append(block, 0, take);
-                    if (take < read)
+                    if (buffer.Length < limit)
+                    {
+                        var take = Math.Min(read, (int)Math.Min(limit - buffer.Length, int.MaxValue));
+                        buffer.Append(block, 0, take);
+                        if (take < read)
+                        {
+                            truncated = true;
+                        }
+                    }
+                    else
                     {
                         truncated = true;
                     }
-                }
-                else
-                {
-                    truncated = true;
+
+                    if (stopAtOutputLimit && truncated)
+                    {
+                        requestStop?.Invoke();
+                        return true;
+                    }
                 }
             }
+            catch (Exception ex) when (stopAtOutputLimit && (ex is IOException or ObjectDisposedException))
+            {
+                // A bounded read killed its own child: the pipe can tear down while the sibling
+                // stream is still draining. The retained prefix is the agreed result.
+                return true;
+            }
+
             return truncated;
         }
 

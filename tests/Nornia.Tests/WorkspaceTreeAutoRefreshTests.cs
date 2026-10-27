@@ -136,7 +136,8 @@ public sealed class WorkspaceTreeAutoRefreshTests : IDisposable
         watcher.RaiseChanged(_workspacePath, Path.Combine(_workspacePath, "src", "Hidden.cs"));
 
         // 未加载目录不提前枚举(惰性语义保持);刷新不得强制展开它。
-        await Task.Delay(300);
+        // 先轮询到这一次刷新真的跑完(而不是固定 sleep 一个"应该够了"的时长),再断言惰性。
+        await WaitUntilAsync(() => viewModel.TreeAutoRefreshRuns >= 1, "变更后未触发树刷新");
         Assert.False(srcNode.IsLoaded);
         Assert.DoesNotContain(
             viewModel.WorkspaceTreeRows.OfType<WorkspaceFileRow>(),
@@ -163,8 +164,11 @@ public sealed class WorkspaceTreeAutoRefreshTests : IDisposable
             Path.Combine(_workspacePath, "obj", "x.dll.bytes"),
             Path.Combine(_workspacePath, "node_modules", "y.js"));
 
-        // 全部被过滤:不启动任何目录重枚举,树保持原样。
-        await Task.Delay(700);
+        // 全部被过滤:过滤在事件分发内同步完成,不启动任何目录重枚举,树保持原样。
+        Assert.Equal(0, viewModel.TreeAutoRefreshRuns);
+
+        // 再给一个稳定窗口,确保没有延迟的重枚举被排入。
+        await Task.Delay(200);
         Assert.Equal(0, viewModel.TreeAutoRefreshRuns);
         Assert.DoesNotContain(viewModel.WorkspaceTreeRows, row => row.Node.Name == "obj");
         Assert.DoesNotContain(viewModel.WorkspaceTreeRows, row => row.Node.Name == "node_modules");

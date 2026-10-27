@@ -1,5 +1,5 @@
 <Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup><IsPackable>false</IsPackable><UseWPF>true</UseWPF></PropertyGroup>
+  <PropertyGroup><IsPackable>false</IsPackable><IsPublishable>false</IsPublishable><UseWPF>true</UseWPF></PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\\..\\src\\Nornia.Core\\Nornia.Core.csproj" />
     <ProjectReference Include="..\\..\\src\\Nornia.Runtime\\Nornia.Runtime.csproj" />

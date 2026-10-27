@@ -9,27 +9,13 @@ public sealed class ProcessRunnerTests
     // 生产字段(内部注册 code-pages provider),避免测试类静态字段与 provider 注册的时序竞态。
     private static Encoding Gbk => TextEncodingDetector.Gb18030;
 
-    /// <summary>Makes the child emit the exact raw bytes (no console re-encoding) via base64.</summary>
-    private static string RawBytesCommand(byte[] bytes) =>
-        $"$b=[Convert]::FromBase64String('{Convert.ToBase64String(bytes)}'); $o=[Console]::OpenStandardOutput(); $o.Write($b,0,$b.Length); $o.Flush()";
-
-    private static async Task<List<Nornia.Core.Models.ProcessStreamEvent>> CollectAsync(ProcessRunner runner, string command)
-    {
-        var events = new List<Nornia.Core.Models.ProcessStreamEvent>();
-        await foreach (var item in runner.StreamLinesWithTextFallbackAsync(
-                         "powershell.exe", ["-NoProfile", "-Command", command]))
-        {
-            events.Add(item);
-        }
-
-        return events;
-    }
-
     [Fact]
     public async Task StreamLinesWithTextFallbackAsync_DecodesLegacyGb18030Stdout()
     {
         // git diff 的内容行携带文件原始字节:GBK 文件的 stdout 不再是合法 UTF-8,
         // 固定 UTF-8 解码会整段乱码——回退到 GB18030 后必须还原中文。
+        // 三个解码变体保持独立子进程:检测按读块进行,把不同编码的字节流拼进同一次
+        // 输出会在分块边界混合,人为触发误回退(已试过合并,不可行)。
         var events = await CollectAsync(new ProcessRunner(), RawBytesCommand(Gbk.GetBytes("中文内容测试：乱码回归\n第二行。\n")));
 
         var lines = events.Where(e => e.Text is not null).Select(e => e.Text).ToList();
@@ -61,41 +47,69 @@ public sealed class ProcessRunnerTests
         Assert.Contains("+中文内容。", lines);
     }
 
+    /// <summary>Makes the child emit the exact raw bytes (no console re-encoding) via base64.</summary>
+    private static string RawBytesCommand(byte[] bytes) =>
+        $"$b=[Convert]::FromBase64String('{Convert.ToBase64String(bytes)}'); $o=[Console]::OpenStandardOutput(); $o.Write($b,0,$b.Length); $o.Flush()";
+
+    private static async Task<List<Nornia.Core.Models.ProcessStreamEvent>> CollectAsync(ProcessRunner runner, string command)
+    {
+        var events = new List<Nornia.Core.Models.ProcessStreamEvent>();
+        await foreach (var item in runner.StreamLinesWithTextFallbackAsync(
+                         "powershell.exe", ["-NoProfile", "-Command", command]))
+        {
+            events.Add(item);
+        }
+
+        return events;
+    }
+
     [Fact]
     public async Task StreamLinesWithTextFallbackAsync_DrainsStdoutLargerThanPipeBuffer()
     {
         // 回归:整段捕获曾"先等退出、后读 stdout"——子进程输出超过 OS 管道缓冲(Windows 数 KB)
         // 时阻塞在写端永不退出,消费方随之永久挂起(大 diff 视图空白即源于此)。此处输出约 1 MB,
         // 必须完整收回;若死锁复现,30 秒取消令牌让测试快速失败而非无限等待。
-        const int lineCount = 8000; // 8000 × 128 字符 ≈ 1 MB,远超管道缓冲
-        var command = "$o=[Console]::OpenStandardOutput(); $w=New-Object System.IO.StreamWriter($o); " +
-                      "1..8000 | ForEach-Object { $w.WriteLine(('L' + $_).PadRight(128, 'x')) }; $w.Flush()";
-        var runner = new ProcessRunner();
-        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(30));
-
-        var events = new List<Nornia.Core.Models.ProcessStreamEvent>();
-        await foreach (var item in runner.StreamLinesWithTextFallbackAsync(
-                         "powershell.exe", ["-NoProfile", "-Command", command], 1_000_000, null, cancellation.Token))
+        // 大输出经预生成临时文件 + cmd type 流出:避免 powershell 冷启(本类耗时主源)。
+        const int lineCount = 8000; // 8000 × ~130 字节 ≈ 1 MB,远超管道缓冲
+        var spill = Path.Combine(Path.GetTempPath(), $"nornia-drain-{Guid.NewGuid():N}.txt");
+        try
         {
-            events.Add(item);
-        }
+            await File.WriteAllTextAsync(spill, string.Join("\r\n",
+                Enumerable.Range(1, lineCount).Select(i => ("L" + i).PadRight(128, 'x'))) + "\r\n");
+            var runner = new ProcessRunner();
+            using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(30));
 
-        var lines = events.Where(e => e.Text is not null).Select(e => e.Text).ToList();
-        Assert.Equal(lineCount, lines.Count);
-        Assert.StartsWith("L1", lines[0]);
-        Assert.StartsWith("L8000", lines[^1]);
-        Assert.True(events[^1].IsCompleted);
-        Assert.Equal(0, events[^1].ExitCode);
+            var events = new List<Nornia.Core.Models.ProcessStreamEvent>();
+            // 不加引号分参传递:cmd /c 对带引号的参数有自己的重解析规则(整条会被误判为
+            // 语法错误);Temp 路径无空格,直接作为独立参数最稳。
+            await foreach (var item in runner.StreamLinesWithTextFallbackAsync(
+                             "cmd.exe", ["/c", "type", spill], 1_000_000, null, cancellation.Token))
+            {
+                events.Add(item);
+            }
+
+            var lines = events.Where(e => e.Text is not null).Select(e => e.Text).ToList();
+            Assert.Equal(lineCount, lines.Count);
+            Assert.StartsWith("L1", lines[0]);
+            Assert.StartsWith("L8000", lines[^1]);
+            Assert.True(events[^1].IsCompleted);
+            Assert.Equal(0, events[^1].ExitCode);
+        }
+        finally
+        {
+            try { File.Delete(spill); } catch (IOException) { }
+        }
     }
 
     [Fact]
     public async Task StreamLinesWithTextFallbackAsync_LineCapKeepsTheAllowedPrefix()
     {
         // The byte capture may read several lines in one 64 KB chunk. Crossing the cap must retain
-        // the allowed prefix, not drop that whole chunk.
+        // the allowed prefix, not drop that whole chunk. cmd.exe 冷启比 powershell 快一个数量级,
+        // 本用例不需要 PS 语法,用 cmd 降低套件耗时。
         var events = new List<Nornia.Core.Models.ProcessStreamEvent>();
         await foreach (var item in new ProcessRunner().StreamLinesWithTextFallbackAsync(
-                           "powershell.exe", ["-NoProfile", "-Command", "'first'; 'second'; 'third'"], maximumLines: 2))
+                           "cmd.exe", ["/c", "echo first& echo second& echo third"], maximumLines: 2))
         {
             events.Add(item);
         }
@@ -123,56 +137,37 @@ public sealed class ProcessRunnerTests
     }
 
     [Fact]
-    public async Task RunAsync_ReportsPercentagesBeforeAnUnterminatedProgressFrameCompletes()
+    public async Task RunAsync_ReportsProgressAndVirtualTerminalFramesBeforeProcessExits()
     {
-        var progressReached = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        // 两个场景(纯文本 42% 与 winget 的 OSC/VT 进度帧)合并为一次子进程:
+        // 进度必须先于进程退出上报(否则 UI 进度条只能在命令结束后闪现)。
+        var plainReached = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var vtReached = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         var progress = new CallbackProgress(output =>
         {
             if (output.Text.Contains("42%", StringComparison.Ordinal))
             {
-                progressReached.TrySetResult(true);
+                plainReached.TrySetResult(true);
             }
-        });
-        var runner = new ProcessRunner();
-        var running = runner.RunAsync(
-            "powershell.exe",
-            [
-                "-NoProfile",
-                "-Command",
-                "$o=[Console]::OpenStandardOutput(); $b=[Text.Encoding]::UTF8.GetBytes('42%'); $o.Write($b,0,$b.Length); $o.Flush(); Start-Sleep -Milliseconds 1500"
-            ],
-            progress);
 
-        var signalled = await Task.WhenAny(progressReached.Task, Task.Delay(TimeSpan.FromSeconds(5)));
-        Assert.Same(progressReached.Task, signalled);
-        Assert.False(running.IsCompleted);
-        await running;
-    }
-
-    [Fact]
-    public async Task RunAsync_ReportsWingetVirtualTerminalProgressBeforeProcessExits()
-    {
-        var progressReached = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        var progress = new CallbackProgress(output =>
-        {
             if (output.Text.Contains("]9;4;1;42", StringComparison.Ordinal))
             {
-                progressReached.TrySetResult(true);
+                vtReached.TrySetResult(true);
             }
         });
-        var sequence = Encoding.UTF8.GetBytes("\u001b]9;4;1;42\u0007");
+        var vtSequence = Encoding.UTF8.GetBytes("\u001b]9;4;1;42\u0007");
         var runner = new ProcessRunner();
         var running = runner.RunAsync(
             "powershell.exe",
             [
                 "-NoProfile",
                 "-Command",
-                RawBytesCommand(sequence) + "; Start-Sleep -Milliseconds 1500"
+                RawBytesCommand(Encoding.UTF8.GetBytes("42%")) + "; " + RawBytesCommand(vtSequence) + "; Start-Sleep -Milliseconds 1500"
             ],
             progress);
 
-        var signalled = await Task.WhenAny(progressReached.Task, Task.Delay(TimeSpan.FromSeconds(5)));
-        Assert.Same(progressReached.Task, signalled);
+        Assert.Same(plainReached.Task, await Task.WhenAny(plainReached.Task, Task.Delay(TimeSpan.FromSeconds(5))));
+        Assert.Same(vtReached.Task, await Task.WhenAny(vtReached.Task, Task.Delay(TimeSpan.FromSeconds(5))));
         Assert.False(running.IsCompleted);
         await running;
     }
@@ -183,9 +178,10 @@ public sealed class ProcessRunnerTests
         using var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(150));
         var runner = new ProcessRunner();
 
+        // ping -n 31 = ~30 秒的长命子进程;cmd 冷启远快于 powershell,取消路径不需要 PS。
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => runner.RunAsync(
-            "powershell.exe",
-            ["-NoProfile", "-Command", "Start-Sleep -Seconds 30"],
+            "cmd.exe",
+            ["/c", "ping -n 31 127.0.0.1 > nul"],
             cancellationToken: cancellation.Token));
     }
 
@@ -197,8 +193,8 @@ public sealed class ProcessRunnerTests
         var runner = new ProcessRunner();
 
         var result = await runner.RunAsync(
-            "powershell.exe",
-            ["-NoProfile", "-Command", "Write-Output $env:NORNIA_TEST_ENV_MARKER"],
+            "cmd.exe",
+            ["/c", "echo %NORNIA_TEST_ENV_MARKER%"],
             environmentVariables: new Dictionary<string, string> { ["NORNIA_TEST_ENV_MARKER"] = "locks-off" });
 
         Assert.True(result.IsSuccess);
@@ -211,9 +207,10 @@ public sealed class ProcessRunnerTests
     {
         // G2 base capability: output beyond the cap is dropped (OutputTruncated) but the child
         // must never be left blocked on a full pipe — the call completes with the capped prefix.
+        // 2000 行 × ~51 字符 ≈ 100 KB,远超 4096 上限;cmd 循环足够。
         var result = await new ProcessRunner().RunAsync(
-            "powershell.exe",
-            ["-NoProfile", "-Command", "Write-Output ('x' * 100000)"],
+            "cmd.exe",
+            ["/c", "for /L %i in (1,1,2000) do @echo 0123456789012345678901234567890123456789st"],
             maximumOutputBytes: 4096);
 
         Assert.True(result.IsSuccess);
@@ -227,8 +224,8 @@ public sealed class ProcessRunnerTests
     public async Task RunAsync_WithoutCap_StillBuffersCompleteOutput()
     {
         var result = await new ProcessRunner().RunAsync(
-            "powershell.exe",
-            ["-NoProfile", "-Command", "Write-Output ('x' * 2000)"]);
+            "cmd.exe",
+            ["/c", "echo " + new string('x', 2000)]);
 
         Assert.True(result.IsSuccess);
         Assert.False(result.OutputTruncated);
@@ -240,8 +237,8 @@ public sealed class ProcessRunnerTests
     {
         var runner = new ProcessRunner();
         var running = runner.RunAsync(
-            "powershell.exe",
-            ["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]);
+            "cmd.exe",
+            ["/c", "ping -n 31 127.0.0.1 > nul"]);
 
         await Task.Delay(150);
         runner.StopActiveProcesses();
@@ -249,6 +246,50 @@ public sealed class ProcessRunnerTests
         var completed = await Task.WhenAny(running, Task.Delay(TimeSpan.FromSeconds(3)));
         Assert.Same(running, completed);
         await running;
+    }
+
+    [Fact]
+    public async Task RunBoundedAsync_TerminatesTheChildOnceTheCapIsReached()
+    {
+        // G11: 有界读取与"截断但继续排空"的区别在于子进程会被终止。病态仓库里 git status 会一直
+        // 产出到几十 MB,排空意味着把整段 stdout 读进内存并等它自然结束;终止才是固定成本。
+        // 必须 powershell 单进程悬挂:cmd 链式命令会孤儿化孙进程(ping),孤儿持有管道写端,
+        // 读端等不到 EOF,终止语义无法验证。
+        var sentinel = Path.Combine(Path.GetTempPath(), $"nornia-bounded-{Guid.NewGuid():N}.done");
+        var command = "$o=[Console]::OpenStandardOutput(); $b=[Text.Encoding]::ASCII.GetBytes('x'*100); "
+            + "for($i=0;$i -lt 4000;$i++){ $o.Write($b,0,100) };"
+            + $"Start-Sleep -Seconds 30; [IO.File]::WriteAllText('{sentinel}','done')";
+        try
+        {
+            var running = new ProcessRunner().RunBoundedAsync(
+                "powershell.exe", ["-NoProfile", "-Command", command], maximumOutputBytes: 4096);
+            var finished = await Task.WhenAny(running, Task.Delay(TimeSpan.FromSeconds(20)));
+
+            Assert.Same(running, finished); // 没有被终止的话,这里要等到子进程睡完 30 秒
+            var result = await running;
+            Assert.True(result.OutputTruncated);
+            Assert.True(result.StandardOutput.Length <= 4096,
+                $"保留了 {result.StandardOutput.Length} 字符,超过上限。");
+            Assert.False(File.Exists(sentinel), "子进程没有被终止:它继续走到了 sleep 之后的写入。");
+        }
+        finally
+        {
+            try { File.Delete(sentinel); } catch (IOException) { }
+        }
+    }
+
+    [Fact]
+    public async Task RunBoundedAsync_UnderTheCap_StillDrainsToCompletion()
+    {
+        // 只有真的越界才终止;正常仓库的一次 status 必须原样读完,否则截断标记会变成假阳性。
+        var result = await new ProcessRunner().RunBoundedAsync(
+            "cmd.exe",
+            ["/c", "echo " + new string('y', 2000)],
+            maximumOutputBytes: 65536);
+
+        Assert.True(result.IsSuccess);
+        Assert.False(result.OutputTruncated);
+        Assert.Equal(2000, result.StandardOutput.Trim().Length);
     }
 
     private sealed class CallbackProgress(Action<ProcessOutput> callback) : IProgress<ProcessOutput>

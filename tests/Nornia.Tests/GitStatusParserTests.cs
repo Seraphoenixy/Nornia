@@ -190,4 +190,43 @@ public sealed class GitStatusParserTests
         Assert.Equal("eeee5555", renamed.HeadBlobId);
         Assert.Equal("ffff6666", renamed.IndexBlobId);
     }
+
+    [Fact]
+    public void Parse_TrailingRecordCutByReadCap_IsNotIngested()
+    {
+        // 有界读取会在字节上限处终止子进程,最后一条记录大概率只剩半截(没有 NUL 收尾)。
+        // 半条记录绝不能进列表:那会生成一条"路径被切短"的假更改,用户按它去暂存/丢弃即错。
+        var output = "# branch.head main\0"
+            + "1 .M N... 100644 100644 100644 0 0 src/complete.cs\0"
+            + "1 .M N... 100644 100644 100644 0 0 src/truncated-and-missing";
+
+        var status = GitStatusParser.Parse(output);
+
+        Assert.Equal("main", status.Branch);
+        var change = Assert.Single(status.UnstagedChanges);
+        Assert.Equal("src/complete.cs", change.Path);
+    }
+
+    [Fact]
+    public void Parse_EntryCapStopsScanningEntirePayload()
+    {
+        // 命中条目上限后必须立刻收尾:旧实现即使已经决定截断,仍会把几十 MB stdout 逐条切完,
+        // 而那正是"打开病态仓库时界面卡住"的耗时来源。这里用一条只在后续位置出现的分支头当探针
+        // —— 若仍在扫描,分支会被覆盖成 other。
+        var output = string.Join('\0',
+        [
+            "# branch.head main",
+            "1 .M N... 100644 100644 100644 0 0 src/A.cs",
+            "1 M. N... 100644 100644 100644 0 0 src/B.cs",
+            "# branch.head other",
+            "? src/way-too-many.cs",
+            ""
+        ]);
+
+        var status = GitStatusParser.Parse(output, maxEntries: 2);
+
+        Assert.True(status.Truncated);
+        Assert.Equal("main", status.Branch);
+        Assert.Equal(2, status.StagedChanges.Count + status.UnstagedChanges.Count);
+    }
 }

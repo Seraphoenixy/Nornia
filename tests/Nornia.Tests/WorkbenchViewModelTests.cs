@@ -43,7 +43,7 @@ public sealed class WorkbenchViewModelTests : IDisposable
         var projects = new StubContentPage("项目管理", log);
         var settings = new StubContentPage("设置", log);
         var gitPage = new GitViewModel(new FakeGitService(), new FakeFolderPicker(),
-            new FakeConfirmationService(), new FakeProjectCatalog(), editor, log, new FakeClipboardService(),
+            new FakeConfirmationService(), new FakeTextPromptService(), new FakeProjectCatalog(), editor, log, new FakeClipboardService(),
             new FakeGitRepositoryWatcher(), new FakeProjectWorkspaceService(), new FakeApplicationStateStore(),
             new FakeSettingsService());
         var navigationItems = new List<NavigationItem>
@@ -114,13 +114,73 @@ public sealed class WorkbenchViewModelTests : IDisposable
         var fixture = CreateWorkbench();
         fixture.Workbench.OpenOrActivatePage(fixture.Environment);
         var first = fixture.Workbench.SelectedTab;
+        Assert.IsType<PageWorkbenchTab>(first);
+
+        // 预览语义下重复打开同一页只激活既有标签,不产生重复。
+        fixture.Workbench.OpenOrActivatePage(fixture.Environment);
+
+        Assert.Single(fixture.Workbench.Tabs);
+        Assert.Same(first, fixture.Workbench.SelectedTab);
+    }
+
+    [Fact]
+    public void OpenOrActivatePage_SecondPage_ReplacesSelectedPreviewPageTab()
+    {
+        var fixture = CreateWorkbench();
+
+        fixture.Workbench.OpenOrActivatePage(fixture.Environment);
+        fixture.Workbench.OpenOrActivatePage(fixture.Projects);
+
+        // VS Code 预览槽:导航新内容页时替换当前选中的预览页标签,不无限堆积。
+        var tab = Assert.Single(fixture.Workbench.Tabs);
+        Assert.Equal("项目管理", tab.Title);
+        Assert.Same(tab, fixture.Workbench.SelectedTab);
+        Assert.True(Assert.IsType<PageWorkbenchTab>(tab).IsPreview);
+    }
+
+    [Fact]
+    public void OpenOrActivatePage_PromotedPageTab_IsKeptOnNextNavigation()
+    {
+        var fixture = CreateWorkbench();
+        fixture.Workbench.OpenOrActivatePage(fixture.Environment);
+        ((PageWorkbenchTab)fixture.Workbench.SelectedTab!).IsPreview = false; // 双击转正
 
         fixture.Workbench.OpenOrActivatePage(fixture.Projects);
         fixture.Workbench.OpenOrActivatePage(fixture.Environment);
 
         Assert.Equal(2, fixture.Workbench.Tabs.Count);
-        Assert.Same(first, fixture.Workbench.SelectedTab);
-        Assert.Single(fixture.Workbench.Tabs, tab => tab.Title == "环境管理");
+        Assert.Contains(fixture.Workbench.Tabs, tab => tab.Title == "环境管理");
+        Assert.Single(fixture.Workbench.Tabs, tab => tab.Title == "项目管理");
+        Assert.Equal("环境管理", fixture.Workbench.SelectedTab?.Title);
+    }
+
+    [Fact]
+    public void TogglePin_OnPreviewPageTab_PromotesToRegular()
+    {
+        var fixture = CreateWorkbench();
+        fixture.Workbench.OpenOrActivatePage(fixture.Environment);
+        var pageTab = Assert.IsType<PageWorkbenchTab>(fixture.Workbench.SelectedTab);
+
+        fixture.Workbench.TogglePinCommand.Execute(pageTab);
+
+        Assert.True(pageTab.IsPinned);
+        Assert.False(pageTab.IsPreview); // 固定预览即常驻
+    }
+
+    [Fact]
+    public void ClosePageTab_ReopensOnNavigationAsPreview()
+    {
+        var fixture = CreateWorkbench();
+        fixture.Workbench.OpenOrActivatePage(fixture.Environment);
+        var pageTab = Assert.IsType<PageWorkbenchTab>(fixture.Workbench.SelectedTab!);
+        pageTab.IsPreview = false;
+        fixture.Workbench.CloseTabCommand.Execute(pageTab);
+        Assert.Empty(fixture.Workbench.Tabs);
+
+        fixture.Workbench.OpenOrActivatePage(fixture.Environment);
+
+        var reopened = Assert.IsType<PageWorkbenchTab>(Assert.Single(fixture.Workbench.Tabs));
+        Assert.True(reopened.IsPreview); // 关闭重开回到预览态
     }
 
     [Fact]
@@ -295,6 +355,7 @@ public sealed class WorkbenchViewModelTests : IDisposable
     {
         var fixture = CreateWorkbench();
         fixture.Workbench.OpenOrActivatePage(fixture.Environment);
+        ((PageWorkbenchTab)fixture.Workbench.SelectedTab!).IsPreview = false; // 转正后才可与下一页共存
         fixture.Workbench.OpenOrActivatePage(fixture.Projects);
 
         Assert.Equal(2, fixture.Workbench.PageTabs.Count);
@@ -309,6 +370,7 @@ public sealed class WorkbenchViewModelTests : IDisposable
     {
         var fixture = CreateWorkbench();
         fixture.Workbench.OpenOrActivatePage(fixture.Environment);
+        ((PageWorkbenchTab)fixture.Workbench.SelectedTab!).IsPreview = false; // 转正后才可与下一页共存
         fixture.Workbench.OpenOrActivatePage(fixture.Projects);
         var projectsTab = fixture.Workbench.Tabs.Single(tab => tab.Title == "项目管理");
 

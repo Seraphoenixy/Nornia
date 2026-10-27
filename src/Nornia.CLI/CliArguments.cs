@@ -26,6 +26,7 @@ public static class CliCommands
     public const string Check = "check";
     public const string Plan = "plan";
     public const string Fix = "fix";
+    public const string Rollback = "rollback";
     public const string Init = "init";
     public const string Export = "export";
     public const string Import = "import";
@@ -62,7 +63,7 @@ public static class CliArguments
                 if (!CultureInfo.GetCultures(CultureTypes.AllCultures).Any(candidate =>
                         string.Equals(candidate.Name, language, StringComparison.OrdinalIgnoreCase)))
                 {
-                    throw new ArgumentException(CliText.Format("Error_UnknownLanguage", language));
+                    throw new CliUsageException(CliText.Format("Error_UnknownLanguage", language));
                 }
 
                 culture = new CultureInfo(language);
@@ -71,7 +72,7 @@ public static class CliArguments
 
             if (string.Equals(args[index], CliCommands.LanguageOption, StringComparison.OrdinalIgnoreCase))
             {
-                throw new ArgumentException($"Usage: Nornia {CliCommands.LanguageOption} <language-code>");
+                throw new CliUsageException($"Usage: Nornia {CliCommands.LanguageOption} <language-code>");
             }
 
             remaining.Add(args[index]);

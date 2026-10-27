@@ -7,6 +7,7 @@ using Nornia.Desktop.Configuration;
 using System.Diagnostics;
 using System.IO;
 using System.Collections.ObjectModel;
+using System.Collections.Specialized;
 using System.Windows;
 
 namespace Nornia.Desktop.ViewModels;
@@ -659,6 +660,20 @@ public partial class WorkspaceViewModel : PageViewModel
         DiffOpenRequested?.Invoke(this, node);
     }
 
+    /// <summary>文件右键"文件历史":交由工作台路由到 Git 页的文件历史分区(仓库外由订阅方忽略)。</summary>
+    public event EventHandler<WorkspaceNode>? FileHistoryRequested;
+
+    [RelayCommand]
+    private void RequestFileHistory(WorkspaceNode? node)
+    {
+        if (node is null || node.IsDirectory)
+        {
+            return;
+        }
+
+        FileHistoryRequested?.Invoke(this, node);
+    }
+
     private bool CanRequestDiff(WorkspaceNode? node) =>
         node is not null && !node.IsDirectory && _statusSource.Lookup(node.RelativePath) is not null;
 
@@ -893,19 +908,10 @@ public partial class WorkspaceViewModel : PageViewModel
                 return;
             }
 
-            var dispatcher = Application.Current?.Dispatcher;
-            if (dispatcher is null)
-            {
-                StartTreeRefresh(immediate: false); // no WPF app (unit tests without STA context)
-                return;
-            }
-
             // Never run UI-bound collection mutations on a ThreadPool fallback. If the dispatcher
             // is busy, keeping this retry queued is safe; it will run when the UI can consume it.
-            dispatcher.BeginInvoke(new Action(() =>
-            {
-                StartTreeRefresh(immediate: false);
-            }));
+            // Without a WPF application (unit tests) the abstraction runs the callback inline.
+            UiDispatcher.BeginInvoke(() => StartTreeRefresh(immediate: false));
         });
     }
 
@@ -1207,6 +1213,10 @@ public partial class WorkspaceViewModel : PageViewModel
     /// <summary>V-诊断计数器:文件监视驱动的树自动刷新实际执行的次数(过滤后无可刷新内容的不计)。</summary>
     internal int TreeAutoRefreshRuns { get; private set; }
 
+    /// <summary>V-诊断计数器:装饰刷新按路径解析节点时的名字索引查找次数(一条路径一段一次)。
+    /// 索引化后它与目录的兄弟数量无关,是「解析成本不再随目录宽度增长」的可断言证据。</summary>
+    internal int DecorationSegmentLookups { get; private set; }
+
     /// <summary>测试/诊断:强制整表同步一次(与真实路径同一实现)。</summary>
     internal void SyncTreeRowsForTest() => SyncTreeRows();
 
@@ -1272,8 +1282,7 @@ public partial class WorkspaceViewModel : PageViewModel
                 return false;
             }
 
-            var match = current.Children.FirstOrDefault(child =>
-                !child.IsPlaceholder && string.Equals(child.Name, segments[index], StringComparison.OrdinalIgnoreCase));
+            var match = current.FindChild(segments[index]);
             if (match is null)
             {
                 return false;
@@ -1351,7 +1360,8 @@ public partial class WorkspaceViewModel : PageViewModel
 
     /// <summary>Resolves one loaded node by workspace-relative path without walking unrelated
     /// loaded subtrees. Git status updates typically touch a handful of paths; recursively
-    /// scanning every expanded node made that common path O(the whole explorer).</summary>
+    /// scanning every expanded node made that common path O(the whole explorer). Each segment is a
+    /// single dictionary lookup on the parent's name index, so the cost is O(depth) per path.</summary>
     private WorkspaceNode? FindLoadedNode(string relativePath)
     {
         if (RootNodes.Count == 0)
@@ -1372,8 +1382,8 @@ public partial class WorkspaceViewModel : PageViewModel
                 return null;
             }
 
-            var next = current.Children.FirstOrDefault(child =>
-                !child.IsPlaceholder && string.Equals(child.Name, segment, StringComparison.OrdinalIgnoreCase));
+            DecorationSegmentLookups++;
+            var next = current.FindChild(segment);
             if (next is null)
             {
                 return null;
@@ -1459,15 +1469,15 @@ public partial class WorkspaceViewModel : PageViewModel
 
         void Run() => OpenTreeFileCommand.Execute(row);
 
-        // 定时器在线程池线程触发:不在 UI 线程时切回再建标签(与 SearchViewModel 的合并回调同约定)。
-        var dispatcher = Application.Current?.Dispatcher;
-        if (dispatcher is null || dispatcher.CheckAccess())
+        // 定时器在线程池线程触发:不在 UI 线程时经 IUiDispatcher 切回再建标签
+        // (与 SearchViewModel 的合并回调同约定)。
+        if (UiDispatcher.CheckAccess())
         {
             Run();
         }
         else
         {
-            dispatcher.BeginInvoke(Run);
+            UiDispatcher.BeginInvoke(Run);
         }
     }
 
@@ -1898,6 +1908,8 @@ public sealed partial class WorkspaceNode : ObservableObject
         RelativePath = ComputeRelativePath();
         if (isDirectory)
         {
+            // 名字索引只服务于目录解析(文件节点不会有子节点),所以订阅与字典都按需创建。
+            Children.CollectionChanged += OnChildrenCollectionChanged;
             Children.Add(new WorkspaceNode(string.Empty, false, rootPath, statusSource) { IsPlaceholder = true, Parent = this });
         }
 
@@ -1912,6 +1924,89 @@ public sealed partial class WorkspaceNode : ObservableObject
     public bool IsPlaceholder { get; private set; }
     public string Glyph => IsDirectory ? Codicons.Folder : Codicons.File;
     public ObservableCollection<WorkspaceNode> Children { get; } = [];
+
+    /// <summary>装饰刷新与 reveal 都要把 workspace 相对路径逐段解析成节点。线性扫描
+    /// <see cref="Children"/> 让一次 git status 刷新退化成 O(路径数 × 深度 × 兄弟数)——大仓库里
+    /// 更改栏与资源管理器一起卡。这个由 <see cref="Children"/> 的 CollectionChanged 维护的
+    /// 忽略大小写名字索引把每段解析降到 O(1)。占位符不入索引(它无名可查,旧扫描也跳过它)。</summary>
+    private Dictionary<string, WorkspaceNode>? _childrenByName;
+
+    /// <summary>按子节点名解析(忽略大小写、O(1));未索引到或命中的是占位符时返回 null。</summary>
+    internal WorkspaceNode? FindChild(string name) =>
+        _childrenByName is not null && _childrenByName.TryGetValue(name, out var child) && !child.IsPlaceholder
+            ? child
+            : null;
+
+    private void OnChildrenCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        switch (e.Action)
+        {
+            case NotifyCollectionChangedAction.Add:
+                IndexChildren(e.NewItems);
+                break;
+            case NotifyCollectionChangedAction.Remove:
+                UnindexChildren(e.OldItems);
+                break;
+            case NotifyCollectionChangedAction.Replace:
+                UnindexChildren(e.OldItems);
+                IndexChildren(e.NewItems);
+                break;
+            case NotifyCollectionChangedAction.Move:
+                break;
+            case NotifyCollectionChangedAction.Reset:
+                // Clear() 后事件里的 Children 已是新内容(通常为空),按实况重建索引。
+                _childrenByName?.Clear();
+                foreach (var child in Children)
+                {
+                    IndexChild(child);
+                }
+                break;
+        }
+    }
+
+    private void IndexChildren(System.Collections.IList? items)
+    {
+        if (items is null)
+        {
+            return;
+        }
+
+        foreach (var item in items)
+        {
+            if (item is WorkspaceNode node)
+            {
+                IndexChild(node);
+            }
+        }
+    }
+
+    private void UnindexChildren(System.Collections.IList? items)
+    {
+        if (items is null || _childrenByName is null)
+        {
+            return;
+        }
+
+        foreach (var item in items)
+        {
+            if (item is WorkspaceNode node
+                && _childrenByName.TryGetValue(node.Name, out var existing)
+                && ReferenceEquals(existing, node))
+            {
+                _childrenByName.Remove(node.Name);
+            }
+        }
+    }
+
+    private void IndexChild(WorkspaceNode node)
+    {
+        if (node.IsPlaceholder)
+        {
+            return;
+        }
+
+        (_childrenByName ??= new(StringComparer.OrdinalIgnoreCase))[node.Name] = node;
+    }
 
     /// <summary>父节点(V4 增量投影:可见行数变化沿父链向上传播;根节点为 null)。</summary>
     internal WorkspaceNode? Parent { get; set; }

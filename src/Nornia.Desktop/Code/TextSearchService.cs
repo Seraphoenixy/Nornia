@@ -1,9 +1,17 @@
-using System.Text.RegularExpressions;
+﻿using System.Text.RegularExpressions;
 
 namespace Nornia.Desktop.Code;
 
 /// <summary>Plain-text search options shared by the find bar and the find state on preview tabs.</summary>
 public sealed record TextSearchOptions(bool CaseSensitive, bool WholeWord, bool UseRegex);
+
+/// <summary>查找的共享上限。diff 查找与预览标签查找此前各写了一份 <c>10_000</c>
+/// (diff 侧甚至散落 5 处硬编码),上限不一致时两侧的"匹配总数"会给出不同结果。</summary>
+public static class SearchLimits
+{
+    /// <summary>单次查找收集的匹配上限。</summary>
+    public const int MaximumFindMatches = 10_000;
+}
 
 /// <summary>One search hit: byte-agnostic char offsets into the document text plus its 1-based line.</summary>
 public sealed record TextSearchMatch(int Length, int Offset, int Line);

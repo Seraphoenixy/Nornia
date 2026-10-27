@@ -334,10 +334,17 @@ internal sealed class FakeRepairExecutor : IEnvironmentRepairExecutor
 {
     public int ExecuteCalls { get; private set; }
 
-    public Task ExecuteAsync(IReadOnlyCollection<RuntimePackageOperation> operations, IProgress<ProcessOutput>? progress = null, CancellationToken cancellationToken = default)
+    /// <summary>执行返回的批次 id。测试可预设它以断言上层是否正确呈现/传递。</summary>
+    public Guid CorrelationId { get; set; } = Guid.NewGuid();
+
+    /// <summary>最后一批被执行的步骤,供断言命令层是否把计划原样传入。</summary>
+    public IReadOnlyCollection<RuntimePackageOperation>? LastOperations { get; private set; }
+
+    public Task<Guid> ExecuteAsync(IReadOnlyCollection<RuntimePackageOperation> operations, IProgress<ProcessOutput>? progress = null, CancellationToken cancellationToken = default)
     {
         ExecuteCalls++;
-        return Task.CompletedTask;
+        LastOperations = operations;
+        return Task.FromResult(CorrelationId);
     }
 }
 
@@ -525,6 +532,7 @@ internal sealed class FakeGitService : IGitService
     public GitRepositoryStatus? StatusAfterInitialization { get; set; }
     public Exception? InitializeException { get; set; }
     public GitFileDiff? DiffResult { get; set; }
+    public GitBlame? Blame { get; set; }
 
     /// <summary>When set, takes precedence over <see cref="DiffResult"/> per side
     /// (key: staged flag + untracked flag) — used to simulate "requested side empty, other side has
@@ -542,6 +550,81 @@ internal sealed class FakeGitService : IGitService
     public GitFileDiff? CommitFileDiff { get; set; }
 
     public List<string> StatusRequests { get; } = [];
+    /// <summary>有上限的状态请求所要求的条目数(用于断言 git.statusLimit 真的接到了读取端)。</summary>
+    public List<int> StatusMaximumEntriesRequests { get; } = [];
+
+    /// <summary>完整选项集的每次请求(索引写回 / fsmonitor / 未跟踪模式),供"前台加载允许写回、
+    /// 静默刷新不允许""首屏先用 -unormal"这类策略断言使用。</summary>
+    public List<Nornia.Core.Models.GitStatusReadOptions> StatusOptionRequests { get; } = [];
+
+    /// <summary>When set, <c>--untracked-files=normal</c> reads return this snapshot instead of
+    /// <see cref="Status"/> — used to exercise the progressive first paint (a collapsed untracked
+    /// directory record <c>dir/</c> that the <c>all</c> read replaces with the individual files).</summary>
+    public GitRepositoryStatus? NormalUntrackedStatus { get; set; }
+
+    /// <summary>生产语义的完整选项读取:登记选项(含未跟踪模式与索引写回策略)后按未跟踪模式分派,
+    /// 其余与有上限读取一致。</summary>
+    public async Task<GitRepositoryStatus> GetStatusAsync(
+        string repositoryPath,
+        Nornia.Core.Models.GitStatusReadOptions options,
+        CancellationToken cancellationToken = default)
+    {
+        StatusOptionRequests.Add(options);
+        StatusRequests.Add(repositoryPath);
+        StatusMaximumEntriesRequests.Add(options.MaximumEntries);
+        IncludeAllUntrackedRequests.Add(options.IncludeAllUntracked);
+        if (StatusGate is not null)
+        {
+            await StatusGate;
+        }
+
+        var status = !options.IncludeAllUntracked && NormalUntrackedStatus is { } normalStatus
+            ? normalStatus
+            : Status;
+        return ApplyEntryLimit(status, options.MaximumEntries);
+    }
+
+    /// <summary>与生产语义一致的上限截断:超出上限的条目被丢弃并标记
+    /// <see cref="GitRepositoryStatus.Truncated"/>,而不是静默返回全量。</summary>
+    private static GitRepositoryStatus ApplyEntryLimit(GitRepositoryStatus status, int maximumEntries)
+    {
+        var staged = status.StagedChanges;
+        var unstaged = status.UnstagedChanges;
+        if (staged.Count + unstaged.Count <= maximumEntries)
+        {
+            return status;
+        }
+
+        var remaining = maximumEntries;
+        var visibleStaged = staged.Take(remaining).ToArray();
+        remaining -= visibleStaged.Length;
+        return status with
+        {
+            StagedChanges = visibleStaged,
+            UnstagedChanges = unstaged.Take(remaining).ToArray(),
+            Truncated = true,
+        };
+    }
+
+    /// <summary>与生产语义一致的有上限状态读取:超出上限的条目被丢弃并标记
+    /// <see cref="GitRepositoryStatus.Truncated"/>,而不是静默返回全量。</summary>
+    public async Task<GitRepositoryStatus> GetStatusAsync(
+        string repositoryPath,
+        int maximumEntries,
+        CancellationToken cancellationToken = default)
+    {
+        StatusRequests.Add(repositoryPath);
+        StatusMaximumEntriesRequests.Add(maximumEntries);
+        // 上限重载在真实服务里等价于 includeAllUntracked: true(GitService.GetStatusCoreAsync),
+        // 替身必须同样登记,否则「静默刷新是否折叠未跟踪目录」的守卫会看不到这条调用。
+        IncludeAllUntrackedRequests.Add(true);
+        if (StatusGate is not null)
+        {
+            await StatusGate;
+        }
+
+        return ApplyEntryLimit(Status, maximumEntries);
+    }
     /// <summary>Per-status untracked mode; the silent (lite) refresh must request every untracked
     /// file (includeAllUntracked == true) so new files inside new folders stay individually trackable.</summary>
     public List<bool> IncludeAllUntrackedRequests { get; } = [];
@@ -675,6 +758,12 @@ internal sealed class FakeGitService : IGitService
         }
         return Task.FromResult<IReadOnlyList<GitCommitInfo>>(Logs.Take(Math.Max(1, count)).ToArray());
     }
+
+    public Task<IReadOnlyList<GitCommitInfo>> GetFileLogAsync(string repositoryPath, string path, int count = 50, int skip = 0, CancellationToken cancellationToken = default) =>
+        Task.FromResult<IReadOnlyList<GitCommitInfo>>(Logs.Skip(Math.Max(0, skip)).Take(Math.Max(1, count)).ToArray());
+
+    public Task<GitBlame> GetBlameAsync(string repositoryPath, string path, CancellationToken cancellationToken = default) =>
+        Task.FromResult(Blame ?? GitBlame.Empty);
 
     public Task<IReadOnlyList<GitBranchInfo>> GetBranchesAsync(string repositoryPath, CancellationToken cancellationToken = default)
     {
@@ -825,6 +914,27 @@ internal sealed class FakeExecutablePicker : IExecutablePickerService
     public string? PickExecutable() => Result;
 }
 
+internal sealed class FakeTextPromptService : ITextPromptService
+{
+    public TextPromptOutcome Result { get; set; } = new(Confirmed: false, Text: string.Empty);
+    public int PromptCalls { get; private set; }
+    public List<(string Title, string Message)> Requests { get; } = [];
+
+    public TextPromptOutcome Prompt(string title, string message, string initialText = "")
+    {
+        PromptCalls++;
+        Requests.Add((title, message));
+        return Result;
+    }
+}
+
+internal sealed class FakeMessageService : IMessageService
+{
+    public List<(string Title, string Message)> Messages { get; } = [];
+
+    public void ShowInformation(string title, string message) => Messages.Add((title, message));
+}
+
 internal sealed class FakeConfirmationService : IConfirmationService
 {
     public bool Result { get; set; } = true;
@@ -947,6 +1057,12 @@ internal sealed class FakeUiDispatcher : IUiDispatcher
     public bool CheckAccess() => AccessGranted;
 
     public void BeginInvoke(Action action) => Invoked.Add(action);
+
+    public void BeginInvoke(Action action, UiDispatcherPriority priority) => Invoked.Add(action);
+    public bool IsHostAvailable => false;
+
+    public IUiTimer CreateTimer(TimeSpan interval, Action tick, UiDispatcherPriority priority = UiDispatcherPriority.Normal) =>
+        new WpfUiDispatcher().CreateTimer(interval, tick, priority);
 
     public Task InvokeAsync(Action action)
     {

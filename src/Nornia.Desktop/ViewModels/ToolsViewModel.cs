@@ -1,4 +1,4 @@
-using System.Collections.ObjectModel;
+﻿using System.Collections.ObjectModel;
 using System.Windows;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
@@ -189,6 +189,9 @@ public partial class ToolsViewModel(
     }, "确认相关命令已加入 PATH，或查看 Problems。", canCancel: true);
 
     /// <summary>用户显式发起的扫描:永远强制重扫并更新持久化快照与 scan_state。</summary>
+    /// <inheritdoc />
+    public override Task RefreshActiveViewAsync() => ScanCommand.ExecuteAsync(null);
+
     [RelayCommand]
     private Task ScanAsync() => RunAsync("扫描开发工具", async cancellationToken =>
     {
@@ -300,7 +303,7 @@ public partial class ToolsViewModel(
     {
         var snapshot = tools
                      .Where(tool => EnvironmentComponentCatalog.Get(tool.Name)?.Category == EnvironmentComponentCategory.DevelopmentTool)
-                     .OrderBy(tool => tool.Name).ThenByDescending(tool => tool.Version)
+                     .OrderBy(tool => tool.Name).ThenByDescending(tool => tool.Version, VersionOrder.Comparer)
             .Select(tool => new ManagedComponentItem(tool, FindAvailableVersion(tool, packages)))
             .ToArray();
         using var performance = performanceMetrics?.Begin("tools.list.publish", snapshot.Length, "ui-batch");

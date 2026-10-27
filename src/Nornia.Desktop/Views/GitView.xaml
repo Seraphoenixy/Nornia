@@ -808,7 +808,23 @@
                        Visibility="{Binding IsLoading, Converter={StaticResource BooleanToVisibilityConverter}}" />
             <TextBlock Text="无文件更改" Style="{StaticResource CaptionStyle}" Margin="4,2,0,2"
                        Visibility="{Binding HasNoFiles, Converter={StaticResource BooleanToVisibilityConverter}}" />
-            <ItemsControl ItemsSource="{Binding Files}" ItemTemplate="{StaticResource ScmCommitFileRowTemplate}" />
+            <!-- Bound the inner viewport so an expanded commit does not materialize every file. -->
+            <ListBox ItemsSource="{Binding Files}" ItemTemplate="{StaticResource ScmCommitFileRowTemplate}"
+                     MaxHeight="320" Background="Transparent" BorderThickness="0" Padding="0"
+                     ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                     ScrollViewer.VerticalScrollBarVisibility="Auto" ScrollViewer.CanContentScroll="True"
+                     VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
+                     VirtualizingPanel.ScrollUnit="Pixel">
+              <ListBox.ItemsPanel>
+                <ItemsPanelTemplate><VirtualizingStackPanel /></ItemsPanelTemplate>
+              </ListBox.ItemsPanel>
+              <ListBox.ItemContainerStyle>
+                <Style TargetType="ListBoxItem">
+                  <Setter Property="Padding" Value="0" />
+                  <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                </Style>
+              </ListBox.ItemContainerStyle>
+            </ListBox>
           </StackPanel>
         </Grid>
       </StackPanel>
@@ -961,6 +977,8 @@
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
             <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
           </Grid.RowDefinitions>
 
         <!-- Row 0: 无仓库占位 / 干净提示(均 Auto,无条目时整行收拢) -->
@@ -975,6 +993,11 @@
           </StackPanel>
           <views:EmptyStateControl Icon="{StaticResource CodiconCheck}" Title="工作区干净，没有更改。"
                                    Visibility="{Binding IsClean, Converter={StaticResource BooleanToVisibilityConverter}}" />
+          <!-- 条目上限降级提示:变更被 git.statusLimit 截断时必须在顶部可见——只写日志的降级,
+               用户会把"前 N 条"当成全部变更。 -->
+          <TextBlock Text="{Binding StatusTruncationSummary}" Foreground="{DynamicResource WarningBrush}"
+                     FontSize="{DynamicResource TypeBadge}" TextWrapping="Wrap" Margin="10,4,10,0"
+                     Visibility="{Binding IsStatusTruncated, Converter={StaticResource BooleanToVisibilityConverter}}" />
         </StackPanel>
 
             <!-- 已暂存的更改（VS Code：暂存分区在上，计数徽标 + 悬停行内操作；支持拖入暂存） -->
@@ -990,12 +1013,17 @@
               </controls:CollapsibleSection.HeaderContent>
               <controls:CollapsibleSection.SectionContent>
               <Grid Visibility="{Binding StagedChanges.Count, Converter={StaticResource NonZeroCountToVisibilityConverter}}">
+                <Grid.RowDefinitions>
+                  <RowDefinition Height="Auto" />
+                  <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
                 <!-- 平铺布局 -->
-                <ListBox Tag="staged" ItemsSource="{Binding StagedChangesView}" SelectedItem="{Binding SelectedStagedChange}"
+                <ListBox Grid.Row="0" Tag="staged" ItemsSource="{Binding StagedChangesView}" SelectedItem="{Binding SelectedStagedChange}"
                          MaxHeight="{Binding ViewportHeight, RelativeSource={RelativeSource AncestorType=ScrollViewer}}"
                          PreviewMouseLeftButtonDown="FlatChangeList_PreviewMouseLeftButtonDown"
                          PreviewMouseLeftButtonUp="FlatChangeList_PreviewMouseLeftButtonUp"
                          PreviewMouseMove="ChangeList_PreviewMouseMove"
+                         KeyDown="ChangeList_KeyDown"
                          SelectionMode="Extended" KeyboardNavigation.TabNavigation="None" Padding="0,2,0,2"
                          b:MultiSelectorBinding.SelectedItems="{Binding SelectedStagedChanges}"
                          b:ListSelectionBehavior.SelectOnRightClick="True"
@@ -1014,13 +1042,15 @@
                                 CommandParameter="{Binding PlacementTarget.SelectedItem, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
                       <MenuItem Header="打开 diff" Command="{Binding OpenChangeDiffCommand}"
                                 CommandParameter="{Binding PlacementTarget.SelectedItem, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                      <MenuItem Header="文件历史" Command="{Binding OpenFileHistoryCommand}"
+                                CommandParameter="{Binding PlacementTarget.SelectedItem, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
                       <Separator />
                       <MenuItem Header="取消暂存选中" Command="{Binding UnstageSelectedChangesCommand}" />
                     </ContextMenu>
                   </ListBox.ContextMenu>
                 </ListBox>
                 <!-- 树状布局 -->
-                <ListBox Tag="staged" ItemsSource="{Binding StagedTreeRows}" SelectedItem="{Binding SelectedStagedTreeRow}"
+                <ListBox Grid.Row="0" Tag="staged" ItemsSource="{Binding StagedTreeRows}" SelectedItem="{Binding SelectedStagedTreeRow}"
                          MaxHeight="{Binding ViewportHeight, RelativeSource={RelativeSource AncestorType=ScrollViewer}}"
                          PreviewMouseMove="ChangeList_PreviewMouseMove"
                          MouseEnter="TreeList_MouseEnter" MouseLeave="TreeList_MouseLeave"
@@ -1058,6 +1088,12 @@
                     </ContextMenu>
                   </ListBox.ContextMenu>
                 </ListBox>
+                <!-- 渲染预算页脚:树状视图一次只发布 TreeRowRenderLimit 行,被挡住的条数按块「显示更多」。
+                     命令语义仍作用于全量列表(暂存/丢弃/复制读完整集合),预算只限制发布的行数。 -->
+                <Button Grid.Row="1" Content="{Binding MoreStagedRowsSummary}"
+                        Command="{Binding ShowMoreStagedRowsCommand}"
+                        HorizontalAlignment="Center" Margin="0,4,0,2" FontSize="{DynamicResource TypeBadge}"
+                        Visibility="{Binding ShowMoreStagedRowsFooter, Converter={StaticResource BooleanToVisibilityConverter}}" />
               </Grid>
               </controls:CollapsibleSection.SectionContent>
             </controls:CollapsibleSection>
@@ -1079,12 +1115,17 @@
               </controls:CollapsibleSection.HeaderContent>
               <controls:CollapsibleSection.SectionContent>
               <Grid Visibility="{Binding UnstagedChanges.Count, Converter={StaticResource NonZeroCountToVisibilityConverter}}">
+                <Grid.RowDefinitions>
+                  <RowDefinition Height="Auto" />
+                  <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
                 <!-- 平铺布局 -->
-                <ListBox Tag="unstaged" ItemsSource="{Binding UnstagedChangesView}" SelectedItem="{Binding SelectedUnstagedChange}"
+                <ListBox Grid.Row="0" Tag="unstaged" ItemsSource="{Binding UnstagedChangesView}" SelectedItem="{Binding SelectedUnstagedChange}"
                          MaxHeight="{Binding ViewportHeight, RelativeSource={RelativeSource AncestorType=ScrollViewer}}"
                          PreviewMouseLeftButtonDown="FlatChangeList_PreviewMouseLeftButtonDown"
                          PreviewMouseLeftButtonUp="FlatChangeList_PreviewMouseLeftButtonUp"
                          PreviewMouseMove="ChangeList_PreviewMouseMove"
+                         KeyDown="ChangeList_KeyDown"
                          SelectionMode="Extended" KeyboardNavigation.TabNavigation="None" Padding="0,2,0,2"
                          b:MultiSelectorBinding.SelectedItems="{Binding SelectedUnstagedChanges}"
                          b:ListSelectionBehavior.SelectOnRightClick="True"
@@ -1103,6 +1144,8 @@
                                 CommandParameter="{Binding PlacementTarget.SelectedItem, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
                       <MenuItem Header="打开 diff" Command="{Binding OpenChangeDiffCommand}"
                                 CommandParameter="{Binding PlacementTarget.SelectedItem, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
+                      <MenuItem Header="文件历史" Command="{Binding OpenFileHistoryCommand}"
+                                CommandParameter="{Binding PlacementTarget.SelectedItem, RelativeSource={RelativeSource AncestorType=ContextMenu}}" />
                       <Separator />
                       <MenuItem Header="丢弃选中" Command="{Binding DiscardSelectedChangesCommand}" />
                       <MenuItem Header="暂存选中" Command="{Binding StageSelectedChangesCommand}" />
@@ -1110,7 +1153,7 @@
                   </ListBox.ContextMenu>
                 </ListBox>
                 <!-- 树状布局 -->
-                <ListBox Tag="unstaged" ItemsSource="{Binding UnstagedTreeRows}" SelectedItem="{Binding SelectedUnstagedTreeRow}"
+                <ListBox Grid.Row="0" Tag="unstaged" ItemsSource="{Binding UnstagedTreeRows}" SelectedItem="{Binding SelectedUnstagedTreeRow}"
                          MaxHeight="{Binding ViewportHeight, RelativeSource={RelativeSource AncestorType=ScrollViewer}}"
                          PreviewMouseMove="ChangeList_PreviewMouseMove"
                          MouseEnter="TreeList_MouseEnter" MouseLeave="TreeList_MouseLeave"
@@ -1152,6 +1195,11 @@
                     </ContextMenu>
                   </ListBox.ContextMenu>
                 </ListBox>
+                <!-- 渲染预算页脚:同上,「显示更多」按块抬高预算后重新发布。 -->
+                <Button Grid.Row="1" Content="{Binding MoreUnstagedRowsSummary}"
+                        Command="{Binding ShowMoreUnstagedRowsCommand}"
+                        HorizontalAlignment="Center" Margin="0,4,0,2" FontSize="{DynamicResource TypeBadge}"
+                        Visibility="{Binding ShowMoreUnstagedRowsFooter, Converter={StaticResource BooleanToVisibilityConverter}}" />
               </Grid>
               </controls:CollapsibleSection.SectionContent>
             </controls:CollapsibleSection>
@@ -1197,6 +1245,52 @@
                   </DataTemplate>
                 </ListBox.ItemTemplate>
               </ListBox>
+              </controls:CollapsibleSection.SectionContent>
+            </controls:CollapsibleSection>
+
+            <!-- 文件历史:右键任一变更文件打开(git log 单路径跟随重命名);行点击打开该提交对该文件的 diff。 -->
+            <controls:CollapsibleSection Grid.Row="4" Title="{Binding FileHistoryCaption}" Margin="0,8,0,0"
+                                         Visibility="{Binding HasFileHistory, Converter={StaticResource BooleanToVisibilityConverter}}">
+              <controls:CollapsibleSection.HeaderContent>
+                <Button Style="{StaticResource ScmHeaderActionButtonStyle}" Content="{StaticResource CodiconClose}" FontFamily="{StaticResource IconFontFamily}"
+                        ToolTip="关闭文件历史" Command="{Binding CloseFileHistoryCommand}" />
+              </controls:CollapsibleSection.HeaderContent>
+              <controls:CollapsibleSection.SectionContent>
+              <Grid>
+                <Grid.RowDefinitions><RowDefinition Height="*" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+                <ListBox ItemsSource="{Binding FileHistoryCommits}"
+                         MaxHeight="{Binding ViewportHeight, RelativeSource={RelativeSource AncestorType=ScrollViewer}}"
+                         KeyboardNavigation.TabNavigation="None" Padding="0,2,0,2"
+                         ScrollViewer.VerticalScrollBarVisibility="Auto"
+                         ScrollViewer.CanContentScroll="True"
+                         VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling"
+                         Background="Transparent" BorderThickness="0" ItemContainerStyle="{StaticResource ScmRowStyle}">
+                  <ListBox.ItemTemplate>
+                    <DataTemplate>
+                      <!-- 整行可点击:打开该提交对该文件的 diff(预览语义) -->
+                      <Button Style="{StaticResource LinkButton}" HorizontalAlignment="Stretch" HorizontalContentAlignment="Left" Padding="0,2"
+                              Command="{Binding DataContext.OpenFileHistoryDiffCommand, RelativeSource={RelativeSource AncestorType=UserControl}}"
+                              CommandParameter="{Binding}"
+                              ToolTip="打开该提交对此文件的差异">
+                        <StackPanel>
+                          <TextBlock Text="{Binding Subject}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis" ToolTip="{Binding Subject}" />
+                          <StackPanel Orientation="Horizontal">
+                            <TextBlock Text="{Binding ShortHash}" Style="{StaticResource CaptionStyle}" Foreground="{DynamicResource MutedTextBrush}" Margin="0,1,8,0" />
+                            <TextBlock Text="{Binding AuthorName}" Style="{StaticResource CaptionStyle}" Foreground="{DynamicResource MutedTextBrush}" Margin="0,1,8,0" TextTrimming="CharacterEllipsis" />
+                            <TextBlock Text="{Binding AuthorDate, StringFormat={}{0:yyyy-MM-dd}}" Style="{StaticResource CaptionStyle}" Foreground="{DynamicResource SubtleTextBrush}" Margin="0,1,0,0" />
+                          </StackPanel>
+                        </StackPanel>
+                      </Button>
+                    </DataTemplate>
+                  </ListBox.ItemTemplate>
+                </ListBox>
+                <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="8,2">
+                  <Button Content="加载更多…" Command="{Binding LoadMoreFileHistoryCommand}" Style="{StaticResource LinkButton}" Padding="4,2"
+                          Visibility="{Binding CanLoadMoreFileHistory, Converter={StaticResource BooleanToVisibilityConverter}}" />
+                  <TextBlock Text="加载中…" Style="{StaticResource CaptionStyle}" Foreground="{DynamicResource MutedTextBrush}" VerticalAlignment="Center" Margin="8,0,0,0"
+                             Visibility="{Binding IsFileHistoryLoading, Converter={StaticResource BooleanToVisibilityConverter}}" />
+                </StackPanel>
+              </Grid>
               </controls:CollapsibleSection.SectionContent>
             </controls:CollapsibleSection>
         </Grid>

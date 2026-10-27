@@ -1,4 +1,4 @@
-using CommunityToolkit.Mvvm.ComponentModel;
+﻿using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Nornia.Core.Collections;
 using Nornia.Core.Interfaces;
@@ -90,6 +90,9 @@ public partial class CacheViewModel : PageViewModel, INavigationTarget
 
     // 首次激活不自动扫描缓存:扫描是全盘目录遍历,只在用户点击“扫描缓存”时执行
     // (OnFirstActivatedAsync 保持基类空实现;空状态指引见 CacheView 的 EmptyStateControl)。
+
+    /// <inheritdoc />
+    public override Task RefreshActiveViewAsync() => ScanCommand.ExecuteAsync(null);
 
     [RelayCommand(CanExecute = nameof(CanScan))]
     private Task ScanAsync() => RunAsync("扫描应用缓存", async cancellationToken =>

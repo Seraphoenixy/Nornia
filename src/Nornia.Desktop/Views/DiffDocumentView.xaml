@@ -119,21 +119,34 @@
             BorderBrush="{DynamicResource StrongBorderBrush}" BorderThickness="1"
             CornerRadius="{StaticResource RadiusMd}" Effect="{StaticResource ShadowPopupEffect}"
             Visibility="{Binding IsFindBarOpen, Converter={StaticResource BooleanToVisibilityConverter}}">
-      <DockPanel LastChildFill="False">
-        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
-          <TextBlock Text="{Binding CurrentMatchDisplay}" FontSize="{DynamicResource TypeBody}" Foreground="{DynamicResource MutedTextBrush}"
-                     VerticalAlignment="Center" MinWidth="44" TextAlignment="Right" Margin="0,0,8,0" />
-          <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconArrowUp}" FontFamily="{StaticResource IconFontFamily}" Padding="5,0" Margin="0"
-                  Click="DiffFindPrevious_Click" ToolTip="上一个匹配（Shift+F3）" />
-          <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconArrowDown}" FontFamily="{StaticResource IconFontFamily}" Padding="5,0" Margin="2,0,0,0"
-                  Click="DiffFindNext_Click" ToolTip="下一个匹配（F3 / Enter）" />
-          <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconClose}" FontFamily="{StaticResource IconFontFamily}" Padding="5,0" Margin="2,0,0,0"
-                  Click="ToggleFindBar_Click" ToolTip="关闭查找（Esc）" />
+      <StackPanel>
+        <DockPanel LastChildFill="False">
+          <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+            <TextBlock Text="{Binding CurrentMatchDisplay}" FontSize="{DynamicResource TypeBody}" Foreground="{DynamicResource MutedTextBrush}"
+                       VerticalAlignment="Center" MinWidth="44" TextAlignment="Right" Margin="0,0,8,0" />
+            <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconArrowUp}" FontFamily="{StaticResource IconFontFamily}" Padding="5,0" Margin="0"
+                    Click="DiffFindPrevious_Click" ToolTip="上一个匹配（Shift+F3）" />
+            <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconArrowDown}" FontFamily="{StaticResource IconFontFamily}" Padding="5,0" Margin="2,0,0,0"
+                    Click="DiffFindNext_Click" ToolTip="下一个匹配（F3 / Enter）" />
+            <Button Style="{StaticResource IconButton}" Content="{StaticResource CodiconClose}" FontFamily="{StaticResource IconFontFamily}" Padding="5,0" Margin="2,0,0,0"
+                    Click="ToggleFindBar_Click" ToolTip="关闭查找（Esc）" />
+          </StackPanel>
+          <TextBox x:Name="DiffFindBox" Text="{Binding FindText, UpdateSourceTrigger=PropertyChanged}"
+                    ToolTip="在 Diff 文本中查找（Enter/F3 下一个 · Shift+Enter/Shift+F3 上一个 · Esc 关闭）" MinWidth="220"
+                   KeyDown="DiffFindBox_KeyDown" />
+        </DockPanel>
+        <!-- 正则表达式非法时显示编译错误,输入修正后自动消失(与文件阅读查找框一致)。 -->
+        <TextBlock Text="{Binding FindErrorMessage}" FontSize="{DynamicResource TypeBody}"
+                   Foreground="{DynamicResource ErrorTextBrush}" TextTrimming="CharacterEllipsis"
+                   MaxWidth="420" Margin="0,4,0,0" ToolTip="{Binding FindErrorMessage}"
+                   Visibility="{Binding FindErrorMessage, Converter={StaticResource StringEmptyToCollapsedConverter}}" />
+        <!-- 选项行与文件阅读查找框同款:此前 diff 侧固定忽略大小写/非整词/非正则,两侧行为不一致。 -->
+        <StackPanel Orientation="Horizontal" Margin="0,4,0,0">
+          <CheckBox Content="大小写" ToolTip="区分大小写" FontSize="{DynamicResource TypeBody}" IsChecked="{Binding FindCaseSensitive, UpdateSourceTrigger=PropertyChanged}" />
+          <CheckBox Content="全词" ToolTip="全词匹配" FontSize="{DynamicResource TypeBody}" IsChecked="{Binding FindWholeWord, UpdateSourceTrigger=PropertyChanged}" Margin="8,0,0,0" />
+          <CheckBox Content="正则" ToolTip="正则表达式" FontSize="{DynamicResource TypeBody}" IsChecked="{Binding FindUseRegex, UpdateSourceTrigger=PropertyChanged}" Margin="8,0,0,0" />
         </StackPanel>
-        <TextBox x:Name="DiffFindBox" Text="{Binding FindText, UpdateSourceTrigger=PropertyChanged}"
-                  ToolTip="在统一 Diff 文本中查找（Ctrl+F 聚焦 · Enter/F3 下一个 · Shift+Enter/Shift+F3 上一个 · Esc 关闭）" MinWidth="220"
-                 KeyDown="DiffFindBox_KeyDown" />
-      </DockPanel>
+      </StackPanel>
     </Border>
 
     <!-- Inline diff: one read-only editor with old|new numbers, per-kind backgrounds + overview ruler

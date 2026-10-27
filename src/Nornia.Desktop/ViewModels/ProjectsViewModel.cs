@@ -1,4 +1,4 @@
-using System.Collections.ObjectModel;
+﻿using System.Collections.ObjectModel;
 using System.IO;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
@@ -260,6 +260,9 @@ public partial class ProjectsViewModel : PageViewModel, INavigationTarget
         }
     }
 
+    /// <inheritdoc />
+    public override Task RefreshActiveViewAsync() => CheckCommand.ExecuteAsync(null);
+
     [RelayCommand(CanExecute = nameof(CanInspect))]
     private Task CheckAsync() => RunProjectAsync("检查项目环境", async (path, context, cancellationToken) =>
     {
@@ -303,7 +306,10 @@ public partial class ProjectsViewModel : PageViewModel, INavigationTarget
             return;
         }
 
-        await _repairExecutor.ExecuteAsync(plan.Operations, OperationProgress, cancellationToken);
+        var batchId = await _repairExecutor.ExecuteAsync(plan.Operations, OperationProgress, cancellationToken);
+        // 修复批次 id 是回滚的唯一钥匙:写入日志并附上可直接复制执行的撤销命令,
+        // 否则用户拿到 id 也无处使用(回滚闭环断在最后一公里)。
+        LogService.Write("INFO", $"修复批次 correlation_id = {batchId:N}。撤销本次修复：Nornia env rollback {batchId:N} --apply");
         EnsureProjectContextCurrent(context, path, cancellationToken);
         var (_, refreshedRuntimes, refreshedResults) = await EvaluateAsync(path, context, cancellationToken);
         EnsureProjectContextCurrent(context, path, cancellationToken);

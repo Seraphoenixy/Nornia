@@ -1,4 +1,5 @@
 using Nornia.Desktop.Commands;
+using Nornia.Desktop.Code;
 using Nornia.Desktop.Configuration;
 using Nornia.Desktop.Views;
 using Nornia.Desktop.ViewModels;
@@ -9,6 +10,35 @@ namespace Nornia.Tests;
 
 public sealed class SettingsCenterTests
 {
+    [Fact]
+    public async Task ReadingLimits_DefaultToTheCapacityConstants()
+    {
+        var service = new FakeSettingsService();
+        var baseline = await service.GetSnapshotAsync(new SettingsContext());
+
+        var limits = SettingsOptionsMapper.ReadingLimits(baseline);
+        Assert.Equal(ReadOnlyContentLimits.Default, limits);
+    }
+
+    [Fact]
+    public async Task ReadingLimits_CarryCommittedThresholdOverrides()
+    {
+        var service = new FakeSettingsService();
+        var context = new SettingsContext();
+        var baseline = await service.GetSnapshotAsync(context);
+
+        var commit = await service.CommitAsync(SettingsTransaction.Set(baseline, SettingScope.User,
+            BuiltInSettingsCatalog.ReadingFullSourceMb, 2));
+        Assert.True(commit.IsSuccess);
+
+        var limits = SettingsOptionsMapper.ReadingLimits(await service.GetSnapshotAsync(context));
+        Assert.Equal(2L * 1024 * 1024, limits.FullSourceBytes);
+        // 未覆盖的阈值保持默认。
+        Assert.Equal(ReadOnlyContentLimits.Default.WindowedSourceBytes, limits.WindowedSourceBytes);
+        Assert.Equal(ReadOnlyContentLimits.Default.FullDiffLines, limits.FullDiffLines);
+        Assert.Equal(ReadOnlyContentLimits.Default.WindowedDiffLines, limits.WindowedDiffLines);
+    }
+
     [Fact]
     public async Task SettingsService_CommitsAndPersistsEditorFontSize()
     {
@@ -107,13 +137,14 @@ public sealed class SettingsCenterTests
     public void Views_RegisterSettingsSidebarAndAutoSaveStatus()
     {
         var root = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", "..", ".."));
-        // 壳先行架构:页面侧栏(含 SettingsSidebarView)由 MainWindow 代码在首帧后物化,
-        // 注册点从 XAML 迁移到 code-behind。
-        var mainCode = File.ReadAllText(Path.Combine(root, "src", "Nornia.Desktop", "Views", "MainWindow.xaml.cs"));
+        // 壳先行架构:页面侧栏由 MainWindow 在首帧后物化;视图类型与页 VM 的对应关系
+        // 现在登记在 App.xaml 的隐式 DataTemplate 里(新增页面 = 加一个模板,不必改窗口代码)。
+        var app = File.ReadAllText(Path.Combine(root, "src", "Nornia.Desktop", "App.xaml"));
         var sidebar = File.ReadAllText(Path.Combine(root, "src", "Nornia.Desktop", "Views", "SettingsSidebarView.xaml"));
         var view = File.ReadAllText(Path.Combine(root, "src", "Nornia.Desktop", "Views", "SettingsView.xaml"));
 
-        Assert.Contains("SettingsSidebarView", mainCode);
+        Assert.Contains("<views:SettingsSidebarView />", app);
+        Assert.Contains("{x:Type vm:SettingsEditorViewModel}", app);
         Assert.Contains("SearchText", sidebar);
         Assert.Contains("Editor.SaveStatus", view);
         Assert.DoesNotContain("SaveCommand", view);

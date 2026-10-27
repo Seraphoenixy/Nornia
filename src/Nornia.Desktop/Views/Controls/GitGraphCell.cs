@@ -2,6 +2,7 @@ using System.Windows;
 using System.Windows.Media;
 using Nornia.Desktop.Services;
 using Nornia.Desktop.ViewModels;
+using Nornia.Desktop.Code;
 
 namespace Nornia.Desktop.Views.Controls;
 
@@ -38,7 +39,7 @@ public sealed class GitGraphCell : FrameworkElement
     }
 
     /// <summary>贯穿模式:展开内容(同步栏展开区/提交行文件清单)占位时,泳道以整行竖线穿过,
-    /// 不画圆点与曲线——线在增高的行内保持连续。渲染语义:所有活动泳道(贯穿 + 圆点泳道)
+    /// 不画圆点与曲线——线在增高的行内保持连续。渲染语义:本行底部出线泳道(贯穿 + 父泳道)
     /// 画全高竖线,颜色取出色(贯穿段永远位于任何圆点之下,不发生颜色切换)。</summary>
     public static readonly DependencyProperty PassThroughProperty = DependencyProperty.Register(
         nameof(PassThrough),
@@ -122,10 +123,11 @@ public sealed class GitGraphCell : FrameworkElement
         Pen LanePen(int lane) => PenFor(BrushForLane(lane));
         Pen LanePenIncoming(int lane) => PenFor(BrushForLaneIncoming(lane));
 
-        // 贯穿模式:展开内容占位的行只画整行竖线(贯穿 + 圆点泳道),保持连线不断。
+        // Expanded content starts below the header: continue its outgoing endpoints,
+        // not its incoming dot lane (which may terminate or change lanes at a merge).
         if (PassThrough)
         {
-            foreach (var lane in row.PassLanes.Append(row.DotLane).Distinct())
+            foreach (var lane in GitGraphContinuation.OutgoingLanes(row.PassLanes, row.Links.Select(link => link.ToLane)))
             {
                 var passX = GitGraphLayout.LaneX(lane);
                 drawingContext.DrawLine(LanePen(lane), new Point(passX, 0), new Point(passX, height));

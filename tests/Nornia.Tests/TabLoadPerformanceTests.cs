@@ -283,8 +283,10 @@ public sealed class DiffTabCountTests
 /// clear+re-add).</summary>
 public sealed class WindowedFindDebounceTests : IDisposable
 {
-    private const string Filler = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do";
-    private const int TotalLines = 150_000; // ≈ 9.5 MB — above the 8 MB full-source threshold
+    private const string Filler = "l";
+    // 行数保持 15 万(窗口化流式搜索按窗口翻页);单字符填充 ~0.45 MB,配注入的小分层
+    // 上限即可进入窗口化——不再为此写 9.5 MB 临时文件。
+    private const int TotalLines = 150_000;
     private readonly string _tempDir = Path.Combine(Path.GetTempPath(), $"nornia-find-debounce-{Guid.NewGuid():N}");
 
     public WindowedFindDebounceTests() => Directory.CreateDirectory(_tempDir);
@@ -306,7 +308,11 @@ public sealed class WindowedFindDebounceTests : IDisposable
         lines[29999] = "pneedle delta"; // line 30000
         await File.WriteAllLinesAsync(path, lines, new UTF8Encoding(false));
 
-        var tab = new FilePreviewTab(path, TextDocumentDecoder.Instance, CodeFileTypeRegistry.Instance);
+        var tab = new FilePreviewTab(path, TextDocumentDecoder.Instance, CodeFileTypeRegistry.Instance)
+        {
+            // 小上限注入:窗口化路径与生产阈值同代码路径。
+            ContentLimits = new ReadOnlyContentLimits(64L * 1024, 1024L * 1024, ReadOnlyContentCapacity.FullDiffLines, ReadOnlyContentCapacity.WindowedDiffLines),
+        };
         await tab.LoadAsync();
         Assert.Equal(1, tab.WindowStartLine);
         return tab;
@@ -447,6 +453,12 @@ internal sealed class GatedFakeGitService : IGitService
 
     public Task<IReadOnlyList<GitCommitInfo>> GetLogAsync(string repositoryPath, int count = 30, CancellationToken cancellationToken = default) =>
         Task.FromResult<IReadOnlyList<GitCommitInfo>>([]);
+
+    public Task<IReadOnlyList<GitCommitInfo>> GetFileLogAsync(string repositoryPath, string path, int count = 50, int skip = 0, CancellationToken cancellationToken = default) =>
+        Task.FromResult<IReadOnlyList<GitCommitInfo>>([]);
+
+    public Task<GitBlame> GetBlameAsync(string repositoryPath, string path, CancellationToken cancellationToken = default) =>
+        Task.FromResult(GitBlame.Empty);
 
     public Task<IReadOnlyList<GitCommitInfo>> GetIncomingCommitsAsync(string repositoryPath, string upstreamReference, int count = 30, CancellationToken cancellationToken = default) =>
         Task.FromResult<IReadOnlyList<GitCommitInfo>>([]);

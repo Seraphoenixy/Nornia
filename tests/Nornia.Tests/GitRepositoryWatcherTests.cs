@@ -1,4 +1,4 @@
-using Nornia.Desktop.Services;
+﻿using Nornia.Desktop.Services;
 
 namespace Nornia.Tests;
 
@@ -32,6 +32,12 @@ public sealed class GitRepositoryWatcherTests : IDisposable
 
         public void BeginInvoke(Action action) => action();
 
+        public void BeginInvoke(Action action, UiDispatcherPriority priority) => action();
+        public bool IsHostAvailable => false;
+
+        public IUiTimer CreateTimer(TimeSpan interval, Action tick, UiDispatcherPriority priority = UiDispatcherPriority.Normal) =>
+            new WpfUiDispatcher().CreateTimer(interval, tick, priority);
+
         public Task InvokeAsync(Action action)
         {
             action();
@@ -42,7 +48,26 @@ public sealed class GitRepositoryWatcherTests : IDisposable
     private GitRepositoryWatcher CreateWatcher(
         TimeSpan? debounce = null,
         TimeSpan? suppression = null) =>
-        new(new InlineDispatcher(), debounce ?? TimeSpan.FromMilliseconds(50), suppression ?? TimeSpan.FromMilliseconds(300));
+        new(new InlineDispatcher(), debounce ?? DefaultTestDebounce, suppression ?? TimeSpan.FromMilliseconds(300));
+
+    private static readonly TimeSpan DefaultTestDebounce = TimeSpan.FromMilliseconds(50);
+
+    /// <summary>去抖计时器回调在线程池上排队,固定 sleep 一个"应该够了"的时长在满负载 CI 上会失效;
+    /// 统一轮询到条件满足,超时后再断言,失败信息里带上语义。</summary>
+    private static async Task WaitUntilAsync(Func<bool> condition, string message, int timeoutMs = 5_000)
+    {
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        while (!condition() && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(15);
+        }
+
+        Assert.True(condition(), message);
+    }
+
+    /// <summary>稳定性观察窗口:等待 3 倍去抖时长,足以让排队中的去抖回调落地,
+    /// 用于"不得出现额外通知"的断言。</summary>
+    private static Task SettleAsync(TimeSpan debounce) => Task.Delay(debounce * 3);
 
     [Fact]
     public void DefaultDebounceInterval_IsShortEnoughForImmediateScmFeedback() =>
@@ -62,7 +87,10 @@ public sealed class GitRepositoryWatcherTests : IDisposable
         }
 
         Assert.Equal(0, count); // still inside the debounce window
-        await Task.Delay(400);
+        // 轮询到首次通知(而不是固定 sleep 一个"应该够了"的时长),再确认没有多余通知。
+        await WaitUntilAsync(() => Volatile.Read(ref count) > 0, "去抖后未收到通知");
+
+        await SettleAsync(DefaultTestDebounce); // settle: 不得出现第二次通知
         Assert.Equal(1, count); // the whole burst collapsed into one notification
     }
 
@@ -78,7 +106,7 @@ public sealed class GitRepositoryWatcherTests : IDisposable
         watcher.HandleFileSystemChange(Path.Combine(_repoPath, ".git", "index"));
         watcher.HandleFileSystemChange(Path.Combine(_repoPath, ".git", "HEAD"));
 
-        await Task.Delay(250);
+        await WaitUntilAsync(() => captured is not null, "去抖后未收到通知");
 
         Assert.NotNull(captured);
         Assert.Equal(Path.GetFullPath(_repoPath), captured!.RepositoryPath);
@@ -91,7 +119,8 @@ public sealed class GitRepositoryWatcherTests : IDisposable
     [Fact]
     public async Task FileSystemEvents_AreDebouncedIntoOneNotification()
     {
-        using var watcher = CreateWatcher(debounce: TimeSpan.FromMilliseconds(300));
+        var debounce = TimeSpan.FromMilliseconds(300);
+        using var watcher = CreateWatcher(debounce: debounce);
         var count = 0;
         watcher.ChangesDetected += (_, _) => Interlocked.Increment(ref count);
         watcher.Attach(_repoPath);
@@ -101,13 +130,9 @@ public sealed class GitRepositoryWatcherTests : IDisposable
             File.WriteAllText(Path.Combine(_repoPath, $"burst{i}.txt"), "content");
         }
 
-        var deadline = DateTime.UtcNow.AddSeconds(5);
-        while (count == 0 && DateTime.UtcNow < deadline)
-        {
-            await Task.Delay(25);
-        }
+        await WaitUntilAsync(() => Volatile.Read(ref count) > 0, "真实文件写入后未收到通知");
 
-        await Task.Delay(700); // no further events → no further notifications
+        await SettleAsync(debounce); // no further events → no further notifications
         Assert.Equal(1, count);
     }
 
@@ -178,13 +203,15 @@ public sealed class GitRepositoryWatcherTests : IDisposable
     {
         using var watcher = CreateWatcher();
         var count = 0;
-        watcher.ChangesDetected += (_, _) => count++;
+        watcher.ChangesDetected += (_, _) => Interlocked.Increment(ref count);
 
         watcher.Attach(Path.Combine(_repoPath, "does-not-exist"));
 
-        Assert.False(watcher.ShouldReactTo(Path.Combine(_repoPath, "src", "A.cs")));
-        watcher.HandleFileSystemChange(Path.Combine(_repoPath, "src", "A.cs"));
-        Thread.Sleep(200);
+        var probe = Path.Combine(_repoPath, "src", "A.cs");
+        // 未附加时门控同步返回 false:HandleFileSystemChange 直接返回,不会排入去抖计时器,
+        // 因此"没有通知"可以立即断言,不需要等待。
+        Assert.False(watcher.ShouldReactTo(probe));
+        watcher.HandleFileSystemChange(probe);
         Assert.Equal(0, count);
     }
 
@@ -193,14 +220,15 @@ public sealed class GitRepositoryWatcherTests : IDisposable
     {
         using var watcher = CreateWatcher();
         var count = 0;
-        watcher.ChangesDetected += (_, _) => count++;
+        watcher.ChangesDetected += (_, _) => Interlocked.Increment(ref count);
         watcher.Attach(_repoPath);
 
         watcher.Detach();
         watcher.Detach(); // idempotent
 
-        watcher.HandleFileSystemChange(Path.Combine(_repoPath, "src", "A.cs"));
-        Thread.Sleep(200);
+        var probe = Path.Combine(_repoPath, "src", "A.cs");
+        Assert.False(watcher.ShouldReactTo(probe)); // Detach 清空 repositoryPath,门控同步关闭
+        watcher.HandleFileSystemChange(probe);
         Assert.Equal(0, count);
     }
 
@@ -209,15 +237,16 @@ public sealed class GitRepositoryWatcherTests : IDisposable
     {
         using var watcher = CreateWatcher();
         var count = 0;
-        watcher.ChangesDetected += (_, _) => count++;
+        watcher.ChangesDetected += (_, _) => Interlocked.Increment(ref count);
         watcher.Attach(_repoPath);
 
         watcher.HandleWatcherError();
 
         Assert.Equal(1, count); // the fallback notification lets the VM re-check state
 
-        watcher.HandleFileSystemChange(Path.Combine(_repoPath, "src", "A.cs"));
-        Thread.Sleep(200);
+        var probe = Path.Combine(_repoPath, "src", "A.cs");
+        Assert.False(watcher.ShouldReactTo(probe)); // 出错即 Detach,后续事件被同步拦截
+        watcher.HandleFileSystemChange(probe);
         Assert.Equal(1, count); // watching stopped, nothing further
     }
 }

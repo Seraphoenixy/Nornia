@@ -81,11 +81,11 @@ public sealed class WorkbenchMainViewModelTests
             logs,
             clipboard,
             workspaceService);
-        var git = new GitViewModel(gitService, folder, confirmation, catalog, editor, logs, clipboard,
+        var git = new GitViewModel(gitService, folder, confirmation, new FakeTextPromptService(), catalog, editor, logs, clipboard,
             new FakeGitRepositoryWatcher(), workspaceService, new FakeApplicationStateStore(), settingsService);
         var explorer = new ExplorerPageViewModel(workspace, editor, terminal, git, projects, catalog, folder, navigation, logs);
 
-        var main = new MainViewModel(environment, explorer, git, projects, settings, terminal, logs, navigation, clipboard);
+        var main = new MainViewModel(environment, explorer, git, projects, settings, terminal, logs, navigation, new FakeMessageService(), clipboard);
         return new Fixture(main, logs, navigation, terminal, terminalService, editor);
     }
 
@@ -130,10 +130,12 @@ public sealed class WorkbenchMainViewModelTests
         var fixture = Create();
 
         fixture.Main.NavigateByIndexCommand.Execute(2); // 项目管理
+        // 预览语义:重复导航激活同一标签;转正(双击)后可与后续页面共存。
+        ((PageWorkbenchTab)fixture.Main.Workbench.SelectedTab!).IsPreview = false;
         fixture.Main.NavigateByIndexCommand.Execute(4); // 设置
-        fixture.Main.NavigateByIndexCommand.Execute(2); // 项目管理(重复导航)
+        fixture.Main.NavigateByIndexCommand.Execute(2); // 项目管理(重复导航,激活既有标签)
 
-        // 启动不再自动打开环境管理页:导航仅产生 项目管理 + 设置 两个标签。
+        // 转正的项目管理标签保留,预览的设置页与其共存:共两个标签。
         Assert.Equal(2, fixture.Main.Workbench.Tabs.Count);
         Assert.Same(fixture.Main.NavigationItems[2].Page, fixture.Main.CurrentPage);
         var projectsTab = fixture.Main.Workbench.Tabs.Single(tab => ReferenceEquals(tab.Content, fixture.Main.NavigationItems[2].Page));
@@ -176,8 +178,9 @@ public sealed class WorkbenchMainViewModelTests
     public void SelectingPageTab_SyncsActivityBar_WithoutReopening()
     {
         var fixture = Create();
-        // 启动不再自动打开环境管理页标签,先显式打开(重复导航不复制)。
+        // 启动不再自动打开环境管理页标签,先显式打开并转正(预览语义下才会与后续页面共存)。
         fixture.Main.Workbench.OpenOrActivatePage(fixture.Main.NavigationItems[3].Page);
+        ((PageWorkbenchTab)fixture.Main.Workbench.SelectedTab!).IsPreview = false;
         fixture.Main.NavigateByIndexCommand.Execute(2); // 项目管理标签打开并选中
         var environmentTab = fixture.Main.Workbench.Tabs.Single(tab => ReferenceEquals(tab.Content, fixture.Main.NavigationItems[3].Page));
 
@@ -591,5 +594,40 @@ public sealed class WorkbenchMainViewModelTests
 
         await terminal.NewTerminalCommand.ExecuteAsync(null);
         return terminal.Sessions.Single(tab => tab.Session.Id == session.Id);
+    }
+
+    [Fact]
+    public async Task WorkspaceSwitch_KeepsRunningTerminalSessions_UpdatesWorkingDirectory()
+    {
+        var settingsService = new FakeSettingsService();
+        var terminalService = Substitute.For<ITerminalService>();
+        terminalService.DiscoverProfiles().Returns([new ShellProfile("pwsh", "PowerShell 7", "pwsh.exe")]);
+        var workspaceService = new FakeProjectWorkspaceService();
+        var terminal = new TerminalViewModel(terminalService, settingsService, workspaceService,
+            new FakeUiLogService(), new FakeClipboardService());
+        await terminal.ActivateAsync();
+        var session = await AddSessionToAsync(terminal, terminalService, "Terminal-A");
+        Assert.Single(terminal.Sessions);
+
+        // 切换项目:ContextChanged 触发(与 IProjectWorkspaceService.ActivateAsync 同路径)。
+        var projectPath = Path.Combine(Path.GetTempPath(), $"nornia-ws-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(projectPath);
+        try
+        {
+            workspaceService.ActivateResultFactory = path => new ProjectWorkspaceContext(
+                new ProjectAsset(Guid.NewGuid(), "Next", path, ProjectPathStatus.Available, 0, null, null,
+                    EnvironmentHealthStatus.Unknown),
+                path, null);
+            await workspaceService.ActivateAsync(projectPath);
+
+            // 已打开的会话不关闭(VS Code 语义):新终端才从新工作区目录启动。
+            Assert.Same(session, Assert.Single(terminal.Sessions));
+            Assert.Same(session, terminal.SelectedSession);
+            Assert.Equal(projectPath, terminal.WorkingDirectory);
+        }
+        finally
+        {
+            Directory.Delete(projectPath, recursive: true);
+        }
     }
 }

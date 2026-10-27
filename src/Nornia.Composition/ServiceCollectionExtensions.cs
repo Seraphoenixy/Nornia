@@ -21,6 +21,10 @@ public static class ServiceCollectionExtensions
 {
     public static IServiceCollection AddNorniaServices(this IServiceCollection services)
     {
+        // 数据目录从 Roaming 迁到 Local(见 NorniaPaths.DataDirectory 的说明)。
+        // 必须在 NorniaDatabase 解析路径之前完成,否则会建出一个空的新库。
+        NorniaPaths.MigrateFromRoamingIfNeeded();
+
         return services
             // Process infrastructure
             .AddSingleton<ProcessRunner>()

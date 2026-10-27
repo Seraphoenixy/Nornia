@@ -701,6 +701,8 @@ public sealed class GitServiceTests
         {
             // A verified HEAD returns an object id. The commit staged-check (diff --cached --quiet)
             // reports "changes staged" (exit 1); status-shape output keeps PushAsync in a repository.
+            // PushAsync resolves the branch from `rev-parse --abbrev-ref HEAD`, not from a status read.
+            if (args.Contains("--abbrev-ref")) return new ProcessResult(0, "main", string.Empty);
             if (args.Contains("rev-parse")) return new ProcessResult(0, "head-object-id", string.Empty);
             return new ProcessResult(args.Contains("--quiet") ? 1 : 0, "# branch.head main\0", string.Empty);
         });
@@ -719,6 +721,130 @@ public sealed class GitServiceTests
             $"'{subCommand}' is a write command and must not set GIT_OPTIONAL_LOCKS");
     }
 
+    // ===== G4b: 前台 status 读取允许 git 写回索引(把 stat/哈希结果持久化,后续读取走热路径) =====
+
+    [Fact]
+    public async Task GetStatusAsync_AllowIndexWriteBack_OmitsOptionalLocksAndMaintainsUntrackedCache()
+    {
+        var runner = new FakeProcessRunner((_, _) => new ProcessResult(0, "# branch.head main\0", string.Empty));
+
+        await new GitService(runner).GetStatusAsync(
+            @"C:\repo",
+            new GitStatusReadOptions(10_000, IncludeAllUntracked: true, AllowIndexWriteBack: true));
+
+        var call = Assert.Single(runner.Calls);
+        Assert.Null(call.Environment); // 不再注入 GIT_OPTIONAL_LOCKS=0:git 可以写回刷新后的索引
+        Assert.Contains("core.untrackedCache=true", call.Arguments);
+        Assert.Contains("status", call.Arguments);
+    }
+
+    [Fact]
+    public async Task GetStatusAsync_WithoutIndexWriteBack_StillDisablesOptionalLocks()
+    {
+        var runner = new FakeProcessRunner((_, _) => new ProcessResult(0, "# branch.head main\0", string.Empty));
+
+        await new GitService(runner).GetStatusAsync(@"C:\repo", new GitStatusReadOptions(10_000));
+
+        var call = Assert.Single(runner.Calls);
+        Assert.Equal("0", call.Environment!["GIT_OPTIONAL_LOCKS"]);
+        Assert.DoesNotContain("core.untrackedCache=true", call.Arguments);
+    }
+
+    [Fact]
+    public async Task GetStatusAsync_FileSystemMonitorOption_PassesCoreFsmonitor()
+    {
+        var runner = new FakeProcessRunner((_, _) => new ProcessResult(0, "# branch.head main\0", string.Empty));
+
+        await new GitService(runner).GetStatusAsync(
+            @"C:\repo",
+            new GitStatusReadOptions(10_000, AllowIndexWriteBack: true, EnableFileSystemMonitor: true));
+
+        Assert.Contains("core.fsmonitor=true", Assert.Single(runner.Calls).Arguments);
+    }
+
+    [Fact]
+    public async Task GetStatusAsync_UntrackedModeSelectsNormalOrAll()
+    {
+        var normalRunner = new FakeProcessRunner((_, _) => new ProcessResult(0, "# branch.head main\0", string.Empty));
+        await new GitService(normalRunner).GetStatusAsync(
+            @"C:\repo", new GitStatusReadOptions(10_000, IncludeAllUntracked: false));
+        Assert.Contains("--untracked-files=normal", Assert.Single(normalRunner.Calls).Arguments);
+
+        var allRunner = new FakeProcessRunner((_, _) => new ProcessResult(0, "# branch.head main\0", string.Empty));
+        await new GitService(allRunner).GetStatusAsync(
+            @"C:\repo", new GitStatusReadOptions(10_000, IncludeAllUntracked: true));
+        Assert.Contains("--untracked-files=all", Assert.Single(allRunner.Calls).Arguments);
+    }
+
+    // ===== 写操作不再为读一个字段而重算整棵工作树(原先各自跑一次完整 git status) =====
+
+    [Fact]
+    public async Task DiscardAll_ReadsUntrackedListWithoutAFullStatus()
+    {
+        var runner = new FakeProcessRunner((_, args) => args.Contains("ls-files")
+            ? new ProcessResult(0, "scratch.txt\0", string.Empty)
+            : new ProcessResult(0, string.Empty, string.Empty));
+        var directory = CreateScratchDirectory();
+        try
+        {
+            await new GitService(runner).DiscardAsync(directory, []);
+
+            Assert.DoesNotContain(runner.Calls, call => call.Arguments.Contains("status"));
+            Assert.Contains(runner.Calls, call =>
+                call.Arguments.Contains("ls-files") && call.Arguments.Contains("--others"));
+            Assert.Contains(runner.Calls, call =>
+                call.Arguments.Contains("restore") && call.Arguments.Contains("--staged"));
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task DiscardAllUnstaged_ReadsUntrackedListWithoutAFullStatus()
+    {
+        var runner = new FakeProcessRunner((_, _) => new ProcessResult(0, string.Empty, string.Empty));
+
+        await new GitService(runner).DiscardUnstagedAsync(@"C:\repo", []);
+
+        Assert.DoesNotContain(runner.Calls, call => call.Arguments.Contains("status"));
+        Assert.Contains(runner.Calls, call =>
+            call.Arguments.Contains("ls-files") && call.Arguments.Contains("--others"));
+        Assert.Contains(runner.Calls, call =>
+            call.Arguments.Contains("restore") && call.Arguments.Contains("--worktree"));
+    }
+
+    [Fact]
+    public async Task PushAsync_ResolvesBranchWithoutAStatusRead()
+    {
+        var runner = new FakeProcessRunner((_, args) => args.Contains("--abbrev-ref")
+            ? new ProcessResult(0, "main\n", string.Empty)
+            : new ProcessResult(0, string.Empty, string.Empty));
+
+        await new GitService(runner).PushAsync(@"C:\repo");
+
+        Assert.DoesNotContain(runner.Calls, call => call.Arguments.Contains("status"));
+        Assert.Contains(runner.Calls, call => call.Arguments.Contains("push") && call.Arguments.Contains("main"));
+    }
+
+    [Fact]
+    public async Task PushAsync_DetachedHead_IsRefusedWithoutAStatusRead()
+    {
+        var runner = new FakeProcessRunner((_, args) =>
+        {
+            if (args.Contains("--abbrev-ref")) return new ProcessResult(0, "HEAD\n", string.Empty);
+            if (args.Contains("--is-inside-work-tree")) return new ProcessResult(0, "true\n", string.Empty);
+            return new ProcessResult(0, string.Empty, string.Empty);
+        });
+
+        var exception = await Assert.ThrowsAsync<GitOperationException>(
+            () => new GitService(runner).PushAsync(@"C:\repo"));
+
+        Assert.Contains("detached HEAD", exception.Message);
+        Assert.DoesNotContain(runner.Calls, call => call.Arguments.Contains("status"));
+    }
+
     // ===== G5: per-repository read pool / exclusive write gate =====
 
     /// <summary>Runner that blocks every invocation until released and records the maximum
@@ -731,11 +857,25 @@ public sealed class GitServiceTests
         private int _maxTotalInFlight;
         private int _invocationCount;
         private readonly TaskCompletionSource _release = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly SemaphoreSlim _parkedInvocations = new(0);
 
         public int MaxConcurrent => Volatile.Read(ref _maxPerRepository);
         public int MaxTotalInFlight => Volatile.Read(ref _maxTotalInFlight);
         public int InvocationCount => Volatile.Read(ref _invocationCount);
         public void Release() => _release.TrySetResult();
+
+        /// <summary>确定性等待:等到第 <paramref name="count"/> 次调用已进入 runner 并停泊。
+        /// 替代"sleep 一段固定时长,假设调用都已到达"——后者在负载稍高的 CI 上会漏掉尚未到达的调用,
+        /// 导致闸门提前释放而断言失败。计数在信号之前更新,因此恢复后统计量已可见。</summary>
+        public async Task WaitForParkedInvocationsAsync(int count, TimeSpan timeout)
+        {
+            for (var i = 0; i < count; i++)
+            {
+                Assert.True(
+                    await _parkedInvocations.WaitAsync(timeout),
+                    $"只有 {InvocationCount} 次调用在超时前进入 runner(期望 {count})");
+            }
+        }
 
         public Task<ProcessResult> RunAsync(
             string fileName,
@@ -765,6 +905,8 @@ public sealed class GitServiceTests
                 }
             }
 
+            // 统计量已就绪,再唤醒等待者;释放闸门此时仍未打开。
+            _parkedInvocations.Release();
             return Blocked();
         }
 
@@ -790,6 +932,9 @@ public sealed class GitServiceTests
     [Fact]
     public async Task ConcurrentReadCommandsForSameRepository_AreBoundedAndOverlap()
     {
+        // 读槽上限是 2(不是"越多越好"):打开工作区时,资源管理器枚举与 git 读命令抢的是同一批
+        // 线程池线程与磁盘 IO。5~6 个 git 进程同时起飞会把枚举结果排在后面,表现为"整个界面一起卡"。
+        // 两个重叠读进程足够让单仓库的静默刷新不串行等待,又不至于挤占其他消费者。
         var runner = new GatingProcessRunner();
         var service = new GitService(runner);
 
@@ -797,12 +942,16 @@ public sealed class GitServiceTests
         var second = service.GetStatusAsync(@"C:\repo");
         var third = service.GetStatusAsync(@"C:\repo");
 
-        await Task.Delay(50); // all three readers should acquire the bounded read pool and park
-        runner.Release();
+        await runner.WaitForParkedInvocationsAsync(2, TimeSpan.FromSeconds(5)); // 两个读者停在有界读池里
+        await Task.Delay(50); // settle: 第三个读者必须还排在读槽外面,不得进入 runner
 
+        Assert.Equal(2, runner.InvocationCount);
+        Assert.Equal(2, runner.MaxConcurrent);
+
+        runner.Release();
         var results = await Task.WhenAll(first, second, third);
 
-        Assert.True(runner.MaxConcurrent == 3, $"expected all three readers to overlap within the pool, saw {runner.MaxConcurrent}");
+        Assert.Equal(3, runner.InvocationCount);
         Assert.All(results, r => Assert.True(r.IsRepository));
     }
 
@@ -816,16 +965,15 @@ public sealed class GitServiceTests
         {
             service.GetStatusAsync(@"C:\repo"),
             service.GetStatusAsync(@"C:\repo"),
-            service.GetStatusAsync(@"C:\repo"),
         };
-        await Task.Delay(50);
+        await runner.WaitForParkedInvocationsAsync(2, TimeSpan.FromSeconds(5));
         var write = service.StageAsync(@"C:\repo", ["file.txt"]);
-        await Task.Delay(50);
+        await Task.Delay(50); // settle: 写命令必须继续被读者挡住,不得进入 runner
 
-        Assert.Equal(3, runner.InvocationCount);
+        Assert.Equal(2, runner.InvocationCount);
         runner.Release();
         await Task.WhenAll(reads.Append(write));
-        Assert.Equal(4, runner.InvocationCount);
+        Assert.Equal(3, runner.InvocationCount);
     }
 
     [Fact]
@@ -837,11 +985,109 @@ public sealed class GitServiceTests
         var a = service.GetStatusAsync(@"C:\repo-a");
         var b = service.GetStatusAsync(@"C:\repo-b");
 
-        await Task.Delay(50); // both should have acquired their (distinct) gates and parked in the runner
+        await runner.WaitForParkedInvocationsAsync(2, TimeSpan.FromSeconds(5)); // both acquire their (distinct) gates and park
         runner.Release();
         await Task.WhenAll(a, b);
 
         Assert.True(runner.MaxTotalInFlight == 2,
             $"expected 2 concurrent git processes across repositories, saw {runner.MaxTotalInFlight}");
+    }
+
+    [Fact]
+    public async Task GetBlameAsync_ParsesPorcelainOutputIntoCompactModel()
+    {
+        // 模拟真实 `git blame --porcelain`:提交元数据只在首次出现时输出;后续出现只有行头。
+        const string hash1 = "aaaaaaa";
+        const string hash2 = "bbbbbbb";
+        var output = string.Join("\n",
+            $"{hash1.PadRight(40, '0')} 1 1 2",
+            "author Alice",
+            "author-mail <alice@example.com>",
+            "author-time 1700000000",
+            "author-tz +0800",
+            "summary first line",
+            "\toriginal text",
+            "\tsecond line",
+            $"{hash2.PadRight(40, '0')} 5 3",
+            "author Bob",
+            "author-mail <bob@example.com>",
+            "author-time 1700100000",
+            "author-tz -0500",
+            "summary rewrite",
+            "\tthird line",
+            "");
+
+        var runner = new FakeProcessRunner((_, _) => new Nornia.Core.Models.ProcessResult(0, output, string.Empty));
+        var blame = await new GitService(runner).GetBlameAsync(@"C:\repo", "file.txt");
+
+        Assert.False(blame.Truncated);
+        Assert.Equal(3, blame.TotalLines);
+        Assert.Equal(2, blame.Commits.Count);
+        Assert.Equal(0, blame.LineCommits[0]);
+        Assert.Equal(0, blame.LineCommits[1]);
+        Assert.Equal(1, blame.LineCommits[2]);
+        Assert.Equal("Alice", blame.Commits[0].AuthorName);
+        Assert.Equal("alice@example.com", blame.Commits[0].AuthorEmail);
+        Assert.Equal("first line", blame.Commits[0].Summary);
+        Assert.Equal(TimeSpan.FromHours(8), blame.Commits[0].AuthorDate.Offset);
+        Assert.Equal(TimeSpan.FromHours(-5), blame.Commits[1].AuthorDate.Offset);
+        Assert.False(blame.Commits[0].IsBoundary);
+    }
+
+    [Fact]
+    public async Task GetBlameAsync_MarksBoundaryCommitsAndUncommittedLines()
+    {
+        // 根提交(boundary)哈希带 ^ 前缀;工作树未提交更改落在 0000 哈希块。
+        var boundary = "^" + "cc".PadRight(40, 'c');
+        var zero = "0".PadLeft(40, '0');
+        var output = string.Join("\n",
+            boundary + " 3 1",
+            "author Root",
+            "author-mail <root@x>",
+            "author-time 1600000000",
+            "author-tz +0000",
+            "summary root commit",
+            "boundary",
+            "\tbase",
+            zero + " 2 2",
+            "author You",
+            "author-mail <you@x>",
+            "author-time 1700000001",
+            "author-tz +0000",
+            "summary Not committed yet",
+            "\tlocal edit",
+            "");
+
+        var runner = new FakeProcessRunner((_, _) => new Nornia.Core.Models.ProcessResult(0, output, string.Empty));
+        var blame = await new GitService(runner).GetBlameAsync(@"C:\repo", "file.txt");
+
+        Assert.Equal(2, blame.TotalLines);
+        Assert.True(blame.Commits[0].IsBoundary);
+        Assert.False(blame.Commits[1].IsBoundary);
+    }
+
+    [Fact]
+    public async Task GetBlameAsync_FailsClosedOnGitError()
+    {
+        var runner = new FakeProcessRunner((_, _) => new Nornia.Core.Models.ProcessResult(128, string.Empty, "fatal: no such path"));
+        var blame = await new GitService(runner).GetBlameAsync(@"C:\repo", "missing.txt");
+
+        Assert.Equal(GitBlame.Empty, blame);
+    }
+
+    [Fact]
+    public async Task GetFileLogAsync_RequestsFollowAndPathLimit()
+    {
+        var runner = new FakeProcessRunner((_, args) =>
+        {
+            Assert.Contains("--follow", args);
+            Assert.Contains("src/File.cs", args);
+            return new Nornia.Core.Models.ProcessResult(0, string.Empty, string.Empty);
+        });
+
+        await new GitService(runner).GetFileLogAsync(@"C:\repo", "src/File.cs", skip: 50);
+
+        Assert.Contains(runner.Calls, call =>
+            call.Arguments.Contains("--follow") && call.Arguments.Contains("--skip=50"));
     }
 }

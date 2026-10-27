@@ -1,4 +1,4 @@
-using Nornia.Desktop.Services;
+﻿using Nornia.Desktop.Services;
 
 namespace Nornia.Tests;
 
@@ -31,6 +31,12 @@ public sealed class FileContentWatcherTests : IDisposable
 
         public void BeginInvoke(Action action) => action();
 
+        public void BeginInvoke(Action action, UiDispatcherPriority priority) => action();
+        public bool IsHostAvailable => false;
+
+        public IUiTimer CreateTimer(TimeSpan interval, Action tick, UiDispatcherPriority priority = UiDispatcherPriority.Normal) =>
+            new WpfUiDispatcher().CreateTimer(interval, tick, priority);
+
         public Task InvokeAsync(Action action)
         {
             action();
@@ -46,6 +52,12 @@ public sealed class FileContentWatcherTests : IDisposable
         public bool CheckAccess() => false;
 
         public void BeginInvoke(Action action) => Invoked.Add(action);
+
+        public void BeginInvoke(Action action, UiDispatcherPriority priority) => Invoked.Add(action);
+        public bool IsHostAvailable => false;
+
+        public IUiTimer CreateTimer(TimeSpan interval, Action tick, UiDispatcherPriority priority = UiDispatcherPriority.Normal) =>
+            new WpfUiDispatcher().CreateTimer(interval, tick, priority);
 
         public Task InvokeAsync(Action action)
         {
@@ -73,6 +85,10 @@ public sealed class FileContentWatcherTests : IDisposable
             Thread.Sleep(15);
         }
     }
+
+    /// <summary>稳定性观察窗口:3 倍去抖时长(默认去抖 50ms),用于"不得有通知"的回归断言——
+    /// 若 Unwatch/Dispose 漏掉了注销,排队中的去抖回调会在这个窗口内落地并让断言变红。</summary>
+    private static void SettleAfterDebounce() => Thread.Sleep(150);
 
     [Fact]
     public void Watch_TargetedFile_IgnoresOtherFilesInSameDirectory()
@@ -115,8 +131,12 @@ public sealed class FileContentWatcherTests : IDisposable
         Assert.Equal(1, count); // the whole burst collapsed into one notification
     }
 
+    /// <summary>真实 FileSystemWatcher 的端到端路径:证明一次真实保存会被观察并带上正确路径。
+    /// 折叠语义(一次安静窗口只有一次通知)由 <see cref="BurstOfEvents_CollapsesIntoSingleNotification"/>
+    /// 在确定性路径上覆盖——真实写入可能派出多条原始事件且间隔不可控,在真实路径上死磕"恰好 1 次"
+    /// 只会带来抖动。</summary>
     [Fact]
-    public void RealFileSystemWrite_RaisesOnceAfterDebounce()
+    public void RealFileSystemWrite_IsObservedWithTheTargetPath()
     {
         using var watcher = CreateWatcher();
         var target = PathFrom(_tempDir, "real.txt");
@@ -131,14 +151,9 @@ public sealed class FileContentWatcherTests : IDisposable
 
         // A real save: write then replace with fresh content (Changed/Created bursts).
         File.WriteAllText(target, "v2");
-        var deadline = DateTime.UtcNow.AddSeconds(5);
-        while (count == 0 && DateTime.UtcNow < deadline)
-        {
-            Thread.Sleep(25);
-        }
+        WaitUntil(() => Volatile.Read(ref count) >= 1);
 
-        Thread.Sleep(300); // no further events → no further notifications
-        Assert.Equal(1, count);
+        Assert.True(Volatile.Read(ref count) >= 1, "真实文件保存未被观察");
     }
 
     [Fact]
@@ -149,24 +164,28 @@ public sealed class FileContentWatcherTests : IDisposable
         var count = 0;
         watcher.FileChanged += (_, _) => Interlocked.Increment(ref count);
         watcher.Watch(target);
-        Thread.Sleep(100); // let the per-directory watcher attach
 
-        File.WriteAllText(target, "new"); // Created
+        // FileSystemWatcher 的挂载是异步的:在它生效前写入会丢掉事件。与其 sleep 一个
+        // "应该够挂载了"的时长,不如重试写入直到观察到第一条通知。重试间隔必须大于去抖窗口
+        // (默认 50ms),否则每次写入都会把去抖定时器往后顺延,通知永远不会到期。
         var deadline = DateTime.UtcNow.AddSeconds(5);
-        while (count == 0 && DateTime.UtcNow < deadline)
+        while (Volatile.Read(ref count) == 0 && DateTime.UtcNow < deadline)
         {
-            Thread.Sleep(25);
+            File.WriteAllText(target, "new"); // Created
+            Thread.Sleep(120);
         }
 
-        Assert.Equal(1, count);
+        Assert.True(Volatile.Read(ref count) >= 1, "文件创建未被上报");
+
+        var beforeDelete = Volatile.Read(ref count);
         File.Delete(target); // Deleted
         deadline = DateTime.UtcNow.AddSeconds(5);
-        while (count < 2 && DateTime.UtcNow < deadline)
+        while (Volatile.Read(ref count) <= beforeDelete && DateTime.UtcNow < deadline)
         {
             Thread.Sleep(25);
         }
 
-        Assert.Equal(2, count);
+        Assert.True(Volatile.Read(ref count) > beforeDelete, "文件删除未被上报");
     }
 
     [Fact]
@@ -186,16 +205,18 @@ public sealed class FileContentWatcherTests : IDisposable
             }
         };
         watcher.Watch(target);
-        Thread.Sleep(100);
 
-        File.Move(temp, target, overwrite: true); // atomic save: rename temp → target
+        // 同上:重试原子替换直到观察到通知,而不是 sleep 等挂载窗口过去。
+        // 重试间隔(120ms)必须大于去抖窗口(50ms),否则定时器会被反复顺延。
         var deadline = DateTime.UtcNow.AddSeconds(5);
-        while (count == 0 && DateTime.UtcNow < deadline)
+        while (Volatile.Read(ref count) == 0 && DateTime.UtcNow < deadline)
         {
-            Thread.Sleep(25);
+            File.WriteAllText(temp, "v2");
+            File.Move(temp, target, overwrite: true); // atomic save: rename temp → target
+            Thread.Sleep(120);
         }
 
-        Assert.True(count >= 1, "atomic replace (rename onto target) must raise for the target path");
+        Assert.True(Volatile.Read(ref count) >= 1, "atomic replace (rename onto target) must raise for the target path");
     }
 
     [Fact]
@@ -235,7 +256,7 @@ public sealed class FileContentWatcherTests : IDisposable
         watcher.Unwatch(target); // idempotent
 
         watcher.HandleFileSystemEvent(target);
-        Thread.Sleep(300);
+        SettleAfterDebounce(); // 若 Unwatch 漏了注销,排队的去抖回调会在此窗口内落地
         Assert.Equal(0, count);
 
         // Re-watch after unwatch must work again.
@@ -262,7 +283,7 @@ public sealed class FileContentWatcherTests : IDisposable
 
         watcher.HandleFileSystemEvent(targetA);
         watcher.HandleFileSystemEvent(targetB);
-        Thread.Sleep(300);
+        SettleAfterDebounce(); // 若 Dispose 漏了注销,排队的去抖回调会在此窗口内落地
         Assert.Equal(0, count);
     }
 

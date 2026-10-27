@@ -48,5 +48,7 @@
   <data name="Provider_ScoopFailed" xml:space="preserve"><value>Scoop failed to {0} (exit {1}): {2}</value></data>
   <data name="Provider_ChocolateyFailed" xml:space="preserve"><value>Chocolatey failed to {0} (exit {1}): {2}</value></data>
   <data name="Rollback_InstallFailed" xml:space="preserve"><value>  Automatic install failed (Winget may not support downgrades): {0}. Follow the manual steps: {1}</value></data>
+  <data name="Rollback_UninstallFailed" xml:space="preserve"><value>  Automatic uninstall failed: {0}. Remove it manually: {1}</value></data>
+  <data name="Rollback_Completed" xml:space="preserve"><value>Rollback finished: {0} of {1} step(s) undone, {2} skipped, {3} failed.</value></data>
   <data name="Package_InstallNoVersion" xml:space="preserve"><value>  Installing {0} with {1}.</value></data>
 </root>

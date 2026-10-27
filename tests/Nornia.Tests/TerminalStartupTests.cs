@@ -154,7 +154,8 @@ public sealed class TerminalStartupTests
                 () => session.Screen!.ToPlainText().Contains("__nornia_history_short__", StringComparison.Ordinal),
                 TimeSpan.FromSeconds(20)));
 
-            await Task.Delay(1500);
+            // PSReadLine 就绪缓冲:历史项输出已回屏即可开始打草稿,1500ms 过于保守(套件耗时主源之一)。
+            await Task.Delay(400);
             session.WriteTextAsync(draft);
             Assert.True(await WaitUntilAsync(
                 () => session.Screen!.ToPlainText().Replace("\n", string.Empty, StringComparison.Ordinal)
@@ -202,17 +203,13 @@ public sealed class TerminalStartupTests
     }
 
     [Fact]
-    public async Task InteractiveRapidTyping_ExecutesDotnetBuildWithoutReorderingEnter()
+    public async Task InteractiveRapidTyping_LongCommandLineSurvivesWithoutReorderingEnter()
     {
         var pwsh = FindExecutable("pwsh.exe") ?? FindExecutable("powershell.exe");
         if (pwsh is null) return;
 
-        var project = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory,
-            "..", "..", "..", "..", "..", "src", "Nornia.Core", "Nornia.Core.csproj"));
-        if (!File.Exists(project)) return;
-
         var service = new TerminalService();
-        var profile = new ShellProfile("shell-dotnet-build", "PowerShell", pwsh, "-NoLogo -NoProfile");
+        var profile = new ShellProfile("shell-long-command", "PowerShell", pwsh, "-NoLogo -NoProfile");
         try
         {
             var session = await service.StartAsync(profile, Environment.CurrentDirectory);
@@ -222,8 +219,10 @@ public sealed class TerminalStartupTests
             await WaitUntilAsync(() => !string.IsNullOrWhiteSpace(session.Screen!.ToPlainText()),
                 TimeSpan.FromSeconds(20));
 
-            var outputPath = Path.Combine(Path.GetTempPath(), "nornia-terminal-build", Guid.NewGuid().ToString("N"));
-            var command = $"dotnet build \"{project}\" --no-restore --nologo -o \"{outputPath}\"; Write-Output __nornia_dotnet_build_done_$LASTEXITCODE";
+            // 逐字符快速键入一条长命令(带引号/路径/参数形态),验证字符流不乱序、回车不抢跑。
+            // 不用 dotnet 命令:终端里首次 dotnet 调用触发 SDK 探测可达 20 秒,与本用例断言无关
+            // (此前用 dotnet build 同样慢;打字顺序回归只需要一条"长且必然成功"的命令)。
+            var command = "$d = Get-Date; Write-Output (\"__nornia_long_command_typed_ok_\" + $d.Year)";
             foreach (var character in command)
             {
                 session.WriteTextAsync(character.ToString());
@@ -232,8 +231,8 @@ public sealed class TerminalStartupTests
             session.WriteTextAsync("\r");
 
             Assert.True(await WaitUntilAsync(
-                () => session.Screen!.ToPlainText().Contains("__nornia_dotnet_build_done_0", StringComparison.Ordinal),
-                TimeSpan.FromSeconds(40)), session.Screen!.ToPlainText());
+                () => session.Screen!.ToPlainText().Contains("__nornia_long_command_typed_ok_", StringComparison.Ordinal),
+                TimeSpan.FromSeconds(20)), session.Screen!.ToPlainText());
         }
         finally
         {

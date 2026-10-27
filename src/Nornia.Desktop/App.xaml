@@ -1,7 +1,9 @@
-<Application x:Class="Nornia.Desktop.App"
+﻿<Application x:Class="Nornia.Desktop.App"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
              xmlns:converters="clr-namespace:Nornia.Desktop.Converters"
+             xmlns:vm="clr-namespace:Nornia.Desktop.ViewModels"
+             xmlns:views="clr-namespace:Nornia.Desktop.Views"
              xmlns:icons="clr-namespace:Nornia.Desktop"
              xmlns:av="clr-namespace:ICSharpCode.AvalonEdit;assembly=ICSharpCode.AvalonEdit"
              xmlns:sys="clr-namespace:System;assembly=System.Runtime"
@@ -155,6 +157,29 @@
     <converters:LogLevelToGlyphConverter x:Key="LogLevelToGlyphConverter" />
     <converters:OutlineIndentConverter x:Key="OutlineIndentConverter" />
     <converters:DocumentTabVisibilityConverter x:Key="DocumentTabVisibilityConverter" />
+
+    <!-- 侧栏视图定位器:按页 VM 类型隐式匹配模板(等效此前 MainWindow 里的 if-else 链)。
+         新增一个带侧栏的页面只需在这里加一个 DataTemplate,不必再去改视图物化代码。
+         模板只声明视图类型:DataContext 由 MainWindow.MaterializeSidebarFor 设为页 VM 本身,
+         可见性由 SidebarVisibilityConverter 依据 MainViewModel.CurrentPage.Sidebar 判定。 -->
+    <DataTemplate DataType="{x:Type vm:EnvironmentManagementViewModel}">
+      <views:EnvironmentSidebarView />
+    </DataTemplate>
+    <DataTemplate DataType="{x:Type vm:ExplorerPageViewModel}">
+      <views:ExplorerSidebarView />
+    </DataTemplate>
+    <DataTemplate DataType="{x:Type vm:SearchViewModel}">
+      <views:SearchSidebarView />
+    </DataTemplate>
+    <DataTemplate DataType="{x:Type vm:GitViewModel}">
+      <views:GitView />
+    </DataTemplate>
+    <DataTemplate DataType="{x:Type vm:ProjectsViewModel}">
+      <views:ProjectsSidebarView />
+    </DataTemplate>
+    <DataTemplate DataType="{x:Type vm:SettingsEditorViewModel}">
+      <views:SettingsSidebarView />
+    </DataTemplate>
 
     <!-- Color tokens (WindowBrush … DiffLineNumberBrush) are defined in the active theme dictionary (Themes/*.xaml), merged above. -->
 

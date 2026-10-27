@@ -75,6 +75,7 @@ public sealed class GitViewModelTests : IDisposable
             git,
             new FakeFolderPicker { Result = _repoPath },
             confirmation,
+            new FakeTextPromptService(),
             new FakeProjectCatalog(),
             new EditorAreaViewModel(git, new FakeUiLogService()),
             Log,
@@ -172,6 +173,7 @@ public sealed class GitViewModelTests : IDisposable
             git,
             new FakeFolderPicker { Result = _repoPath },
             new FakeConfirmationService(),
+            new FakeTextPromptService(),
             new FakeProjectCatalog(),
             new EditorAreaViewModel(git, new FakeUiLogService()),
             Log,
@@ -213,6 +215,7 @@ public sealed class GitViewModelTests : IDisposable
             git,
             new FakeFolderPicker(),
             new FakeConfirmationService(),
+            new FakeTextPromptService(),
             new FakeProjectCatalog(),
             new EditorAreaViewModel(git, new FakeUiLogService()),
             Log,
@@ -492,16 +495,19 @@ public sealed class GitViewModelTests : IDisposable
     }
 
     [Fact]
-    public async Task WatcherChanges_MidFlightCatchUp_LandsWithinSnappyWindow()
+    public async Task WatcherChanges_MidFlightCatchUp_LandsWithinOneMinimumInterval()
     {
         // 更改栏"未及时监听到更改"的回归防线:落在静默刷新在途期间(或刚结束后的冷却窗内)的
-        // 变更,其补刷必须在"一个最小间隔 + 一次状态读取"内落地。旧的 2000ms 最小间隔让这条链
-        // 最长达到 3-4s;上限取 1900ms —— 新值(500ms)下最坏路径约 1.5s,旧值下最短也要 2000ms,
-        // 二者可区分。
+        // 变更,其补刷必须在"一个最小间隔 + 一次状态读取"内落地。旧实现把最小间隔写死为 2000ms,
+        // 让这条链最长达到 3-4s。
+        // 这里不再断言"跑得比 1900ms 快"(负载稍高的 CI 上必挂),而是把间隔注入成 50ms,
+        // 断言补刷在一个宽松的 1s 预算内落地 —— 若有人再把间隔写死回 2000ms,注入被忽略,
+        // 实测耗时必然突破 1s,回归仍会被抓住。
         var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var git = new FakeGitService { Status = SampleStatus(), DiffResult = SampleDiff(), StatusGate = gate.Task };
         var (viewModel, _, _, _, _) = Create(git);
         viewModel.RepositoryPath = _repoPath;
+        viewModel.QuietRefreshMinimumIntervalMs = 50;
 
         Watcher.RaiseChangesDetected(); // in-flight, blocked on the gate
         Watcher.RaiseChangesDetected(); // merges into the pending slot
@@ -509,16 +515,16 @@ public sealed class GitViewModelTests : IDisposable
 
         gate.SetResult();
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
-        var deadline = DateTime.UtcNow.AddSeconds(3);
+        var deadline = DateTime.UtcNow.AddSeconds(10);
         while (git.StatusRequests.Count < 2 && DateTime.UtcNow < deadline)
         {
-            await Task.Delay(10);
+            await Task.Delay(5);
         }
         stopwatch.Stop();
 
         Assert.Equal(2, git.StatusRequests.Count);
-        Assert.True(stopwatch.ElapsedMilliseconds < 1900,
-            $"mid-flight catch-up took {stopwatch.ElapsedMilliseconds}ms; expected < 1900ms (one minimum interval + one status)");
+        Assert.True(stopwatch.ElapsedMilliseconds < 1000,
+            $"mid-flight catch-up took {stopwatch.ElapsedMilliseconds}ms; expected < 1000ms with a 50ms interval");
     }
 
     [Fact]
@@ -538,7 +544,7 @@ public sealed class GitViewModelTests : IDisposable
         Watcher.RaiseChangesDetected(); // still inside the window — merges into the same pending slot
         Assert.Equal(before + 1, git.StatusRequests.Count);
 
-        var deadline = DateTime.UtcNow.AddSeconds(GitViewModel.QuietRefreshMinimumIntervalMs / 1000 + 3);
+        var deadline = DateTime.UtcNow.AddSeconds(viewModel.QuietRefreshMinimumIntervalMs / 1000 + 3);
         while (git.StatusRequests.Count < before + 2 && DateTime.UtcNow < deadline)
         {
             await Task.Delay(25);
@@ -550,24 +556,26 @@ public sealed class GitViewModelTests : IDisposable
     [Fact]
     public async Task WatcherDrivenSilentRefresh_ListsEveryUntrackedFileInNewFolders()
     {
-        // 新建文件夹中的新文件必须在静默(轻量)刷新里逐个列出:--untracked-files=normal 会把整个
-        // 新目录折叠成 "? dir/" 单条目,更改列表渲染成空名文件行,且无法对其中文件单独暂存/丢弃。
+        // 新建文件夹中的新文件必须在读取里逐个列出:--untracked-files=normal 会把整个新目录折叠成
+        // "? dir/" 单条目,更改列表渲染成空名文件行,且无法对其中文件单独暂存/丢弃。
         var git = new FakeGitService { Status = SampleStatus(), DiffResult = SampleDiff() };
         var (viewModel, _, _, _, _) = Create(git);
         viewModel.RepositoryPath = _repoPath;
 
         Watcher.RaiseChangesDetected(); // 首次:无已加载状态 → 全量加载
-        var deadline = DateTime.UtcNow.AddSeconds(GitViewModel.QuietRefreshMinimumIntervalMs / 1000 + 3);
+        var deadline = DateTime.UtcNow.AddSeconds(viewModel.QuietRefreshMinimumIntervalMs / 1000 + 3);
         while (viewModel.UnstagedChanges.Count == 0 && DateTime.UtcNow < deadline)
         {
             await Task.Delay(25);
         }
 
         Assert.True(viewModel.UnstagedChanges.Count > 0, "首次静默刷新未完成");
-        Assert.True(git.IncludeAllUntrackedRequests[0], "全量加载必须逐文件列出未跟踪内容");
+        // 首屏快路径先发 -unormal(见 GitViewModelTests.FirstLoad_CollapsedUntrackedDirectory_...):
+        // 该快照没有折叠任何未跟踪目录时与 -uall 逐条等价,因此这里已经是完整的列表。
+        Assert.False(git.StatusOptionRequests[0].IncludeAllUntracked, "首屏必须先发便宜的 -unormal 摘要");
 
         Watcher.RaiseChangesDetected(); // HEAD 未变 → 轻量静默刷新路径
-        deadline = DateTime.UtcNow.AddSeconds(GitViewModel.QuietRefreshMinimumIntervalMs / 1000 + 3);
+        deadline = DateTime.UtcNow.AddSeconds(viewModel.QuietRefreshMinimumIntervalMs / 1000 + 3);
         while (git.StatusRequests.Count < 2 && DateTime.UtcNow < deadline)
         {
             await Task.Delay(25);
@@ -576,6 +584,119 @@ public sealed class GitViewModelTests : IDisposable
         Assert.Equal(2, git.StatusRequests.Count);
         Assert.True(git.IncludeAllUntrackedRequests[^1],
             "轻量静默刷新不得折叠未跟踪目录:新建文件夹中的新文件必须以单文件出现在更改列表");
+    }
+
+    [Fact]
+    public async Task FirstLoad_CollapsedUntrackedDirectory_IsRefinedByAnAllUntrackedRead()
+    {
+        // 首屏用 -unormal:未跟踪目录会被折叠成 "? newdir/" 单条目。折叠条目不能作为最终状态发布
+        // (空名文件行,且无法单文件暂存/丢弃),所以同一轮之后必须补一次 -uall 静默刷新,把明细换成
+        // 逐文件条目;补齐读取不再允许写回索引(那是前台加载的责任)。
+        var git = new FakeGitService
+        {
+            Status = new GitRepositoryStatus(true, "main", null, 0, 0, [],
+            [
+                new GitFileChange("newdir/inner/n0.txt", GitChangeStatus.Unmodified, GitChangeStatus.Untracked),
+                new GitFileChange("notes/todo.txt", GitChangeStatus.Unmodified, GitChangeStatus.Untracked),
+            ]),
+            NormalUntrackedStatus = new GitRepositoryStatus(true, "main", null, 0, 0, [],
+            [
+                new GitFileChange("newdir/", GitChangeStatus.Unmodified, GitChangeStatus.Untracked),
+                new GitFileChange("notes/todo.txt", GitChangeStatus.Unmodified, GitChangeStatus.Untracked),
+            ]),
+        };
+        var (viewModel, _, _, _, _) = Create(git);
+        viewModel.RepositoryPath = _repoPath;
+
+        await viewModel.RefreshCommand.ExecuteAsync(null);
+
+        // 首屏快照里折叠的 newdir/ 不会发布(空名文件行);随后的一次静默刷新用 -uall 换成逐文件条目。
+        // 轮询只读 Count/集合计数:发布发生在没有同步上下文的续延线程上,枚举集合会撞上并发修改。
+        await WaitUntilAsync(() => viewModel.UnstagedChanges.Count == 2,
+            "折叠的未跟踪目录没有被 -uall 补齐");
+        Assert.DoesNotContain(viewModel.UnstagedChanges.ToArray(), change => change.Path == "newdir/");
+        Assert.Contains(viewModel.UnstagedChanges.ToArray(), change => change.Path == "newdir/inner/n0.txt");
+        Assert.Collection(
+            git.StatusOptionRequests,
+            first =>
+            {
+                Assert.False(first.IncludeAllUntracked);
+                Assert.True(first.AllowIndexWriteBack, "首屏读取必须允许 git 写回索引");
+            },
+            second =>
+            {
+                Assert.True(second.IncludeAllUntracked);
+                Assert.False(second.AllowIndexWriteBack);
+            });
+    }
+
+    [Fact]
+    public async Task FullLoad_AllowsIndexWriteBack_SilentRefreshDoesNot()
+    {
+        // 前台加载允许 git 把这次读取算出的 stat/哈希写回 .git/index:否则每次读取都要重算整棵工作树
+        // (实测 6 万跟踪文件、mtime 全部变化时每次约 4 秒,允许写回后第一次 4 秒、之后 0.1 秒)。
+        // 静默刷新不允许:它最高每 500ms 一次,自己写索引会被 watcher 反过来触发下一轮刷新。
+        var git = new FakeGitService { Status = SampleStatus(), DiffResult = SampleDiff() };
+        var (viewModel, _, _, _, _) = Create(git);
+        viewModel.RepositoryPath = _repoPath;
+
+        await viewModel.RefreshCommand.ExecuteAsync(null);
+
+        Assert.True(git.StatusOptionRequests[0].AllowIndexWriteBack);
+
+        Watcher.RaiseChangesDetected();
+        await WaitUntilAsync(() => git.StatusOptionRequests.Count >= 2, "静默刷新没有发生");
+        Assert.False(git.StatusOptionRequests[^1].AllowIndexWriteBack);
+    }
+
+    [Fact]
+    public async Task WatcherOverflow_DoesNotEscalateToFullLoad()
+    {
+        // watcher 缓冲溢出/监视器错误(isUnknown)只意味着"丢掉了具体路径",不代表 HEAD 移动:
+        // 状态读取本身就是权威快照,不该为此付出 status + 2×for-each-ref + log + stash + 两次
+        // range log 的全量代价。HEAD 真的移动时仍由 HEAD 签名比较升级(见
+        // SilentRefresh_HeadMoved_EscalatesToFullReload)。
+        var git = new FakeGitService { Status = SampleStatus(), DiffResult = SampleDiff() };
+        var (viewModel, _, _, _, _) = Create(git);
+        viewModel.RepositoryPath = _repoPath;
+        git.Logs = [new GitCommitInfo("a".PadRight(40, '0'), "aaaaaaa", "initial", null, "A", "a@x", DateTimeOffset.UtcNow)];
+        git.Branches = [new GitBranchInfo("main", true, "origin/main", 2, 1)];
+        await viewModel.RefreshCommand.ExecuteAsync(null);
+        Assert.Equal(1, git.LogCalls);
+        Assert.Equal(1, git.BranchCalls);
+
+        Watcher.RaiseChangesDetected(isUnknown: true);
+
+        await WaitUntilAsync(() => git.StatusRequests.Count >= 2, "溢出后的状态刷新没有发生");
+        Assert.Equal(1, git.LogCalls);
+        Assert.Equal(1, git.BranchCalls);
+        Assert.Equal(1, git.StashListCalls);
+    }
+
+    [Fact]
+    public async Task FileSystemMonitorSetting_PassesCoreFsmonitorToStatusReads()
+    {
+        // git.fsmonitor 默认关闭:打开它意味着 git 会为该仓库启动后台监视守护进程
+        // (git fsmonitor--daemon + .git/fsmonitor--daemon),必须由用户显式选择。
+        var git = new FakeGitService { Status = SampleStatus(), DiffResult = SampleDiff() };
+        var (viewModel, _, settings, _, _) = Create(git);
+        // 设置会话由首次激活打开(BindScopedSettingsAsync),之后提交的设置变更才会到达 VM。
+        await viewModel.ActivateAsync();
+        viewModel.RepositoryPath = _repoPath;
+        await viewModel.RefreshCommand.ExecuteAsync(null);
+        Assert.DoesNotContain(git.StatusOptionRequests, options => options.EnableFileSystemMonitor);
+
+        var baseline = await settings.GetSnapshotAsync(new Nornia.Desktop.Configuration.SettingsContext());
+        var commit = await settings.CommitAsync(Nornia.Desktop.Configuration.SettingsTransaction.Set(
+            baseline,
+            Nornia.Desktop.Configuration.SettingScope.User,
+            Nornia.Desktop.Configuration.BuiltInSettingsCatalog.GitFileSystemMonitor,
+            true));
+        Assert.Equal(Nornia.Desktop.Configuration.SettingsCommitStatus.Success, commit.Status);
+
+        await WaitUntilAsync(
+            () => git.StatusOptionRequests.Any(options => options.EnableFileSystemMonitor),
+            "打开 git.fsmonitor 后 status 读取没有带上 -c core.fsmonitor=true");
     }
 
     [Fact]
@@ -607,6 +728,7 @@ public sealed class GitViewModelTests : IDisposable
             git,
             new FakeFolderPicker { Result = _repoPath },
             new FakeConfirmationService(),
+            new FakeTextPromptService(),
             new FakeProjectCatalog(),
             new EditorAreaViewModel(git, new FakeUiLogService()),
             new FakeUiLogService(),
@@ -760,6 +882,28 @@ public sealed class GitViewModelTests : IDisposable
 
         Assert.Equal(_repoPath, viewModel.RepositoryPath);
         Assert.Contains(_repoPath, git.StatusRequests);
+    }
+
+    [Fact]
+    public async Task ExpandingLargeCommit_PublishesFilesOnceAndReusesCache()
+    {
+        var (vm, git, _, _, _) = Create();
+        vm.RepositoryPath = _repoPath;
+        git.Logs = [new GitCommitInfo("b".PadRight(40, '0'), "bbbbbbb", "large", null, "A", "a@x", DateTimeOffset.UtcNow)];
+        git.CommitFiles = Enumerable.Range(0, 5000).Select(i =>
+            new GitFileChange($"src/file{i:D5}.cs", GitChangeStatus.Modified, GitChangeStatus.Unmodified)).ToArray();
+        await vm.RefreshCommand.ExecuteAsync(null);
+        var row = vm.LogRows[^1];
+        var notifications = 0;
+        row.Files.CollectionChanged += (_, _) => notifications++;
+        await vm.ToggleLogRowCommand.ExecuteAsync(row);
+        Assert.Equal(5000, row.Files.Count);
+        Assert.Equal(1, notifications);
+        Assert.Same(row, row.Files[^1].Row);
+        await vm.ToggleLogRowCommand.ExecuteAsync(row);
+        await vm.ToggleLogRowCommand.ExecuteAsync(row);
+        Assert.Equal(1, git.CommitFileListCalls);
+        Assert.Equal(1, notifications);
     }
 
     [Fact]
@@ -1331,6 +1475,44 @@ public sealed class GitViewModelTests : IDisposable
     }
 
     [Fact]
+    public async Task ToggleFolder_LargeSubtree_BatchesNotificationsAndKeepsOtherRows()
+    {
+        var git = new FakeGitService
+        {
+            Status = SampleStatus() with
+            {
+                UnstagedChanges = Enumerable.Range(0, 5000)
+                    .Select(i => new GitFileChange($"large/file{i:D5}.cs", GitChangeStatus.Unmodified, GitChangeStatus.Modified))
+                    .Append(new GitFileChange("other/keep.cs", GitChangeStatus.Unmodified, GitChangeStatus.Modified)).ToArray()
+            }
+        };
+        var (vm, _, _, _, _) = Create(git);
+        vm.RepositoryPath = _repoPath;
+        // 本测试的主题是「一次目录展开只发一次通知」,不是渲染预算;把预算抬到覆盖 5000 行,
+        // 否则被测的是「显示更多」而不是批量化(预算本身由 ScmLargeChangesDegradationTests 覆盖)。
+        vm.TreeRowRenderLimit = 8_192;
+        await vm.RefreshCommand.ExecuteAsync(null);
+        var folder = vm.UnstagedTreeRows.OfType<ScmFolderNode>().Single(x => x.Name == "large");
+        var unaffected = vm.UnstagedTreeRows.OfType<ScmFileNode>().Single(x => x.Change.Path == "other/keep.cs");
+        var staged = vm.StagedTreeRows.ToArray();
+        var changes = 0;
+        var stagedChanges = 0;
+        vm.UnstagedTreeRows.CollectionChanged += (_, _) => changes++;
+        vm.StagedTreeRows.CollectionChanged += (_, _) => stagedChanges++;
+
+        vm.ToggleFolderCommand.Execute(folder);
+        Assert.Equal(3, vm.UnstagedTreeRows.Count);
+        Assert.Equal(1, changes);
+        Assert.Same(unaffected, vm.UnstagedTreeRows.OfType<ScmFileNode>().Single());
+        vm.ToggleFolderCommand.Execute(folder);
+        Assert.Equal(5003, vm.UnstagedTreeRows.Count);
+        Assert.Equal(2, changes);
+        Assert.Equal(0, stagedChanges);
+        Assert.Same(staged[0], vm.StagedTreeRows[0]);
+        Assert.Same(unaffected, vm.UnstagedTreeRows.Last());
+    }
+
+    [Fact]
     public async Task ToggleFolder_CollapsesAndExpandsTreeDirectory()
     {
         var (viewModel, _, _, _, _) = Create();
@@ -1458,6 +1640,7 @@ public sealed class GitViewModelTests : IDisposable
         new FakeGitService { Status = SampleStatus(), DiffResult = SampleDiff() },
         new FakeFolderPicker { Result = _repoPath },
         new FakeConfirmationService(),
+        new FakeTextPromptService(),
         new FakeProjectCatalog(),
         editor,
         Log,
@@ -1945,5 +2128,41 @@ public sealed class GitViewModelTests : IDisposable
         // CommandParameter 绑定失败的旧缺陷形态:参数为 null → 静默返回(无确认、无删除)。
         Assert.Equal(0, confirmation.Calls);
         Assert.Empty(git.DeletedTags);
+    }
+
+    [Fact]
+    public async Task OpenFileHistory_LoadsFirstPageAndSignalsMore()
+    {
+        var (viewModel, git, _, _, _) = Create();
+        viewModel.RepositoryPath = _repoPath;
+        git.Logs = Enumerable.Range(0, 60).Select(i =>
+            new GitCommitInfo(i.ToString().PadLeft(40, '0'), i.ToString("d7"), $"c{i}", null, "A", "a@x", DateTimeOffset.UtcNow)).ToArray();
+        await viewModel.RefreshCommand.ExecuteAsync(null); // IsRepository 由状态装载置位
+
+        await viewModel.OpenFileHistoryCommand.ExecuteAsync(new GitChangeItem(new GitFileChange("src/A.cs", GitChangeStatus.Modified, GitChangeStatus.Unmodified)));
+
+        Assert.True(viewModel.HasFileHistory);
+        Assert.Equal("src/A.cs", viewModel.FileHistoryPath);
+        Assert.Equal(50, viewModel.FileHistoryCommits.Count); // 页大小 50
+        Assert.True(viewModel.CanLoadMoreFileHistory);
+
+        await viewModel.LoadMoreFileHistoryCommand.ExecuteAsync(null);
+        Assert.Equal(60, viewModel.FileHistoryCommits.Count); // 60 条全量到货
+        Assert.False(viewModel.CanLoadMoreFileHistory);
+
+        viewModel.CloseFileHistoryCommand.Execute(null);
+        Assert.False(viewModel.HasFileHistory);
+        Assert.Empty(viewModel.FileHistoryCommits);
+    }
+
+    [Fact]
+    public async Task OpenFileHistory_RequiresRepository()
+    {
+        var (viewModel, _, _, _, _) = Create();
+
+        await viewModel.OpenFileHistoryCommand.ExecuteAsync(new GitChangeItem(new GitFileChange("a.cs", GitChangeStatus.Modified, GitChangeStatus.Unmodified)));
+
+        // 无仓库:静默返回,分区不出现。
+        Assert.False(viewModel.HasFileHistory);
     }
 }

@@ -48,9 +48,16 @@ public sealed class AppDataCacheServiceTests : IDisposable
     [Fact]
     public async Task ConcurrentScans_ShareOneInFlightWalk()
     {
+        // 目录要大到"首次 walk 不可能在两次参数求值之间跑完"。此前只放一个文件:池线程有时能在
+        // ScanForcedAsync() 与下一个参数之间把整棵树的 walk 跑完并清空 _scanInFlight,
+        // 于是第二次调用另起一次 walk,返回另一个结果实例 —— Assert.Same 在负载下随机变红。
         var cachePath = Path.Combine(_root, ".cache");
         Directory.CreateDirectory(cachePath);
-        await File.WriteAllTextAsync(Path.Combine(cachePath, "item.bin"), "cache-data");
+        for (var i = 0; i < 300; i++)
+        {
+            await File.WriteAllTextAsync(Path.Combine(cachePath, $"item{i:D3}.bin"), "cache-data");
+        }
+
         var service = new AppDataCacheService([_root]);
 
         var scans = await Task.WhenAll(

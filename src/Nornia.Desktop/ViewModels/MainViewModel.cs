@@ -1,4 +1,4 @@
-using CommunityToolkit.Mvvm.ComponentModel;
+﻿using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using Nornia.Desktop.Code;
 using Nornia.Desktop.Commands;
@@ -12,7 +12,6 @@ using System.Globalization;
 using System.IO;
 using System.Windows;
 using System.Windows.Data;
-using System.Windows.Threading;
 
 namespace Nornia.Desktop.ViewModels;
 
@@ -23,6 +22,10 @@ public partial class MainViewModel : ObservableObject
     public CommandAccessor Commands { get; } = new();
     private readonly IUiLogService _logService;
     private readonly IClipboardService _clipboard;
+    private readonly IMessageService _messageService;
+    /// <summary>UI 线程调度抽象(空闲预热、面板筛选去抖)。不要直接读
+    /// <c>Application.Current.Dispatcher</c> / <c>Dispatcher.CurrentDispatcher</c>。</summary>
+    private readonly IUiDispatcher _uiDispatcher = new WpfUiDispatcher();
     private readonly BulkObservableCollection<UiLogEntry> _problemEntries = [];
     private readonly IDesktopNavigationService _navigationService;
     private readonly EnvironmentManagementViewModel? _environment;
@@ -65,11 +68,13 @@ public partial class MainViewModel : ObservableObject
         TerminalViewModel terminal,
         IUiLogService logService,
         IDesktopNavigationService navigationService,
+        IMessageService messageService,
         IClipboardService clipboard,
         SearchViewModel? search = null)
     {
         _logService = logService;
         _clipboard = clipboard;
+        _messageService = messageService;
         _navigationService = navigationService;
         _environment = environment;
         _explorer = explorer;
@@ -93,6 +98,12 @@ public partial class MainViewModel : ObservableObject
         }
         Initialize(navigationItems);
         Terminal = terminal;
+        // 通知中心底座:各页 VM 的操作失败终态 → 右上角 toast(状态栏一行文字易被忽略)。
+        foreach (var page in new PageViewModel?[] { explorer, git, projects, environment, settings, search })
+        {
+            if (page is null) continue;
+            page.OperationFailed += (_, e) => ShowNotification($"{e.Operation}失败", e.Message);
+        }
         // The terminal is a shell-level bottom panel now (no workbench page owns it); discover its
         // profiles once at startup.
         _ = ActivatePageSafelyAsync(terminal);
@@ -137,8 +148,9 @@ public partial class MainViewModel : ObservableObject
         _preloading = true;
         try
         {
-            var dispatcher = Application.Current?.Dispatcher ?? Dispatcher.CurrentDispatcher;
-            await dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle);
+            // 让出一帧空闲,保证首屏交互先于页面预热。抽象在无 WPF 宿主(单测)时内联执行,
+            // 不会像 Dispatcher.CurrentDispatcher 那样在没有消息泵的线程上永远等不到回调。
+            await _uiDispatcher.InvokeAsync(() => { }, UiDispatcherPriority.ApplicationIdle);
 
             var pages = NavigationItems.Select(item => item.Page).Distinct().ToArray();
             if (pages.Length == 0) return;
@@ -150,7 +162,7 @@ public partial class MainViewModel : ObservableObject
                 _preloadCancellation.Token.ThrowIfCancellationRequested();
                 // Yield between pages so layout/input/rendering gets a chance to run. This is
                 // intentionally a UI-idle continuation rather than a tight sequential loop.
-                await dispatcher.InvokeAsync(() => { }, DispatcherPriority.ApplicationIdle);
+                await _uiDispatcher.InvokeAsync(() => { }, UiDispatcherPriority.ApplicationIdle);
                 await page.ActivateAsync();
             }
         }
@@ -176,6 +188,8 @@ public partial class MainViewModel : ObservableObject
     {
         _logService = logService;
         _clipboard = clipboard;
+        // 兼容构造器没有宿主可供注入：直接给出真实实现，避免 About 在这条路径上变成静默空操作。
+        _messageService = new MessageService();
         _navigationService = navigationService;
         _settings = settings;
         Initialize([
@@ -230,7 +244,7 @@ public partial class MainViewModel : ObservableObject
 
     // Debounce log-search filter refresh so each keystroke does not O(n) re-evaluate
     // both ListCollectionView views (the terminal buffer can hold 200k+ characters).
-    private DispatcherTimer? _searchDebounceTimer;
+    private IUiTimer? _searchDebounceTimer;
     private WorkbenchPanel _previousPanel = WorkbenchPanel.Output;
     private static readonly TimeSpan SearchDebounceDelay = TimeSpan.FromMilliseconds(180);
 
@@ -605,12 +619,12 @@ public partial class MainViewModel : ObservableObject
     private void OpenProjectDirectory() => _ = _explorer?.ChooseProjectCommand?.ExecuteAsync(null);
 
     [RelayCommand]
-    private static void About() =>
-        System.Windows.MessageBox.Show(
-            "Nornia —— Windows 原生的精简开发工作台。\n基于 WPF/MVVM，外壳仿 VS Code（活动栏 / 侧栏 / 标签条 / 面板 / 状态栏）。",
+    private void About() =>
+        // 经 IMessageService 而不是直接 MessageBox：ViewModel 不依赖 WPF 窗口基础设施，
+        // 无 UI 宿主时也能用替身断言"确实提示了"。
+        _messageService.ShowInformation(
             "关于 Nornia",
-            System.Windows.MessageBoxButton.OK,
-            System.Windows.MessageBoxImage.Information);
+            "Nornia —— Windows 原生的精简开发工作台。\n基于 WPF/MVVM，外壳仿 VS Code（活动栏 / 侧栏 / 标签条 / 面板 / 状态栏）。");
 
     // ===== QuickInput overlay: command palette (Ctrl+Shift+P) / quick open (Ctrl+P) =====
 
@@ -659,6 +673,139 @@ public partial class MainViewModel : ObservableObject
         }
     }
 
+    /// <summary>状态栏编码选择器(VS Code "Reopen with Encoding" 的只读等价物):按所选编码
+    /// 强制重新解码当前文件(自动 = BOM→严格 UTF-8→GB18030)。仅文件标签,二进制除外。</summary>
+    public void OpenEncodingPicker(EditorTabItem? tab)
+    {
+        if (tab is not FilePreviewTab preview || preview.IsBinary)
+        {
+            return;
+        }
+
+        DetachQuickOpenPrefixMode();
+        var current = preview.ForcedEncodingWebName;
+        QuickInput.Open("选择编码（重新解码）",
+        [
+            Option("自动检测", "BOM → 严格 UTF-8 → GB18030", null),
+            Option("UTF-8", "无 BOM UTF-8", "utf-8"),
+            Option("GB18030", "简体中文遗留内容", "gb18030"),
+            Option("UTF-16 LE", "小端 UTF-16", "utf-16"),
+            Option("UTF-16 BE", "大端 UTF-16", "utf-16be"),
+        ]);
+
+        QuickPickItem Option(string title, string description, string? webName) => new(
+            title + (string.Equals(current, webName, StringComparison.OrdinalIgnoreCase) ? "（当前）" : string.Empty),
+            description,
+            Codicons.Eye,
+            () => preview.SetEncodingCommand.Execute(webName));
+    }
+
+    /// <summary>命令面板入口:查看当前编辑文件的提交历史(切到 Git 页打开文件历史分区;
+    /// 文件不在仓库内时静默返回)。</summary>
+    [RelayCommand]
+    private void ShowActiveFileHistory()
+    {
+        if (_git is null || !_git.IsRepository || _explorer?.Editor.SelectedTab is not FilePreviewTab tab)
+        {
+            return;
+        }
+
+        string relative;
+        try
+        {
+            relative = Path.GetRelativePath(Path.GetFullPath(_git.RepositoryPath), Path.GetFullPath(tab.Path));
+        }
+        catch (Exception ex) when (ex is ArgumentException or IOException or NotSupportedException)
+        {
+            return;
+        }
+
+        if (relative.Length == 0 || relative.StartsWith("..", StringComparison.Ordinal) || Path.IsPathRooted(relative))
+        {
+            return;
+        }
+
+        SelectNavigationItem(NavigationTargets.Git);
+        _git.OpenFileHistoryForPath(relative.Replace('\\', '/'));
+    }
+
+    /// <summary>Esc 统一退层(窗口级兜底,视图层未消费时):QuickInput → 活动标签的跳转行 → 查找框。
+    /// 返回是否关闭了某层(决定按键是否标记已消费)。终端的 Esc 不属于这里。</summary>
+    public bool DismissTopLayer()
+    {
+        if (QuickInput.IsOpen)
+        {
+            QuickInput.Close();
+            return true;
+        }
+
+        switch (Workbench?.Editor.SelectedTab)
+        {
+            case FilePreviewTab { IsGoToLineBarOpen: true } preview:
+                preview.IsGoToLineBarOpen = false;
+                return true;
+            case FilePreviewTab { IsFindBarOpen: true } previewFind:
+                previewFind.ClearSearchCommand.Execute(null);
+                return true;
+            case DiffTab { IsFindBarOpen: true } diff:
+                diff.IsFindBarOpen = false;
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /// <summary>标签溢出菜单 + 命令面板:按最近使用列出全部打开的编辑器(回车激活)。</summary>
+    [RelayCommand]
+    private void ShowAllEditors() => ShowEditorMruSwitcher(true);
+
+    // ===== 通知 toast(底座):容量受限、8 秒自动消失、点击关闭;不引入历史面板(Output 已有)。 =====
+
+    /// <summary>一条 toast 通知(Level: error/warning/info,决定卡片描边色)。</summary>
+    public sealed record AppNotification(string Level, string Title, string Message, DateTimeOffset When);
+
+    /// <summary>同时可见的 toast 上限(超出挤掉最旧的,不堆积遮挡)。</summary>
+    private const int NotificationCapacity = 3;
+
+    private static readonly TimeSpan NotificationLifetime = TimeSpan.FromSeconds(8);
+
+    public BulkObservableCollection<AppNotification> Notifications { get; } = [];
+
+    public void ShowNotification(string title, string message, string level = "error")
+    {
+        void Publish()
+        {
+            while (Notifications.Count >= NotificationCapacity)
+            {
+                Notifications.RemoveAt(0);
+            }
+
+            var notification = new AppNotification(level, title, message, DateTimeOffset.Now);
+            Notifications.Add(notification);
+            _ = Task.Delay(NotificationLifetime).ContinueWith(
+                _ => _uiDispatcher.InvokeAsync(() => Notifications.Remove(notification)),
+                TaskScheduler.Default);
+        }
+
+        if (!_uiDispatcher.CheckAccess())
+        {
+            _ = _uiDispatcher.InvokeAsync(Publish);
+        }
+        else
+        {
+            Publish();
+        }
+    }
+
+    [RelayCommand]
+    private void DismissNotification(AppNotification? notification)
+    {
+        if (notification is not null)
+        {
+            Notifications.Remove(notification);
+        }
+    }
+
     /// <summary>状态栏语言选择器(VS Code"更改语言模式"):QuickInput 枚举全部已注册语言,
     /// 选中即切换当前标签的解析/高亮类型。</summary>
     public void OpenLanguagePicker(EditorTabItem? tab)
@@ -696,8 +843,9 @@ public partial class MainViewModel : ObservableObject
         QuickInput.FilterText = "@";
     }
 
-    /// <summary>快速打开的前缀模式(VS Code quickAccess):'@' 切到当前文件符号、':' 切到行号,
-    /// 其余为文件。前缀保留在输入框,过滤随模式联动;关闭时自动解绑。</summary>
+    /// <summary>快速打开的前缀模式(VS Code quickAccess):'@' 切到当前文件符号、':' 切到行号、
+    /// '&gt;' 切到命令面板、'?' 切到模式帮助,其余为文件。前缀保留在输入框,过滤随模式联动
+    /// (QuickInput.ModePrefix 剥离引导字符后再打分);关闭时自动解绑。</summary>
     private QuickOpenSession? _quickOpenSession;
 
     private sealed class QuickOpenSession
@@ -705,10 +853,12 @@ public partial class MainViewModel : ObservableObject
         public required QuickPickItem[] FileItems { get; set; }
         public required QuickPickItem[] SymbolItems { get; init; }
         public required QuickPickItem[] LineItems { get; init; }
+        public required QuickPickItem[] CommandItems { get; init; }
+        public required QuickPickItem[] HelpItems { get; init; }
         public QuickOpenUiMode Mode { get; set; } = QuickOpenUiMode.File;
     }
 
-    private enum QuickOpenUiMode { File, Symbol, Line }
+    private enum QuickOpenUiMode { File, Symbol, Line, Command, Help }
 
     /// <summary>把当前已经打开的 QuickInput(文件/符号)接入前缀模式切换;关闭时自动解绑。</summary>
     private void AttachQuickOpenPrefixMode()
@@ -730,6 +880,18 @@ public partial class MainViewModel : ObservableObject
                 new QuickPickItem("转到行…", "输入行号（如 42 或 42,16）· Enter 定位", Codicons.GoToFile,
                     () => ExecuteQuickOpenGotoLine()),
             ],
+            CommandItems = [.. BuildPaletteItems()],
+            HelpItems =
+            [
+                new QuickPickItem("按名称打开文件", "直接输入文件名（Ctrl+P）", Codicons.GoToFile,
+                    () => QuickInput.FilterText = string.Empty),
+                new QuickPickItem("> 转到命令", "查看并运行所有命令（Ctrl+Shift+P）", Codicons.Menu,
+                    () => QuickInput.FilterText = ">"),
+                new QuickPickItem("@ 转到符号", "当前文件的大纲符号（Ctrl+Shift+O）", Codicons.SymbolFile,
+                    () => QuickInput.FilterText = "@"),
+                new QuickPickItem(": 转到行", "输入行号或 行,列（Ctrl+G）", Codicons.GoToFile,
+                    () => QuickInput.FilterText = ":"),
+            ],
         };
         QuickInput.PropertyChanged += OnQuickInputForPrefixChanged;
     }
@@ -737,6 +899,7 @@ public partial class MainViewModel : ObservableObject
     private void DetachQuickOpenPrefixMode()
     {
         QuickInput.PropertyChanged -= OnQuickInputForPrefixChanged;
+        QuickInput.ModePrefix = null;
         _quickOpenSession = null;
     }
 
@@ -768,17 +931,31 @@ public partial class MainViewModel : ObservableObject
         var trimmed = (QuickInput.FilterText ?? string.Empty).TrimStart();
         var mode = trimmed.Length > 0 && trimmed[0] == '@'
             ? QuickOpenUiMode.Symbol
-            : trimmed.Length > 0 && trimmed[0] == ':' ? QuickOpenUiMode.Line : QuickOpenUiMode.File;
+            : trimmed.Length > 0 && trimmed[0] == ':' ? QuickOpenUiMode.Line
+            : trimmed.Length > 0 && trimmed[0] == '>' ? QuickOpenUiMode.Command
+            : trimmed.Length > 0 && trimmed[0] == '?' ? QuickOpenUiMode.Help
+            : QuickOpenUiMode.File;
         if (mode == session.Mode)
         {
             return;
         }
 
         session.Mode = mode;
+        // 引导字符随模式联动:打分前剥离,行项目标题无需携带前缀。
+        QuickInput.ModePrefix = mode switch
+        {
+            QuickOpenUiMode.Symbol => '@',
+            QuickOpenUiMode.Line => ':',
+            QuickOpenUiMode.Command => '>',
+            QuickOpenUiMode.Help => '?',
+            _ => null,
+        };
         QuickInput.ReplaceItems(mode switch
         {
             QuickOpenUiMode.Symbol => session.SymbolItems,
             QuickOpenUiMode.Line => session.LineItems,
+            QuickOpenUiMode.Command => session.CommandItems,
+            QuickOpenUiMode.Help => session.HelpItems,
             _ => session.FileItems,
         });
     }
@@ -1153,7 +1330,25 @@ public partial class MainViewModel : ObservableObject
         }
     }
 
-    private void OnWorkspaceFilesChanged(object? sender, EventArgs e) => InvalidateQuickOpenCache();
+    private CancellationTokenSource? _quickOpenInvalidationDebounce;
+
+    /// <summary>文件事件风暴去抖(保存/构建会连续触发 watcher):1.5 秒静默后才真正失效快速打开
+    /// 缓存——失效本身 O(1),收益是避免风暴期间反复打断进行中的后台索引任务。</summary>
+    private void OnWorkspaceFilesChanged(object? sender, EventArgs e)
+    {
+        _quickOpenInvalidationDebounce?.Cancel();
+        _quickOpenInvalidationDebounce = new CancellationTokenSource();
+        var token = _quickOpenInvalidationDebounce.Token;
+        _ = Task.Delay(TimeSpan.FromSeconds(1.5)).ContinueWith(
+            _ =>
+            {
+                if (!token.IsCancellationRequested)
+                {
+                    InvalidateQuickOpenCache();
+                }
+            },
+            TaskScheduler.Default);
+    }
 
     private void InvalidateQuickOpenCache()
     {
@@ -1387,26 +1582,22 @@ public partial class MainViewModel : ObservableObject
     partial void OnPanelSearchTextChanged(string value)
     {
         _searchDebounceTimer?.Stop();
-        if (System.Windows.Application.Current?.Dispatcher is { } dispatcher)
+        if (!_uiDispatcher.IsHostAvailable)
         {
-            if (_searchDebounceTimer is null)
-            {
-                _searchDebounceTimer = new DispatcherTimer(DispatcherPriority.Input, dispatcher)
-                {
-                    Interval = SearchDebounceDelay
-                };
-                _searchDebounceTimer.Tick += (_, _) =>
-                {
-                    _searchDebounceTimer!.Stop();
-                    RefreshPanelFilter();
-                };
-            }
-            _searchDebounceTimer.Start();
-        }
-        else
-        {
+            // 无 UI 宿主(单测)时没有消息泵可承载定时器:直接刷新,保持"立即生效"的语义。
             RefreshPanelFilter();
+            return;
         }
+
+        _searchDebounceTimer ??= _uiDispatcher.CreateTimer(
+            SearchDebounceDelay,
+            () =>
+            {
+                _searchDebounceTimer?.Stop();
+                RefreshPanelFilter();
+            },
+            UiDispatcherPriority.Input);
+        _searchDebounceTimer.Start();
     }
     partial void OnPanelLevelFilterChanged(LogPanelLevelFilter value) => RefreshPanelFilter();
 

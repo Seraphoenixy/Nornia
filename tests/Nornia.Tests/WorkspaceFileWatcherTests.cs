@@ -1,4 +1,4 @@
-using Nornia.Desktop.Services;
+﻿using Nornia.Desktop.Services;
 
 namespace Nornia.Tests;
 
@@ -34,6 +34,12 @@ public sealed class WorkspaceFileWatcherTests : IDisposable
 
         public void BeginInvoke(Action action) => action();
 
+        public void BeginInvoke(Action action, UiDispatcherPriority priority) => action();
+        public bool IsHostAvailable => false;
+
+        public IUiTimer CreateTimer(TimeSpan interval, Action tick, UiDispatcherPriority priority = UiDispatcherPriority.Normal) =>
+            new WpfUiDispatcher().CreateTimer(interval, tick, priority);
+
         public Task InvokeAsync(Action action)
         {
             action();
@@ -42,7 +48,24 @@ public sealed class WorkspaceFileWatcherTests : IDisposable
     }
 
     private WorkspaceFileWatcher CreateWatcher(TimeSpan? debounce = null) =>
-        new(new InlineDispatcher(), debounce ?? TimeSpan.FromMilliseconds(50));
+        new(new InlineDispatcher(), debounce ?? DefaultTestDebounce);
+
+    private static readonly TimeSpan DefaultTestDebounce = TimeSpan.FromMilliseconds(50);
+
+    /// <summary>去抖回调在线程池上排队,固定 sleep 在满负载 CI 上会失效;统一轮询到条件满足再断言。</summary>
+    private static async Task WaitUntilAsync(Func<bool> condition, string message, int timeoutMs = 5_000)
+    {
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        while (!condition() && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(15);
+        }
+
+        Assert.True(condition(), message);
+    }
+
+    /// <summary>稳定性观察窗口:3 倍去抖时长,用于"不得出现额外通知"的断言。</summary>
+    private static Task SettleAsync(TimeSpan debounce) => Task.Delay(debounce * 3);
 
     [Fact]
     public void DefaultDebounceInterval_MatchesScmWatcher() =>
@@ -67,7 +90,8 @@ public sealed class WorkspaceFileWatcherTests : IDisposable
         }
 
         Assert.Equal(0, count); // still inside the debounce window
-        await Task.Delay(400);
+        await WaitUntilAsync(() => Volatile.Read(ref count) > 0, "去抖后未收到通知");
+        await SettleAsync(DefaultTestDebounce); // settle: 整批事件必须只折叠成一次通知
 
         Assert.Equal(1, count); // the whole burst collapsed into one notification
         Assert.Equal(Path.GetFullPath(_root), captured!.RootPath);
@@ -77,7 +101,8 @@ public sealed class WorkspaceFileWatcherTests : IDisposable
     [Fact]
     public async Task FileSystemCreatesAndDeletes_AreReportedAfterDebounce()
     {
-        using var watcher = CreateWatcher(debounce: TimeSpan.FromMilliseconds(300));
+        var debounce = TimeSpan.FromMilliseconds(300);
+        using var watcher = CreateWatcher(debounce: debounce);
         var raises = new List<IReadOnlySet<string>>();
         watcher.FilesChanged += (_, args) => raises.Add(args.ChangedPaths);
         watcher.Attach(_root);
@@ -85,24 +110,16 @@ public sealed class WorkspaceFileWatcherTests : IDisposable
         File.WriteAllText(Path.Combine(_root, "burst0.txt"), "content");
         File.WriteAllText(Path.Combine(_root, "burst1.txt"), "content");
 
-        var deadline = DateTime.UtcNow.AddSeconds(5);
-        while (raises.Count == 0 && DateTime.UtcNow < deadline)
-        {
-            await Task.Delay(25);
-        }
+        await WaitUntilAsync(() => raises.Count > 0, "真实文件创建后未收到通知");
 
-        await Task.Delay(700); // settle: the burst must not fragment into further raises
+        await SettleAsync(debounce); // settle: the burst must not fragment into further raises
         Assert.Single(raises);
         Assert.Contains(raises[0], p => p.EndsWith("burst0.txt", StringComparison.OrdinalIgnoreCase));
         Assert.Contains(raises[0], p => p.EndsWith("burst1.txt", StringComparison.OrdinalIgnoreCase));
 
         File.Delete(Path.Combine(_root, "burst0.txt"));
         var before = raises.Count;
-        deadline = DateTime.UtcNow.AddSeconds(5);
-        while (raises.Count <= before && DateTime.UtcNow < deadline)
-        {
-            await Task.Delay(25);
-        }
+        await WaitUntilAsync(() => raises.Count > before, "删除后未收到通知");
 
         Assert.Contains(raises[^1], p => p.EndsWith("burst0.txt", StringComparison.OrdinalIgnoreCase));
     }
@@ -120,19 +137,11 @@ public sealed class WorkspaceFileWatcherTests : IDisposable
         Directory.CreateDirectory(oldDir);
 
         // Let the creation settle and be observed (or not) before the rename.
-        var deadline = DateTime.UtcNow.AddSeconds(5);
-        while (raises.Count == 0 && DateTime.UtcNow < deadline)
-        {
-            await Task.Delay(25);
-        }
+        await WaitUntilAsync(() => raises.Count > 0, "目录创建后未收到通知");
 
         Directory.Move(oldDir, newDir);
         var before = raises.Count;
-        deadline = DateTime.UtcNow.AddSeconds(5);
-        while (raises.Count <= before && DateTime.UtcNow < deadline)
-        {
-            await Task.Delay(25);
-        }
+        await WaitUntilAsync(() => raises.Count > before, "目录重命名后未收到通知");
 
         // A rename refreshes both sides of the tree: the old name's parent and the new name's row.
         var renameRaise = raises[^1];
@@ -149,8 +158,9 @@ public sealed class WorkspaceFileWatcherTests : IDisposable
         watcher.Attach(_root);
         watcher.Detach();
 
+        // Detach 清空内部 watcher 集合,HandleFileSystemEvent 同步返回且不去武装去抖计时器,
+        // 因此"没有通知"是确定性结论,无需等待。
         watcher.HandleFileSystemEvent(Path.Combine(_root, "after-detach.txt"));
-        await Task.Delay(400);
 
         Assert.Equal(0, count);
     }
@@ -165,7 +175,7 @@ public sealed class WorkspaceFileWatcherTests : IDisposable
         var count = 0;
         watcher.FilesChanged += (_, _) => Interlocked.Increment(ref count);
         watcher.HandleFileSystemEvent(Path.Combine(_root, "x.txt"));
-        await Task.Delay(400);
+        await WaitUntilAsync(() => Volatile.Read(ref count) > 0, "重复 Attach 后事件未被投递");
 
         Assert.Equal(1, count);
     }

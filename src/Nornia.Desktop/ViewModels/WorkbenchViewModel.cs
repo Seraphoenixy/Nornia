@@ -119,7 +119,8 @@ public partial class WorkbenchViewModel : ObservableObject
     public Action<string>? CopyToClipboard { get; set; }
 
     /// <summary>打开内容页标签(环境管理 / 项目管理 / 设置),已存在则激活;视图页(资源管理器 /
-    /// 源代码管理)不创建、不激活、不选中——它们的主内容就是共享编辑器。</summary>
+    /// 源代码管理)不创建、不激活、不选中——它们的主内容就是共享编辑器。
+    /// 预览语义对齐文件标签:当前选中的预览页标签会被新导航的内容页替换,而不是无限堆积。</summary>
     public void OpenOrActivatePage(PageViewModel page)
     {
         if (page is ExplorerPageViewModel or GitViewModel)
@@ -128,10 +129,19 @@ public partial class WorkbenchViewModel : ObservableObject
         }
 
         var tab = _pageTabs.Values.FirstOrDefault(candidate => ReferenceEquals(candidate.Content, page));
-        if (tab is not null)
+        if (tab is null)
         {
-            OpenOrActivateTab(tab);
+            return;
         }
+
+        if (!Tabs.Contains(tab)
+            && SelectedTab is PageWorkbenchTab { IsPreview: true } currentPreview
+            && !ReferenceEquals(currentPreview, tab))
+        {
+            Tabs.Remove(currentPreview);
+        }
+
+        OpenOrActivateTab(tab);
     }
 
     /// <summary>视图页规整:视图页下不允许页面标签处于选中态——活动文档保持选中,
@@ -299,6 +309,7 @@ public partial class WorkbenchViewModel : ObservableObject
         else
         {
             Tabs.RemoveAt(index);
+            ResetPageTabPreview(tab);
         }
 
         // Closing a file can synchronously update the editor projection and temporarily leave
@@ -309,6 +320,15 @@ public partial class WorkbenchViewModel : ObservableObject
             SelectedTab = neighbour is not null && Tabs.Contains(neighbour)
                 ? neighbour
                 : Tabs.Count > 0 ? Tabs[^1] : null;
+        }
+    }
+
+    /// <summary>页面标签实例是预建复用的:关闭即回到预览态,下次导航重新以预览打开。</summary>
+    private static void ResetPageTabPreview(WorkbenchTabViewModel tab)
+    {
+        if (tab is PageWorkbenchTab pageTab)
+        {
+            pageTab.IsPreview = true;
         }
     }
 
@@ -403,6 +423,11 @@ public partial class WorkbenchViewModel : ObservableObject
                 editorTab.EditorTab.IsPreview = false;
             }
         }
+        else if (tab is PageWorkbenchTab pageTab && tab.IsPinned)
+        {
+            // 固定内容页即常驻:预览态消失,不再被下一次导航的预览槽替换。
+            pageTab.IsPreview = false;
+        }
     }
 
     /// <summary>复制标签标题 (右键菜单, 经 MainViewModel 注入剪贴板)。</summary>
@@ -435,6 +460,7 @@ public partial class WorkbenchViewModel : ObservableObject
         else
         {
             Tabs.Remove(tab);
+            ResetPageTabPreview(tab);
         }
     }
 

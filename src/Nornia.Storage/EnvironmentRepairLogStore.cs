@@ -5,8 +5,9 @@ using System.Text.Json;
 namespace Nornia.Storage;
 
 /// <summary>环境修复步骤明细的文件存储(JSON Lines)。每个修复步骤执行完即追加一行 JSON 到
-/// %APPDATA%\Nornia\environment-repair-logs.jsonl,回滚引擎按 correlation_id 读回步骤序列
-/// 做逆向还原。读写经同一把信号量串行化,桌面规模(每次修复数条记录)下同步追加足够可靠。</summary>
+/// %LOCALAPPDATA%\Nornia\environment-repair-logs.jsonl(见 <see cref="NorniaPaths.RepairLogPath"/>;
+/// 这里是机器本地数据,不放 Roaming),回滚引擎按 correlation_id 读回步骤序列做逆向还原。
+/// 读写经同一把信号量串行化,桌面规模(每次修复数条记录)下同步追加足够可靠。</summary>
 public sealed class EnvironmentRepairLogStore : IEnvironmentRepairLogRepository
 {
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);

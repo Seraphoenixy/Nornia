@@ -33,6 +33,7 @@ public static class CliServiceCollectionExtensions
             .AddSingleton<ICommand, EnvCheckCommand>()
             .AddSingleton<ICommand, EnvPlanCommand>()
             .AddSingleton<ICommand, EnvFixCommand>()
+            .AddSingleton<ICommand, EnvRollbackCommand>()
             .AddSingleton<ICommand, ProjectInitCommand>()
             .AddSingleton<ICommand, ProjectExportCommand>()
             .AddSingleton<ICommand, ProjectImportCommand>()

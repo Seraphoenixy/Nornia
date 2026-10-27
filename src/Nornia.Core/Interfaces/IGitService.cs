@@ -17,6 +17,32 @@ public interface IGitService
         CancellationToken cancellationToken = default,
         bool includeAllUntracked = true);
 
+    /// <summary>Status read with an explicit change-entry cap (the workbench feeds this from the
+    /// <c>git.statusLimit</c> setting). Beyond the cap <see
+    /// cref="GitRepositoryStatus.Truncated"/> is set and the caller degrades the UI. This compatibility
+    /// body ignores the cap so existing test doubles stay source-safe.</summary>
+    Task<GitRepositoryStatus> GetStatusAsync(
+        string repositoryPath,
+        int maximumEntries,
+        CancellationToken cancellationToken = default)
+    {
+        return GetStatusAsync(repositoryPath, cancellationToken);
+    }
+
+    /// <summary>Status read with the full option set (<c>git.statusLimit</c> cap, untracked mode,
+    /// index write-back and fsmonitor). <see cref="GitStatusReadOptions.AllowIndexWriteBack"/> is
+    /// what lets a foreground load pay Git's index refresh once instead of on every read; silent
+    /// refreshes keep it off so their own index write-back cannot feed the file watcher. This
+    /// compatibility body ignores the option record so existing test doubles stay source-safe;
+    /// production callers use <see cref="Nornia.Git.GitService"/>'s override.</summary>
+    Task<GitRepositoryStatus> GetStatusAsync(
+        string repositoryPath,
+        GitStatusReadOptions options,
+        CancellationToken cancellationToken = default)
+    {
+        return GetStatusAsync(repositoryPath, options.MaximumEntries, cancellationToken);
+    }
+
     /// <summary>Initializes a new local Git repository in an existing directory. This creates only
     /// Git metadata; it does not stage files, create a commit, or configure a remote.</summary>
     Task InitializeRepositoryAsync(string repositoryPath, CancellationToken cancellationToken = default) =>
@@ -167,6 +193,15 @@ public interface IGitService
     Task CommitAsync(string repositoryPath, string message, CancellationToken cancellationToken = default);
 
     Task<IReadOnlyList<GitCommitInfo>> GetLogAsync(string repositoryPath, int count = 30, CancellationToken cancellationToken = default);
+
+    /// <summary>单文件提交历史(<c>git log --follow -- path</c>,跨重命名跟随)。复用
+    /// <see cref="GitCommitInfo"/> 模型;分页用 skip 偏移,由调用方累积。</summary>
+    Task<IReadOnlyList<GitCommitInfo>> GetFileLogAsync(
+        string repositoryPath, string path, int count = 50, int skip = 0, CancellationToken cancellationToken = default);
+
+    /// <summary>行级来源(<c>git blame --porcelain -- path</c>;未提交更改落在 0000 哈希的
+    /// "未提交"块)。输出/行数/提交数均有界,超限截断并置 <see cref="GitBlame.Truncated"/>。</summary>
+    Task<GitBlame> GetBlameAsync(string repositoryPath, string path, CancellationToken cancellationToken = default);
 
     /// <summary>仅存在于上游的提交(待拉取,<c>HEAD..upstream</c>)。</summary>
     Task<IReadOnlyList<GitCommitInfo>> GetIncomingCommitsAsync(
